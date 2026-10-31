@@ -1,0 +1,10 @@
+{
+  "//": "Copy the myna entry into each machine's project .mcp.json (or ~/.claude.json). Use an ABSOLUTE path to the BUNDLED dist/ (self-contained, no node_modules). The large timeout + idle=0 are load-bearing (spike-verified: lets ask_human block indefinitely for the human).",
+  "mcpServers": {
+    "myna": {
+      "command": "node",
+      "args": ["C:/path/to/myna-plugin/dist/ask-human.mjs"],
+      "timeout": 86400000
+    }
+  }
+}

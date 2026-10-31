@@ -1,0 +1,9 @@
+#!/bin/sh
+# Keep the shipped bundle fresh: if the MCP server source is staged, rebuild dist/ and stage it,
+# so dist/ask-human.mjs never goes stale (the plugin runs the bundled dist, not src).
+# Enable once per clone:  git config core.hooksPath .githooks
+if git diff --cached --name-only | grep -qx 'src/mcp/ask-human.mjs'; then
+  echo "myna pre-commit: src/mcp/ask-human.mjs changed → rebuilding dist/…"
+  npm run build || { echo "myna pre-commit: build failed — commit aborted"; exit 1; }
+  git add dist/ask-human.mjs
+fi

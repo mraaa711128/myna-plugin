@@ -1,0 +1,94 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+      - run: npm ci
+
+      - name: Build bundle (dist/)
+        run: npm run build
+
+      - name: dist/ must be committed fresh
+        run: |
+          if ! git diff --exit-code -- dist/; then
+            echo "::error::dist/ is stale — run 'npm run build' and commit dist/ask-human.mjs"
+            exit 1
+          fi
+
+      - name: Smoke — src (autopilot + fallback)
+        run: node test/smoke-autopilot.mjs
+
+      - name: Smoke — AskUserQuestion interception hook
+        run: node test/smoke-intercept.mjs
+
+      - name: Smoke — gate-brief render (Mermaid diagrams + fallbacks)
+        run: node test/smoke-render-gate.mjs
+
+      - name: Smoke — markdown → plain text for Telegram
+        run: node test/smoke-plain.mjs
+
+      - name: Smoke — relay + telegram provider e2e (stubbed API)
+        run: node test/smoke-telegram-provider.mjs
+
+      - name: Smoke — discord/slack provider payloads
+        run: node test/smoke-provider-payloads.mjs
+
+      - name: Smoke — discord provider e2e (stubbed Gateway + REST)
+        run: node test/smoke-discord-provider.mjs
+
+      - name: Smoke — slack provider e2e (stubbed Socket Mode + Web API)
+        run: node test/smoke-slack-provider.mjs
+
+      - name: Smoke — full chain (MCP ask_human → relay → stubbed IM)
+        run: node test/smoke-full-chain.mjs
+
+      - name: Smoke — session handoff (detach_human → await_human, expiry, reconnect)
+        run: node test/smoke-handoff.mjs
+
+      - name: Smoke — session switch (in-app /resume → ask under the current session)
+        run: node test/smoke-session-switch.mjs
+
+      - name: Smoke — approval attestation (✅ tap → POST /attest once, memory only — restart / forged journal never attest, TTL)
+        run: node test/smoke-attest.mjs
+
+      - name: Smoke — orphan gate sweep (journal → relay → stubbed Telegram)
+        run: node test/smoke-orphan.mjs
+
+      - name: Smoke — relay chat core (register / inbox / progress / chat topic → stubbed Telegram)
+        run: node test/smoke-chat.mjs
+
+      - name: Smoke — relay network settings (connect attempt timeout, err.cause in logs)
+        run: node test/smoke-net.mjs
+
+      - name: Smoke — chat mod (stub engine → relay → stubbed Telegram)
+        run: node test/smoke-chatmod.mjs
+
+      - name: Smoke — permission forwarding (PermissionRequest hook → relay → stubbed IM)
+        run: node test/smoke-permission.mjs
+
+      - name: Smoke — Stop hook (stop-catch + round-end + background-work guard)
+        run: node test/smoke-stopcatch.mjs
+
+      - name: Smoke — relay daemon lifecycle (fake .env — no real bot)
+        run: |
+          printf 'TELEGRAM_BOT_TOKEN=fake\nTELEGRAM_CHAT_ID=1\nTELEGRAM_API_BASE=http://127.0.0.1:9\n' > "$RUNNER_TEMP/myna.env"
+          MYNA_ENV="$RUNNER_TEMP/myna.env" RELAY_PORT=17899 node test/smoke-daemon.mjs
+
+      - name: Smoke — bundled dist (no node_modules resolution)
+        env:
+          MYNA_SERVER: dist/ask-human.mjs
+        run: node test/smoke-autopilot.mjs

@@ -1,0 +1,25 @@
+{
+  "name": "mraaa711128-myna",
+  "owner": {
+    "name": "Stanley Chiang"
+  },
+  "metadata": {
+    "description": "Myna — a Claude Code plugin that sends the questions Claude asks you to your phone.",
+    "version": "0.5.1"
+  },
+  "plugins": [
+    {
+      "name": "myna",
+      "source": "./",
+      "description": "Async human-gate bridge — send Claude Code questions and decision gates to your phone via Telegram, Discord, or Slack (blocking MCP ask_human + local relay). Autopilot auto-accept + decision log, reply threading, /myna:* commands, auto-start relay.",
+      "version": "0.19.2",
+      "author": {
+        "name": "Stanley Chiang"
+      },
+      "keywords": ["human-in-the-loop", "telegram", "discord", "slack", "mcp", "async", "gate", "notifications"],
+      "homepage": "https://github.com/mraaa711128/myna-plugin",
+      "repository": "https://github.com/mraaa711128/myna-plugin",
+      "license": "MIT"
+    }
+  ]
+}

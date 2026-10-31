@@ -1,0 +1,18 @@
+{
+  "name": "myna-plugin",
+  "version": "0.19.2",
+  "private": true,
+  "license": "MIT",
+  "type": "module",
+  "description": "Myna — async human-gate bridge (MCP ask_human + local relay + Telegram/Discord/Slack) for Claude Code.",
+  "scripts": {
+    "build": "esbuild src/mcp/ask-human.mjs --bundle --platform=node --format=esm --outfile=dist/ask-human.mjs",
+    "relay": "node src/relay.mjs",
+    "mcp": "node dist/ask-human.mjs",
+    "test": "node test/smoke-autopilot.mjs"
+  },
+  "devDependencies": {
+    "@modelcontextprotocol/sdk": "^1.18.0",
+    "esbuild": "^0.28.1"
+  }
+}

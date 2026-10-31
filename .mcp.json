@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "myna": {
+      "command": "node",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/dist/ask-human.mjs"],
+      "timeout": 86400000
+    }
+  }
+}
