@@ -1,6 +1,6 @@
 # Async Human-Gate Bridge — SPEC (v3, 定稿)
 
-> **Status:** 已實作並持續修訂(目前 v0.20.0;各版內容見下方各節的「後續修訂」;多機共用 relay 的協定見 §5.1)
+> **Status:** 已實作並持續修訂(目前 v0.20.1;各版內容見下方各節的「後續修訂」;多機共用 relay 的協定見 §5.1)
 > **Type:** Flow tooling(AI agent 工作流程的基礎建設)
 > **Home:** 獨立 repo(Claude Code plugin「myna」)。
 
@@ -258,6 +258,8 @@ Remote Control 不合用:它把 session 綁在**當下登入的帳號**,多台�
 3. 帶 `Origin` 的請求(瀏覽器)回 403;`/chat/*` 例外,因為它本來就要 relay 密鑰或 per-session token,而且 chat mod 的 `$.http.fetch` 會不會帶 `Origin` 沒有實測。
 
 **威脅模型重點:** 被偷的 machine token(在 Access 後面還要再偷 service token)最多能:對手機發問、讀和取消**自己那台**的題目、關掉自己那台的 session。改綁 bot、停掉 relay、管理機器、別台的題目和核准都碰不到。edge 跟 AI 用同一個 OS 帳號,AI 讀得到 machine token、換得掉 edge relay;這跟 0.19 的極限一樣,護欄仍然只是防意外的保險絲。
+
+- **後續修訂(2026-11,`/myna:hub`,v0.20.1):** 0.20.0 的遠端有 `/myna:join` 幫忙寫設定,主節點卻要自己在 `~/.myna/.env` 加 `MYNA_REMOTE_PORT`(可選 `MYNA_MACHINE_NAME`)再 `/myna:relay restart`,兩邊不對稱。**決定:** 新增 `/myna:hub`(`scripts/hub.mjs`),只寫設定、重啟 relay、顯示狀態,協定與 relay 的行為都不變。(a) `on [--name <名稱>]`:`.env` 還沒有 `MYNA_REMOTE_PORT`(或值是空的)時才寫入 `7801`,已經有值就保留原本的 port、不覆寫;有 `--name` 時寫入 `MYNA_MACHINE_NAME`(跟 `join.mjs` 一樣轉小寫、只留 a-z 0-9 -、最多 16 字,不符合 `NAME_RE` 就擋)。`.env` 的寫法跟 `configure.mjs` 的 set 一樣。接著 `ensure-relay.mjs --force` 重啟(開著的題目照 journal 交接),等到新的 relay(不同 pid)回應、遠端 listener 開始聽,印出 `/health` 的 `remote` 和 tunnel 該指到的 port(實際使用的那個)。(b) `on` 先檢查再寫:這台是 edge(`MYNA_ROLE=edge`)或沒有設定 bot(跟 `ensure-relay` 判斷「已設定」的條件一樣)時擋下、說明原因、exit 1,`.env` 不改、relay 不重啟。(c) `off`:從 `.env` 拿掉 `MYNA_REMOTE_PORT`(跟 `configure.mjs` 的 unset 一樣)後重啟;`machines.json` 不動,之後再 `on` 時已加入的機器照舊有效。(d) `status`(沒有參數時的預設):唯讀,印出 `/health` 的 `role`、`remote`,`machines.json` 裡沒撤銷的機器數量,並提醒 tunnel 要指到實際使用的 port、不能指到 `RELAY_PORT`(7800)。**刻意不做:** 自動安裝或設定 `cloudflared`、建 Access application 和 service token(要 Cloudflare 登入,每個人的網域不同,README 有手動步驟)、`--port` 參數(要別的 port 直接編輯 `.env`,`on` 會保留它)、Windows 常駐(第 5 階段)。測試:`test/smoke-hub.mjs`(暫存 HOME 與 `MYNA_ENV`、隨機 port、假 bot token):`on` 寫入兩個鍵且原本的設定不動、`/health` 出現 `remote`;已有自訂 port 時保留並在那個 port 上聽;`off` 拿掉設定、`remote` 變 `null`、`machines.json` 一個 byte 都沒變;edge、沒有 bot、沒有 `.env`、名稱不合法時擋下,`.env` 不變(沒有 `.env` 時也不會建立)且 relay 沒有重啟;`status` 在 relay 沒跑、主節點開著、關掉後三種情況都不寫任何檔案;關掉再開時已加入的機器還在。
 
 ## 6. Telegram UX
 
