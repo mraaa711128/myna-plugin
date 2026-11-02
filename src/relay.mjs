@@ -46,6 +46,15 @@
 // Open gates survive a relay restart/upgrade: every mutation of the pending table (and of the provider's
 // button-token state) is written through to ~/.myna/relay-pending.json; a fresh relay adopts it on start,
 // so buttons already on the phone keep working and the client's /answer poll simply resumes.
+// Several machines, one inbox (0.20.0, SPEC §5.1). As the HUB, with MYNA_REMOTE_PORT set, this relay
+// also listens on 127.0.0.1:<that> for other machines' EDGE relays — every request there carries a
+// machine token (machines.json holds their SHA-256), only /health, /ask, /answer, /cancel,
+// /session/close, /session/round-end and the join endpoints exist, and a machine sees only its own
+// requests (session ids become m:<machine_id>:<session_id>). A new machine joins by asking
+// (POST /machines/join): the phone gets ✅/❌ buttons and only a human tap issues its token.
+// As an EDGE (MYNA_ROLE=edge) this same relay forwards this machine's questions to the hub and keeps
+// its own bot (if any, and not the hub's) as the fallback while the hub is away — see "edge" below.
+// Without MYNA_REMOTE_PORT and MYNA_ROLE=edge nothing of this runs.
 // No npm deps (Node 18+ for telegram; 22+ for discord/slack — built-in WebSocket).
 // Reads config from ~/.myna/.env (stable per-user location — survives plugin updates).
 import http from "node:http";
@@ -57,9 +66,14 @@ import { fileURLToPath } from "node:url";
 import * as telegram from "./providers/telegram.mjs";
 import * as discord from "./providers/discord.mjs";
 import * as slack from "./providers/slack.mjs";
-import { validateAskArgs, normalizeCommand, isApproveOption, approveOptionOf } from "./providers/util.mjs";
+import { validateAskArgs, normalizeCommand, isApproveOption, approveOptionOf, oneLine } from "./providers/util.mjs";
 import { createChat } from "./chat.mjs";
 import { applyNetAttemptTimeout } from "./net.mjs";
+import {
+  PROTOCOL, PROTOCOL_HEADER, ENROLL_SECRET_HEADER, REQUEST_ID_HEADER, LOCAL_ID, NAME_RE, CODE_RE, ASK_MAX_BYTES_DEFAULT,
+  roleOf, machinesFile, seenFile, machineStore, newMachineId, newMachineToken, sha256hex, sameHex, bearerOf,
+  readBody, localRefusal, writePrivate, upstreamUrl, cfHeaders, tokenFile, botIdentity,
+} from "./remote.mjs";
 
 const PROVIDERS = [telegram, discord, slack]; // auto-pick order when MYNA_PROVIDER is unset
 
@@ -83,6 +97,49 @@ const PORT = Number(cfg.RELAY_PORT || 7800);
 // (the default that silently killed the old unbounded /answer wait → "fetch failed" → fallback).
 const ANSWER_HOLD_MS = Number(cfg.MYNA_ANSWER_HOLD_MS || 25000);
 const log = (...a) => console.error(`[relay ${new Date().toISOString()}]`, ...a);
+// role: hub (default) = this relay is the one other machines forward to (when MYNA_REMOTE_PORT is set);
+// edge = it forwards this machine's questions to a hub (MYNA_UPSTREAM) and keeps its own bot, if it
+// has one, as the fallback while the hub is away (see "edge" below)
+const ROLE = roleOf(cfg);
+if (ROLE !== "hub" && ROLE !== "edge") { log(`unknown MYNA_ROLE "${ROLE}" — use hub (default) | edge`); process.exit(1); }
+const EDGE = ROLE === "edge";
+const intCfg = (k, dflt, min = 0) => {
+  const v = String(cfg[k] ?? "").trim(), n = Number(v);
+  if (v === "") return dflt;
+  if (!Number.isInteger(n) || n < min) { log(`${k}="${v}" is not an integer ≥ ${min} — using ${dflt}`); return dflt; }
+  return n;
+};
+// body cap of POST /ask (both ports) — a question is a few KB; a megabyte body is a mistake or abuse
+const ASK_MAX_BYTES = intCfg("MYNA_ASK_MAX_BYTES", ASK_MAX_BYTES_DEFAULT, 1024);
+const SMALL_BODY_BYTES = 64 * 1024;     // every other body (session ids, a command line)
+// the remote listener (other machines), off unless MYNA_REMOTE_PORT is set
+const REMOTE_PORT = (() => {
+  const v = String(cfg.MYNA_REMOTE_PORT ?? "").trim();
+  if (!v) return null;
+  if (EDGE) { log(`MYNA_REMOTE_PORT is ignored on an edge (MYNA_ROLE=edge) — only the hub takes other machines`); return null; }
+  const n = Number(v);
+  if (!Number.isInteger(n) || n < 1 || n > 65535 || n === PORT) { log(`MYNA_REMOTE_PORT="${v}" must be a port other than RELAY_PORT (${PORT}) — remote listener off`); return null; }
+  return n;
+})();
+let remoteListening = false;
+// several machines are configured on this one (hub with a remote port, or an edge). Without it the
+// relay takes /ask bodies of any size and does not check the local port for proxy headers (no tunnel).
+const MULTI = !!REMOTE_PORT || EDGE;
+// this machine's short name (topic prefix once other machines have joined; logs)
+const MACHINE_NAME = (String(cfg.MYNA_MACHINE_NAME || os.hostname().split(".")[0] || "").toLowerCase().replace(/[^a-z0-9-]/g, "").slice(0, 16)) || "hub";
+// MYNA_TOPIC_MACHINE: auto (default) = prefix topic names with the machine name once a remote machine
+// is registered (a single machine sees no change); on = always; off = never
+const TOPIC_MACHINE = (() => {
+  const v = String(cfg.MYNA_TOPIC_MACHINE || "auto").trim().toLowerCase();
+  if (!["auto", "on", "off"].includes(v)) { log(`MYNA_TOPIC_MACHINE="${v}" is not auto|on|off — using auto`); return "auto"; }
+  return v;
+})();
+const REMOTE_ASK_MAX = intCfg("MYNA_REMOTE_ASK_MAX", 30, 1);                 // asks per machine per window
+const REMOTE_ASK_WINDOW_MS = intCfg("MYNA_REMOTE_ASK_WINDOW_MS", 600000, 1000);
+const REMOTE_MAX_POLLS = intCfg("MYNA_REMOTE_MAX_POLLS", 50, 1);             // /answer polls held at once per machine
+const JOIN_TTL_MS = intCfg("MYNA_JOIN_TTL_MS", 600000, 1000);                // a join request waits this long for the tap
+const JOIN_INTERVAL_MS = intCfg("MYNA_JOIN_INTERVAL_MS", 60000, 0);          // at most one new join request per interval
+const JOIN_MAX_OPEN = intCfg("MYNA_JOIN_MAX_OPEN", 3, 1);                    // join requests waiting at once
 // how long each address gets to connect (Happy Eyeballs) — before any provider call goes out (src/net.mjs)
 const NET_ATTEMPT_MS = applyNetAttemptTimeout(cfg, log);
 // journal of open gates (write-through) — next to .env so it survives plugin updates like the topics map
@@ -127,7 +184,8 @@ if (want) {
 } else {
   // a fully configured provider first; else one that only waits to be paired (telegram: token, no chat yet)
   mod = PROVIDERS.find((p) => p.configured(cfg)) || PROVIDERS.find((p) => p.pairable?.(cfg));
-  if (!mod) { log(`no IM provider configured (telegram/discord/slack keys all missing in ${ENV_PATH}) — see .env.example`); process.exit(1); }
+  // an edge needs no IM of its own: without one it only forwards to the hub
+  if (!mod && !EDGE) { log(`no IM provider configured (telegram/discord/slack keys all missing in ${ENV_PATH}) — see .env.example`); process.exit(1); }
 }
 
 // state
@@ -156,7 +214,7 @@ function persist() {
   try {
     const requests = {};
     for (const [id, p] of pending) requests[id] = {
-      created: p.created, ...(p.session_id ? { session_id: p.session_id } : {}), ...(p.meta ? { meta: p.meta } : {}),
+      created: p.created, ...(p.session_id ? { session_id: p.session_id } : {}), ...(p.machine_id ? { machine_id: p.machine_id } : {}), ...(p.meta ? { meta: p.meta } : {}),
       ...(p.detached ? { detached: p.detached } : {}), ...(p.result !== undefined ? { result: p.result, resolvedAt: p.resolvedAt } : {}),
     };
     const doc = { version: VERSION, saved_at: new Date().toISOString(), requests, closing: [...closing], provider: provider?.exportState?.() ?? null };
@@ -168,10 +226,13 @@ function persist() {
     try { fs.renameSync(tmp, PENDING_FILE); } catch { fs.writeFileSync(PENDING_FILE, text); try { fs.unlinkSync(tmp); } catch {} }
   } catch (e) { log("journal: could not persist", PENDING_FILE, e.message); }
 }
-function newEntry(created = Date.now(), session_id, meta) {
+// machine_id: which machine asked — absent for this machine's own (local) requests, so a journal
+// without the field (any pre-0.20 one) reads as all-local
+function newEntry(created = Date.now(), session_id, meta, machine_id) {
   let resolveFn; const promise = new Promise((r) => (resolveFn = r));
-  return { promise, resolve: resolveFn, created, wake: new Set(), holders: 0, lastPoll: Date.now(), ...(session_id ? { session_id: String(session_id) } : {}), ...(meta ? { meta } : {}) };
+  return { promise, resolve: resolveFn, created, wake: new Set(), holders: 0, lastPoll: Date.now(), ...(session_id ? { session_id: String(session_id) } : {}), ...(meta ? { meta } : {}), ...(machine_id && machine_id !== LOCAL_ID ? { machine_id: String(machine_id) } : {}) };
 }
+const machineOf = (p) => p?.machine_id || LOCAL_ID;
 
 // --- detach expiry ---------------------------------------------------------------------------
 function armExpiry(id, p) {
@@ -214,7 +275,7 @@ function adopt() {
   let open = 0, answered = 0;
   const detached = [];
   for (const [id, r] of Object.entries(doc.requests || {})) {
-    const e = newEntry(r.created || Date.now(), r.session_id, r.meta);
+    const e = newEntry(r.created || Date.now(), r.session_id, r.meta, r.machine_id);
     if (r.result !== undefined) { e.result = r.result; e.resolvedAt = Date.now(); e.resolve(r.result); answered++; } // fresh TTL — give the client time to collect
     else open++;
     pending.set(id, e);
@@ -240,13 +301,15 @@ const approvalExpired = (a, now = Date.now()) => { const t = Date.parse(a.answer
 // adopted from the journal (asked before a restart) records nothing even when its ✅ is tapped —
 // otherwise an edited journal could pair a button the human sees with a different command.
 function resolveFromIM(request_id, result) {
+  // a tap on a join request's buttons (not a question of any session — never in `pending`)
+  if (joinByQ.has(request_id)) return joinAnswered(joinByQ.get(request_id), result);
   const p = pending.get(request_id);
   const cmd = p?.approves;
   // the tapped option must be THE ✅ option of this question (set by /ask in this process), not
   // merely one starting with ✅
   if (p && p.result === undefined && result?.kind === "selection" && typeof cmd === "string" && cmd && isApproveOption(result.value)
     && typeof p.approveOption === "string" && result.value === p.approveOption && p.session_id) {
-    approvals.set(request_id, { request_id, session_id: p.session_id, command: cmd, chosen: result.value, answered_at: new Date().toISOString() });
+    approvals.set(request_id, { request_id, machine_id: machineOf(p), session_id: p.session_id, command: cmd, chosen: result.value, answered_at: new Date().toISOString() });
     log(`request ${request_id}: ✅ approval recorded for session ${p.session_id} (usable once, ${APPROVAL_TTL_MS / 1000}s)`);
   }
   resolveRequest(request_id, result);
@@ -297,22 +360,584 @@ function closeIfDue(sid) {
 }
 
 // chat: sessions registered as chatbots (src/chat.mjs) — /chat/* endpoints, routed before everything else
+// --- edge: the hub link -----------------------------------------------------------------------------
+// An edge forwards this machine's questions to the hub (MYNA_UPSTREAM) with its machine token. Its own
+// bot (if it has one) is the fallback: it keeps polling — so a fallback question's answer and the
+// questions still open on it are handled — but sends questions only while the hub is away.
+// The hub reports its bot's id on its remote /health; the same bot as this machine's → this machine
+// never uses its own (two pollers on one bot fight: Telegram 409, Discord/Slack events twice).
+const NO_IM = { name: "none", start() {}, async sendQuestion() { throw new Error("this machine has no IM of its own (edge forwarding only)"); } };
+const hub = EDGE ? edgeLink() : null;
+function edgeLink() {
+  const up = upstreamUrl(cfg.MYNA_UPSTREAM);
+  if (up.error) { log(`${up.error} — set MYNA_UPSTREAM in ${ENV_PATH} to the hub's URL (run /myna:join)`); process.exit(1); }
+  const CF = cfHeaders(cfg);
+  if (!!String(cfg.MYNA_CF_ACCESS_CLIENT_ID || "").trim() !== !!String(cfg.MYNA_CF_ACCESS_CLIENT_SECRET || "").trim()) log("only one of MYNA_CF_ACCESS_CLIENT_ID / MYNA_CF_ACCESS_CLIENT_SECRET is set — sending neither");
+  const TOKEN_FILE = tokenFile(cfg);
+  const token = () => { if (cfg.MYNA_MACHINE_TOKEN) return String(cfg.MYNA_MACHINE_TOKEN).trim(); try { return fs.readFileSync(TOKEN_FILE, "utf8").trim(); } catch { return ""; } };
+  const BOT_FILE = path.join(path.dirname(ENV_PATH), "upstream.json"); // the hub's bot id last seen (decides at start while the hub is away)
+  const h = {
+    url: up.url, cf: !!Object.keys(CF).length, tokenFile: TOKEN_FILE,
+    reachable: false,      // the last check (or forward) reached the hub
+    active: false,         // new questions go to the hub (after MYNA_UPSTREAM_RECOVER good checks in a row once it was away)
+    everUp: false, okStreak: 0, reason: "not checked yet", since: Date.now(), downSince: Date.now(),
+    version: null, protocol: null, machine: null,
+    bot: (() => { try { return JSON.parse(fs.readFileSync(BOT_FILE, "utf8")).bot_id || null; } catch { return null; } })(),
+    forwarded: new Map(),  // request_id -> {at}: forwarded to the hub, answer not collected yet
+    abandoned: new Set(),  // given up while the hub was away → cancelled at the hub once it is back
+    CHECK_MS: intCfg("MYNA_UPSTREAM_CHECK_MS", 10000, 50),
+    GRACE_MS: intCfg("MYNA_UPSTREAM_GRACE", 120, 0) * 1000,
+    RECOVER: intCfg("MYNA_UPSTREAM_RECOVER", 3, 1),
+    headers: (extra = {}) => ({ authorization: `Bearer ${token()}`, [PROTOCOL_HEADER]: String(PROTOCOL), ...CF, ...extra }),
+    onBot: null,           // set below: called when the hub's bot id is learned / changes
+  };
+  // forwarded / abandoned / the outage start survive a restart (an upgrade mid-outage must neither
+  // cut a question's grace short nor forget to retract the buttons of one given up): edge-state.json
+  const STATE_FILE = cfg.MYNA_EDGE_STATE_FILE || path.join(path.dirname(ENV_PATH), "edge-state.json");
+  try {
+    const s = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
+    for (const [id, v] of s.forwarded || []) h.forwarded.set(String(id), v);
+    for (const id of s.abandoned || []) h.abandoned.add(String(id));
+    if (Number.isFinite(s.down_since)) h.downSince = s.down_since;
+    if (h.forwarded.size || h.abandoned.size) log(`edge: picked up ${h.forwarded.size} question(s) waiting on the hub and ${h.abandoned.size} to cancel there from ${STATE_FILE}`);
+  } catch {}
+  let saveQueued = false;
+  h.save = () => {
+    if (saveQueued) return; saveQueued = true;
+    setImmediate(() => {
+      saveQueued = false;
+      try { writePrivate(STATE_FILE, JSON.stringify({ forwarded: [...h.forwarded], abandoned: [...h.abandoned], down_since: h.reachable ? null : h.downSince }) + "\n"); }
+      catch (e) { log("edge: could not save", STATE_FILE, e.message); }
+    });
+  };
+  h.markDown = (reason) => {
+    if (h.reachable) { h.downSince = Date.now(); h.save(); log(`hub unreachable: ${reason} — ${ownBot.on ? "new questions go to this machine's own bot" : "local clients fall back to this machine's terminal"} until it is back`); }
+    else if (h.reason !== reason) log(`hub still unavailable: ${reason}`);
+    Object.assign(h, { reachable: false, active: false, okStreak: 0, reason, since: Date.now() });
+  };
+  h.why = (status, body) => status === 401 ? "machine token refused (revoked or wrong) — run /myna:join again"
+    : status === 403 || (status >= 300 && status < 400) ? `access denied before the hub (HTTP ${status} — Cloudflare Access service token missing or wrong?)`
+    : status === 426 ? `the hub speaks another remote protocol (${body?.protocol ?? "?"}; this machine speaks ${PROTOCOL}) — update myna on both`
+    : `hub answered HTTP ${status}`;
+  h.failStatus = (s) => s === 401 || s === 403 || s === 426 || (s >= 300 && s < 400) || s >= 500;
+  h.check = async () => {
+    if (!token()) return h.markDown(`no machine token (${TOKEN_FILE}) — run /myna:join`);
+    let r, j = null;
+    try { r = await fetch(`${h.url}/health`, { headers: h.headers(), redirect: "manual", signal: AbortSignal.timeout(5000) }); j = await r.json().catch(() => null); }
+    catch (e) { return h.markDown(`cannot connect (${e.name === "TimeoutError" ? "timeout" : e.cause?.code || e.message})`); }
+    if (h.failStatus(r.status)) return h.markDown(h.why(r.status, j));
+    if (r.status !== 200 || j?.name !== "myna-relay") return h.markDown(`not a myna hub (HTTP ${r.status})`);
+    if (j.protocol !== PROTOCOL) return h.markDown(h.why(426, j));
+    const was = h.reachable;
+    Object.assign(h, { reachable: true, reason: "", since: was ? h.since : Date.now(), version: j.version, protocol: j.protocol, machine: j.machine?.name || null });
+    h.okStreak++;
+    if ((j.bot_id || null) !== h.bot) {
+      h.bot = j.bot_id || null;
+      try { writePrivate(BOT_FILE, JSON.stringify({ bot_id: h.bot, seen_at: new Date().toISOString() }) + "\n"); } catch {}
+    }
+    h.onBot?.(h.bot);
+    // back after an outage: new questions return to the hub only after RECOVER good checks in a row
+    // (a flapping link must not bounce questions between two bots). Without a bot of its own there
+    // is nothing to bounce to — forward again at once.
+    if (!h.active && (!h.everUp || !ownBot.on || h.okStreak >= h.RECOVER)) {
+      h.active = true;
+      log(`hub ${h.url} ${h.everUp ? "back" : "reachable"} — v${j.version}, protocol ${j.protocol}, this machine = ${h.machine}; new questions go to the hub`);
+      h.everUp = true;
+    }
+    if (!was) h.save();
+    h.flush();
+  };
+  // cancel at the hub what was given up — retried on every good check until the hub confirms it: 200
+  // (cancelled, or already over) or 404 (it never got the question). Anything else (401, 403, 3xx, 5xx,
+  // timeout) keeps the id for the next check.
+  let flushing = false;
+  h.flush = async () => {
+    if (flushing || !h.abandoned.size) return;
+    flushing = true;
+    try {
+      for (const id of [...h.abandoned]) {
+        let r;
+        try { r = await fetch(`${h.url}/cancel/${id}`, { method: "POST", headers: h.headers(), redirect: "manual", signal: AbortSignal.timeout(5000) }); }
+        catch { return; }
+        if (r.status === 200 || r.status === 404) { h.abandoned.delete(id); h.save(); log(`edge: question ${id} given up during the outage — ${r.status === 200 ? "cancelled at the hub" : "the hub never had it"}`); }
+      }
+    } finally { flushing = false; }
+  };
+  h.inGrace = (id) => h.forwarded.has(id) && Date.now() - h.downSince < h.GRACE_MS;
+  return h;
+}
+// this machine's own bot: on = its provider runs (questions go to it only while the hub is away)
+const ownBot = { on: false, id: mod ? botIdentity(mod.name, cfg) : null, reason: mod ? "" : "no bot configured on this machine" };
+if (EDGE) {
+  hub.first = hub.check();
+  await Promise.race([hub.first, new Promise((r) => setTimeout(r, 6000))]);
+  if (mod && hub.bot && ownBot.id && hub.bot === ownBot.id) ownBot.reason = `same bot as the hub (${ownBot.id}) — not using it, forwarding only`;
+  else if (mod) {
+    ownBot.on = true;
+    if (!hub.bot) log(`the hub's bot id is not known yet (hub ${hub.reachable ? "reports none" : "not reachable"}) — starting this machine's own bot; it is stopped if it turns out to be the hub's`);
+  }
+  if (!ownBot.on) log(`edge: ${ownBot.reason}`);
+}
 const chat = createChat({ cfg, log, dir: path.dirname(ENV_PATH) });
 let provider;
-try { provider = mod.create(cfg, { resolve: resolveFromIM, log, persist, chat: chat.ctx }); }
-catch (e) { log(e.message); process.exit(1); }
+if (!EDGE || ownBot.on) {
+  try { provider = mod.create(cfg, { resolve: resolveFromIM, log, persist, chat: chat.ctx }); }
+  catch (e) { log(e.message); process.exit(1); }
+} else provider = NO_IM;
 chat.attach(provider);
+if (EDGE) {
+  // the hub's bot turns out to be this machine's (learned after start, or the hub switched bots):
+  // stop polling it at once and only forward from now on
+  hub.onBot = (botId) => {
+    if (!ownBot.on || !botId || botId !== ownBot.id) return;
+    ownBot.on = false; ownBot.reason = `same bot as the hub (${botId}) — stopped using it, forwarding only`;
+    log(`edge: ${ownBot.reason}`);
+    try { provider.stop(); } catch (e) { log("could not stop the provider:", e.message, "— exiting so the next start sees the hub's bot id (upstream.json) and never starts it"); process.exit(1); }
+    provider = NO_IM; chat.attach(provider);
+  };
+  hub.onBot(hub.bot);
+  setInterval(() => {
+    hub.check().then(edgeGraceCheck, edgeGraceCheck);
+  }, hub.CHECK_MS).unref();
+}
+// past the grace: the questions still waiting on the hub are given up (their clients get
+// {kind:"unreachable"} and fall back); once the hub is back they are cancelled there. They are NOT
+// re-sent on this machine's bot: the hub may still be up behind a broken link and take a tap on its
+// own buttons — a second copy here could be answered twice.
+function edgeGraceCheck() {
+  if (hub.reachable || !hub.forwarded.size || Date.now() - hub.downSince < hub.GRACE_MS) return;
+  log(`hub away for over ${hub.GRACE_MS / 1000}s — giving up ${hub.forwarded.size} question(s) waiting on it; they are cancelled at the hub once it is back`);
+  for (const id of hub.forwarded.keys()) hub.abandoned.add(id);
+  hub.forwarded.clear(); hub.save();
+}
 const adopted = adopt();
+
+// --- request handlers shared by the local and the remote listener ------------------------------
+// A scope says who is asking: this machine (local listener, no credentials — as before 0.20) or a
+// remote machine identified by its token. A remote machine's session ids are namespaced
+// m:<machine_id>:<session_id> (two machines using the same id never meet, one cannot act on the
+// other's sessions) and it only ever sees its own requests.
+const LOCAL_SCOPE = { id: LOCAL_ID, name: MACHINE_NAME, remote: false, sid: (s) => (s ? String(s) : ""), owns: () => true };
+const remoteScope = (m) => ({ id: m.id, name: m.name, remote: true, sid: (s) => (s ? `m:${m.id}:${String(s)}` : ""), owns: (p) => machineOf(p) === m.id });
+const send = (res, code, o) => { res.writeHead(code, { "content-type": "application/json" }); res.end(JSON.stringify(o)); };
+const jsonOf = (body) => { try { return { v: JSON.parse(body || "{}") }; } catch (e) { return { err: e }; } };
+// machines.json is read only when the remote listener is on — without it nothing below changes a topic
+const machines = REMOTE_PORT ? machineStore(machinesFile(cfg), { onRevoked: (ids) => machinesRevoked(ids) }) : null;
+// the machine-name prefix a question's topic gets (see MYNA_TOPIC_MACHINE)
+const topicMachine = (scope) => (TOPIC_MACHINE === "on" || (TOPIC_MACHINE === "auto" && machines && machines.active().length > 0) ? scope.name : "");
+const remoteAsks = new Map();   // machine_id -> timestamps of its recent /ask (rate limit)
+const remotePolls = new Map();  // machine_id -> /answer polls held now
+
+// pre: the body when the caller already read it (an edge that fell back from forwarding)
+async function handleAsk(req, res, scope, pre) {
+  // body cap only where a question can come from another machine (a single machine keeps no cap, as before)
+  const { body, tooLarge } = pre || await readBody(req, MULTI ? ASK_MAX_BYTES : Infinity);
+  if (tooLarge) { log(`rejecting /ask (413): body over ${ASK_MAX_BYTES} bytes${scope.remote ? ` from machine=${scope.name}` : ""}`); return send(res, 413, { error: `request body over ${ASK_MAX_BYTES} bytes` }); }
+  const { v: args, err } = jsonOf(body);
+  if (err) return send(res, 400, { error: `bad JSON: ${err.message}` });
+  // Second line of defense — never ship a button-less menu / markup residue to the phone.
+  const problems = validateAskArgs(args);
+  if (problems.length) {
+    log("rejecting /ask (400):", problems.join("; "));
+    return send(res, 400, { error: problems.join("; ") });
+  }
+  // an edge may pick the request id (X-Myna-Request-Id, 10 hex) so it can cancel the question even when
+  // this reply never reaches it; the same id again from the same machine returns that request (idempotent)
+  let request_id;
+  if (scope.remote && req.headers[REQUEST_ID_HEADER] !== undefined) {
+    const want = String(req.headers[REQUEST_ID_HEADER]).trim().toLowerCase();
+    if (!/^[a-f0-9]{10}$/.test(want)) return send(res, 400, { error: "X-Myna-Request-Id must be 10 lowercase hex characters" });
+    const ex = pending.get(want);
+    if (ex) return machineOf(ex) === scope.id ? send(res, 200, { request_id: want }) : send(res, 409, { error: "request id in use — pick another" });
+    request_id = want;
+  }
+  if (scope.remote) {
+    const now = Date.now(), recent = (remoteAsks.get(scope.id) || []).filter((t) => now - t < REMOTE_ASK_WINDOW_MS);
+    if (recent.length >= REMOTE_ASK_MAX) {
+      remoteAsks.set(scope.id, recent);
+      log(`rejecting /ask (429) from machine=${scope.name}: ${recent.length} asks in ${REMOTE_ASK_WINDOW_MS / 1000}s`);
+      return send(res, 429, { error: `too many questions from this machine (${REMOTE_ASK_MAX} per ${REMOTE_ASK_WINDOW_MS / 1000}s)`, retry_after_s: Math.ceil((REMOTE_ASK_WINDOW_MS - (now - recent[0])) / 1000) });
+    }
+    recent.push(now); remoteAsks.set(scope.id, recent);
+    if (args.session_id) args.session_id = scope.sid(args.session_id);
+  }
+  // set by the relay only, never taken from the caller
+  delete args.machine_label;
+  const label = topicMachine(scope);
+  if (label) args.machine_label = label;
+  request_id ||= crypto.randomBytes(5).toString("hex");
+  const entry = newEntry(Date.now(), args.session_id, metaOf(args), scope.id);
+  // runtime only (persist() never writes it): the command a ✅ tap on THIS question approves
+  // and the one ✅ option whose tap approves it (validateAskArgs allows exactly one)
+  if (typeof args.approves === "string") { entry.approves = normalizeCommand(args.approves); entry.approveOption = approveOptionOf(args.options); }
+  pending.set(request_id, entry);
+  if (scope.remote) log(`remote ask from machine=${scope.name} (${scope.id}) → request ${request_id}${args.session_id ? ` session ${args.session_id}` : ""}`);
+  // sendQuestion throws when the question/keyboard could not be delivered to the phone (after the
+  // provider's own transient retries). Resolve the request as {kind:"unreachable"} so the client's
+  // /answer poll returns immediately and the orchestrator falls back to the local picker — instead
+  // of polling forever for an answer to a message the human never received (retro: this was
+  // logged-and-absorbed, so the 3-layer fallback never fired). request_id is still returned so the
+  // client has something to poll and collect the unreachable verdict.
+  // a remote machine's /cancel waits for this send to finish (entry.sending): an edge that gave the
+  // question up may cancel it while Telegram is still sending it, and only a sent message can be retracted
+  try {
+    const sending = provider.sendQuestion(request_id, args);
+    if (scope.remote) entry.sending = Promise.resolve(sending).catch(() => {});
+    await sending; persist(); // buttons are on the phone → journal them
+  }
+  catch (e) {
+    log("sendQuestion delivery failed — resolving unreachable:", e.message);
+    resolveRequest(request_id, { kind: "unreachable", error: `question delivery failed: ${e.message}` });
+  }
+  send(res, 200, { request_id });
+}
+
+async function handleCancel(res, id, scope) {
+  let entry = pending.get(id);
+  // another machine's request does not exist for this one (404 — not even its existence leaks)
+  if (scope.remote && (!entry || !scope.owns(entry))) return send(res, 404, { error: "no such request" });
+  if (scope.remote && entry.sending) { await entry.sending; entry = pending.get(id); if (!entry) return send(res, 200, { cancelled: false }); }
+  const open = !!entry && entry.result === undefined;
+  if (open) {
+    Promise.resolve(provider.cancelQuestion?.(id)).catch((e) => log("cancelQuestion err", e.message)); // reads its state synchronously, before resolve drops it
+    resolveRequest(id, { kind: "cancelled" });
+  }
+  send(res, 200, { cancelled: open });
+}
+
+async function handleAnswer(res, id, scope) {
+  const entry = pending.get(id);
+  if (!entry || !scope.owns(entry)) { res.writeHead(404); res.end('{"error":"no such request"}'); return; }
+  const json = { "content-type": "application/json" };
+  // handed off: the answer (now or later) belongs to whoever reattaches it — never deliver it here
+  const detachedReply = () => JSON.stringify({ kind: "detached", request_id: id, until: new Date(entry.detached.until).toISOString() });
+  if (entry.detached) { res.writeHead(200, json); res.end(detachedReply()); return; }
+  // already answered (human replied while the client was between polls) → deliver and consume.
+  if (entry.result !== undefined) {
+    pending.delete(id); persist();
+    res.writeHead(200, json); res.end(JSON.stringify(entry.result));
+    return;
+  }
+  if (scope.remote) {
+    const held = remotePolls.get(scope.id) || 0;
+    if (held >= REMOTE_MAX_POLLS) return send(res, 429, { error: `too many /answer polls held for this machine (${REMOTE_MAX_POLLS})` });
+    remotePolls.set(scope.id, held + 1);
+  }
+  // bounded long-poll: hold at most ANSWER_HOLD_MS, then return {kind:"pending"} so the client
+  // re-polls on a fresh short-lived socket. entry.promise resolves to a (never-undefined) result;
+  // the timer resolves to undefined — so `=== undefined` cleanly means "hold expired, still waiting".
+  // A detach while held wakes the poll (wake) so the answer is not collected by the old owner.
+  let timer, wake;
+  const held = new Promise((r) => { timer = setTimeout(() => r(undefined), ANSWER_HOLD_MS); wake = () => r(undefined); entry.wake.add(wake); });
+  entry.holders++;
+  const result = await Promise.race([entry.promise, held]);
+  clearTimeout(timer); entry.wake.delete(wake);
+  entry.holders--; entry.lastPoll = Date.now();
+  if (scope.remote) remotePolls.set(scope.id, Math.max(0, (remotePolls.get(scope.id) || 1) - 1));
+  if (entry.detached) { res.writeHead(200, json); res.end(detachedReply()); return; }
+  if (result === undefined) {
+    res.writeHead(200, json); res.end(JSON.stringify({ kind: "pending" }));
+    return;
+  }
+  pending.delete(id); persist();          // answered while we held → consume
+  res.writeHead(200, json); res.end(JSON.stringify(result));
+}
+
+async function handleSessionClose(req, res, scope, pre) {
+  const { body } = pre || await readBody(req, SMALL_BODY_BYTES);
+  const sid = scope.sid((jsonOf(body).v || {}).session_id);
+  if (sid) cancelPermissions(sid, "session end");
+  if (sid && openFor(sid)) {
+    closing.add(sid); persist();
+    log(`session ${sid} closed with open gate(s) — its topics stay until they are answered`);
+  } else if (sid && provider.closeSession) { try { await provider.closeSession(sid); } catch (e) { log("closeSession err", e.message); } }
+  send(res, 200, {});
+}
+
+async function handleRoundEnd(req, res, scope, pre) {
+  const { body } = pre || await readBody(req, SMALL_BODY_BYTES);
+  const sid = scope.sid((jsonOf(body).v || {}).session_id);
+  if (sid) cancelPermissions(sid, "round end");
+  // a gate of this session still waiting (e.g. a background subagent's) → the round is not over
+  const open = sid && [...pending.values()].some((q) => q.session_id === sid && q.result === undefined);
+  if (sid && !open && provider.endRound) { try { provider.endRound(sid); } catch (e) { log("endRound err", e.message); } }
+  send(res, 200, { ended: !!sid && !open });
+}
+
+// --- machines: revoke + join ----------------------------------------------------------------------
+// a machine revoked (machines.mjs revoke edits machines.json; the hub notices on its next look): its
+// token stops working at once (verify reads the file), its open questions are cancelled (buttons
+// retracted) and its approvals dropped
+function machinesRevoked(ids) {
+  const gone = new Set(ids);
+  for (const [id, p] of pending) {
+    if (!gone.has(machineOf(p)) || p.result !== undefined) continue;
+    log(`request ${id}: machine ${p.machine_id} revoked — cancelling`);
+    Promise.resolve(provider.cancelQuestion?.(id, "revoked")).catch((e) => log("cancelQuestion err", e.message));
+    resolveRequest(id, { kind: "cancelled", reason: "machine revoked" });
+  }
+  for (const [rid, a] of approvals) if (gone.has(a.machine_id)) approvals.delete(rid);
+  for (const id of ids) log(`machine ${id} revoked — its token no longer works`);
+}
+if (machines) setInterval(() => machines.refresh(), 5000).unref();
+
+// when a machine was last seen and from where (Cf-Connecting-Ip behind Cloudflare) — machines-seen.json,
+// written by the hub alone, at most once a minute
+const seen = !machines ? {} : (() => { try { return JSON.parse(fs.readFileSync(seenFile(cfg), "utf8")) || {}; } catch { return {}; } })();
+let seenSavedAt = 0;
+function noteSeen(m, req) {
+  const h = req.headers;
+  seen[m.id] = { last_seen_at: new Date().toISOString(), last_addr: String(h["cf-connecting-ip"] || String(h["x-forwarded-for"] || "").split(",")[0].trim() || req.socket.remoteAddress || "") };
+  if (Date.now() - seenSavedAt < 60000) return;
+  seenSavedAt = Date.now();
+  try { writePrivate(seenFile(cfg), JSON.stringify(seen, null, 2) + "\n"); } catch (e) { log("machines: could not save", seenFile(cfg), e.message); }
+}
+
+// Joining (a machine with no token yet): POST /machines/join {name, os, hostname, code,
+// enroll_secret_hash} → the phone gets "🆕 <name> 要加入，核對碼 <code> [✅ 允許] [❌ 拒絕]"; the
+// joining machine polls GET /machines/join/<enroll_id> with its enroll secret (whose hash it sent) and
+// gets the token once, only after the ✅ tap. Only the provider's button callback approves — the relay
+// never auto-answers, autopilot lives in the MCP client and never sees this question. Join requests
+// live in memory only: a relay restart drops them (the machine asks again).
+const JOIN_ALLOW = "✅ 允許", JOIN_DENY = "❌ 拒絕";
+const joins = new Map();   // enroll_id -> {qid, name, os, hostname, code, secretHash, expires, status, token?, machine?, wake, timer, doneAt?}
+const joinByQ = new Map(); // the join question's request_id -> enroll_id
+let lastJoinAt = 0;
+const shown = (s, n) => oneLine(String(s ?? "").replace(/[\u0000-\u001f\u007f-\u009f​-‏‪-‮⁦-⁩﻿]/g, " "), n) || "?";
+function finishJoin(j, status, extra = {}) {
+  clearTimeout(j.timer);
+  Object.assign(j, { status, doneAt: Date.now(), ...extra });
+  joinByQ.delete(j.qid);
+  for (const w of j.wake) w();
+}
+function joinAnswered(enrollId, result) {
+  const j = joins.get(enrollId);
+  joinByQ.delete(j?.qid);
+  if (!j || j.status !== "pending") return;
+  provider.onResolve?.(j.qid, result);   // the provider drops the question's button tokens
+  if (result?.kind !== "selection" || result.value !== JOIN_ALLOW) {
+    log(`join: ${j.name} denied on the phone (${result?.kind}${result?.value ? ` "${result.value}"` : ""})`);
+    return finishJoin(j, "denied");
+  }
+  if (machines.active().some((m) => m.name === j.name)) {
+    log(`join: ${j.name} approved, but that name was taken meanwhile — denied`);
+    return finishJoin(j, "denied", { reason: "name_taken" });
+  }
+  const id = newMachineId(), token = newMachineToken(id);
+  try { machines.add({ id, name: j.name, sha256: sha256hex(token), os: j.os, hostname: j.hostname, created_at: new Date().toISOString() }); }
+  catch (e) { log("join: could not save machines.json:", e.message); return finishJoin(j, "denied", { reason: "save_failed" }); }
+  log(`join: ${j.name} approved on the phone — machine ${id} added to ${machines.file}`);
+  finishJoin(j, "approved", { token, machine: { id, name: j.name } });
+}
+function expireJoin(enrollId) {
+  const j = joins.get(enrollId);
+  if (!j || j.status !== "pending") return;
+  log(`join: ${j.name} not answered within ${JOIN_TTL_MS / 1000}s — expired`);
+  Promise.resolve(provider.cancelQuestion?.(j.qid, "join_expired")).catch((e) => log("cancelQuestion err", e.message))
+    .finally(() => provider.onResolve?.(j.qid, { kind: "cancelled" }));
+  finishJoin(j, "expired");
+}
+async function joinStart(req, res) {
+  const { body, tooLarge } = await readBody(req, 4096);
+  if (tooLarge) return send(res, 413, { error: "request body too large" });
+  const a = jsonOf(body).v;
+  if (!a || typeof a !== "object") return send(res, 400, { error: "bad JSON" });
+  const name = String(a.name ?? "").trim().toLowerCase();
+  if (!NAME_RE.test(name)) return send(res, 400, { error: "name must be 1–16 of a-z 0-9 - (starting with a letter or digit)" });
+  if (!CODE_RE.test(String(a.code ?? ""))) return send(res, 400, { error: "code must look like ABC-234" });
+  if (!/^[a-f0-9]{64}$/.test(String(a.enroll_secret_hash ?? ""))) return send(res, 400, { error: "enroll_secret_hash must be a hex SHA-256" });
+  const open = [...joins.values()].filter((j) => j.status === "pending");
+  if (open.length >= JOIN_MAX_OPEN) return send(res, 429, { error: `too many join requests waiting (${JOIN_MAX_OPEN})`, retry_after_s: Math.ceil(Math.max(1000, Math.min(...open.map((j) => j.expires)) - Date.now()) / 1000) });
+  const since = Date.now() - lastJoinAt;
+  if (since < JOIN_INTERVAL_MS) return send(res, 429, { error: "one join request per interval — try again later", retry_after_s: Math.ceil((JOIN_INTERVAL_MS - since) / 1000) });
+  if (machines.active().some((m) => m.name === name) || open.some((j) => j.name === name)) return send(res, 409, { error: `a machine named "${name}" is already registered or joining — pick another --name, or revoke the old one on the hub (machines.mjs revoke ${name})` });
+  lastJoinAt = Date.now();
+  const enrollId = crypto.randomBytes(8).toString("hex"), qid = crypto.randomBytes(5).toString("hex");
+  const j = { qid, name, os: shown(a.os, 24), hostname: shown(a.hostname, 64), code: a.code, secretHash: a.enroll_secret_hash, expires: Date.now() + JOIN_TTL_MS, status: "pending", wake: new Set() };
+  joins.set(enrollId, j); joinByQ.set(qid, enrollId);
+  try {
+    await provider.sendQuestion(qid, {
+      header: "🆕 新機器要加入",
+      question: `${name}（${j.os}，主機名 ${j.hostname}）要加入這個 relay。\n核對碼：${j.code}\n先確認跟那台機器終端機上顯示的核對碼一樣，再按允許。不是你發起的就按拒絕。`,
+      options: [JOIN_ALLOW, JOIN_DENY],
+    });
+  } catch (e) {
+    log(`join: could not send ${name}'s join request to the phone: ${e.message}`);
+    joins.delete(enrollId); joinByQ.delete(qid);
+    return send(res, 503, { error: `the hub could not reach the phone: ${e.message}` });
+  }
+  j.timer = setTimeout(() => expireJoin(enrollId), JOIN_TTL_MS); j.timer.unref?.();
+  log(`join: ${name} (${j.os}, host ${j.hostname}) asks to join — code ${j.code}, waiting for the tap (${JOIN_TTL_MS / 1000}s)`);
+  send(res, 202, { enroll_id: enrollId, expires_at: new Date(j.expires).toISOString(), protocol: PROTOCOL });
+}
+async function joinPoll(req, res, enrollId) {
+  const j = joins.get(enrollId);
+  // unknown id and wrong secret look the same: 404
+  if (!j || !sameHex(sha256hex(String(req.headers[ENROLL_SECRET_HEADER] || "")), j.secretHash)) return send(res, 404, { error: "no such join request" });
+  if (j.status === "pending") {
+    let timer, wake;
+    await new Promise((r) => { timer = setTimeout(r, ANSWER_HOLD_MS); wake = r; j.wake.add(wake); });
+    clearTimeout(timer); j.wake.delete(wake);
+  }
+  if (joins.get(enrollId) !== j) return send(res, 404, { error: "no such join request" }); // another poll collected it meanwhile
+  if (j.status === "pending") return send(res, 200, { status: "pending", expires_at: new Date(j.expires).toISOString() });
+  joins.delete(enrollId); // the outcome — and the token — is handed out exactly once
+  if (j.status === "approved") return send(res, 200, { status: "approved", machine_id: j.machine.id, name: j.machine.name, token: j.token, protocol: PROTOCOL });
+  return send(res, 200, { status: j.status, ...(j.reason ? { reason: j.reason } : {}) });
+}
+// finished join requests nobody collected: dropped after a TTL; an approved one's machine is revoked
+// again (its token was never handed out — nobody can use it)
+if (machines) setInterval(() => {
+  for (const [eid, j] of joins) {
+    if (j.status === "pending" || Date.now() - j.doneAt < JOIN_TTL_MS) continue;
+    joins.delete(eid);
+    if (j.status === "approved") { machines.revoke(j.machine.id); log(`join: ${j.name}'s token was never collected — machine ${j.machine.id} revoked`); }
+  }
+}, Math.min(60000, JOIN_TTL_MS)).unref();
+
+// --- the remote listener (other machines' edge relays, through a tunnel) ------------------------
+async function handleRemote(req, res) {
+  const url = new URL(req.url, "http://x");
+  const proto = req.headers[PROTOCOL_HEADER];
+  if (proto !== undefined && String(proto).trim() !== String(PROTOCOL)) return send(res, 426, { error: `this hub speaks remote protocol ${PROTOCOL}`, protocol: PROTOCOL });
+  // joining needs no machine token (the machine has none yet): rate-limited, approved by a human tap
+  if (req.method === "POST" && url.pathname === "/machines/join") return joinStart(req, res);
+  const jm = url.pathname.match(/^\/machines\/join\/([a-f0-9]{16})$/);
+  if (req.method === "GET" && jm) return joinPoll(req, res, jm[1]);
+  // everything else: a valid, unrevoked machine token first — unknown paths included (401, not 404)
+  const m = machines.verify(bearerOf(req));
+  if (!m) { log(`remote: 401 ${req.method} ${url.pathname} (machine token missing, wrong or revoked)`); return send(res, 401, { error: "machine token missing, wrong or revoked" }); }
+  noteSeen(m, req);
+  const scope = remoteScope(m);
+  if (req.method === "GET" && url.pathname === "/health") {
+    // no local paths, pids or counts of other machines here
+    // bot_id: which bot this hub polls (Telegram: getMe's numeric id, the part of the token before ":")
+    // — an edge with the same bot must not poll it too
+    return send(res, 200, { ok: true, name: "myna-relay", version: VERSION, protocol: PROTOCOL, role: "hub", machine: { id: m.id, name: m.name }, bot_id: botIdentity(provider.name, cfg) });
+  }
+  if (req.method === "POST" && url.pathname === "/ask") return handleAsk(req, res, scope);
+  const am = url.pathname.match(/^\/answer\/([a-f0-9]+)$/);
+  if (req.method === "GET" && am) return handleAnswer(res, am[1], scope);
+  const cm = url.pathname.match(/^\/cancel\/([a-f0-9]+)$/);
+  if (req.method === "POST" && cm) { await readBody(req, SMALL_BODY_BYTES); return handleCancel(res, cm[1], scope); }
+  if (req.method === "POST" && url.pathname === "/session/close") return handleSessionClose(req, res, scope);
+  if (req.method === "POST" && url.pathname === "/session/round-end") return handleRoundEnd(req, res, scope);
+  // /pair, /shutdown, /attest, /detach, /reattach, /requests, /chat/* … do not exist here
+  send(res, 404, { error: `not available on the remote port (protocol ${PROTOCOL}): ${req.method} ${url.pathname}` });
+}
+
+// --- edge routing (MYNA_ROLE=edge) -------------------------------------------------------------------
+// Which way a local request goes. Returns true when handled here, false → the normal local handlers
+// (this machine's own bot, approvals, journal — exactly as on a single machine).
+//   new question: hub active → forwarded; else own bot (if any); else the connection is dropped so the
+//     client falls back to the terminal, as if no relay ran
+//   /answer, /cancel: a question of the own bot → local; one forwarded → the hub (a short outage: pending
+//     within MYNA_UPSTREAM_GRACE; past it → {kind:"unreachable"}, cancelled at the hub once back)
+//   /attest: always local — an approval lives in the relay whose bot took the tap; one from the hub is
+//     never asked for in this version (fail closed)
+const dropConn = (req) => { req.socket.destroy(); };
+const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
+async function edgeForward(req, p, body, timeoutMs, extra = {}) {
+  let r, text;
+  try {
+    r = await fetch(`${hub.url}${p}`, {
+      method: req.method, headers: hub.headers({ ...(body !== undefined ? { "content-type": "application/json" } : {}), ...extra }),
+      ...(body !== undefined ? { body } : {}), redirect: "manual", signal: AbortSignal.timeout(timeoutMs),
+    });
+    text = await r.text();
+  } catch (e) { hub.markDown(`cannot connect (${e.name === "TimeoutError" ? "timeout" : e.cause?.code || e.message})`); return { ok: false }; }
+  let json = null; try { json = JSON.parse(text); } catch {}
+  if (hub.failStatus(r.status)) { hub.markDown(hub.why(r.status, json)); return { ok: false }; }
+  return { ok: true, status: r.status, json, text, type: r.headers.get("content-type") || "application/json" };
+}
+const relayBack = (res, r) => { res.writeHead(r.status, { "content-type": r.type }); res.end(r.text); };
+async function edgeAnswer(req, res, id) {
+  if (hub.abandoned.has(id)) return send(res, 200, { kind: "unreachable", error: `the hub was away for over ${hub.GRACE_MS / 1000}s — this question was given up (its buttons are retracted once the hub is back)` });
+  if (hub.reachable) {
+    const r = await edgeForward(req, `/answer/${id}`, undefined, ANSWER_HOLD_MS + 30000);
+    if (r.ok) {
+      if (r.status === 404 || (r.status === 200 && r.json?.kind && r.json.kind !== "pending")) { hub.forwarded.delete(id); hub.save(); }
+      return relayBack(res, r);
+    }
+  }
+  if (!hub.inGrace(id)) { edgeGraceCheck(); return hub.abandoned.has(id) ? edgeAnswer(req, res, id) : dropConn(req); }
+  // a short outage: hold a moment, then "pending" — the client polls again
+  const until = Date.now() + Math.min(ANSWER_HOLD_MS, 5000);
+  while (Date.now() < until && !hub.reachable) await sleepMs(250);
+  if (hub.reachable) return edgeAnswer(req, res, id);
+  send(res, 200, { kind: "pending" });
+}
+async function edgeRoute(req, res, url) {
+  const p = url.pathname, M = req.method;
+  if ((M === "GET" && p === "/health") || (M === "POST" && p === "/shutdown") || p === "/attest") return false;
+  if (p.startsWith("/pair/") || p.startsWith("/chat/") || /^\/(detach|reattach)\//.test(p) || p === "/requests") {
+    if (ownBot.on) return false;   // pairing / chat / handoff of this machine's own bot
+    if (p.startsWith("/pair/")) { send(res, 400, { error: `this machine is an edge (MYNA_ROLE=edge) without a bot of its own — pairing is done on the hub` }); return true; }
+    if (M === "GET" && p === "/chat/session") { send(res, 200, { chat: false }); return true; }
+    send(res, 501, { error: `${p} is not available on an edge without a bot of its own (remote protocol ${PROTOCOL})` }); return true;
+  }
+  await hub.first;
+  const am = p.match(/^\/answer\/([a-f0-9]+)$/), cm = p.match(/^\/cancel\/([a-f0-9]+)$/);
+  if (M === "GET" && am) { if (pending.has(am[1])) return false; await edgeAnswer(req, res, am[1]); return true; }
+  if (M === "POST" && cm) {
+    const id = cm[1];
+    if (pending.has(id)) return false;
+    await readBody(req, SMALL_BODY_BYTES);
+    if (hub.reachable) { const r = await edgeForward(req, `/cancel/${id}`, "{}", 10000); if (r.ok) { hub.forwarded.delete(id); hub.save(); return relayBack(res, r), true; } }
+    if (hub.forwarded.has(id)) { hub.forwarded.delete(id); hub.abandoned.add(id); hub.save(); send(res, 200, { cancelled: true, queued: true }); return true; }
+    dropConn(req); return true;
+  }
+  if (M === "POST" && p === "/ask") {
+    const pre = await readBody(req, ASK_MAX_BYTES);
+    if (pre.tooLarge) { send(res, 413, { error: `request body over ${ASK_MAX_BYTES} bytes` }); return true; }
+    if (hub.active) {
+      // the edge picks the request id (X-Myna-Request-Id): when the forward fails it still knows which
+      // question the hub may have put on the phone (the reply lost in a broken link), and cancels it
+      // there once the hub is back — a copy that might exist does not stay answerable
+      const rid = crypto.randomBytes(5).toString("hex");
+      const r = await edgeForward(req, "/ask", pre.body, 30000, { [REQUEST_ID_HEADER]: rid });
+      if (r.ok) { if (r.status === 200 && r.json?.request_id) { hub.forwarded.set(String(r.json.request_id), { at: Date.now() }); hub.save(); } relayBack(res, r); return true; }
+      hub.abandoned.add(rid); hub.save();
+    }
+    if (ownBot.on) { log(`hub away (${hub.reason}) — asking on this machine's own bot`); await handleAsk(req, res, LOCAL_SCOPE, pre); return true; }
+    dropConn(req); return true;
+  }
+  if (M === "POST" && (p === "/session/close" || p === "/session/round-end")) {
+    // both places may hold this session's topics: the hub's and this machine's own bot's
+    const pre = await readBody(req, SMALL_BODY_BYTES);
+    const r = hub.reachable ? await edgeForward(req, p, pre.body || "{}", 10000) : { ok: false };
+    if (ownBot.on) { await (p === "/session/close" ? handleSessionClose : handleRoundEnd)(req, res, LOCAL_SCOPE, pre); return true; }
+    if (r.ok) { relayBack(res, r); return true; }
+    dropConn(req); return true;
+  }
+  if (!hub.reachable && !ownBot.on) { dropConn(req); return true; } // GET / and the like: "is a relay there?"
+  return false;
+}
+const edgeHealth = () => ({
+  upstream: { url: hub.url, reachable: hub.reachable, active: hub.active, reason: hub.reason || undefined, since: new Date(hub.since).toISOString(), version: hub.version, protocol: hub.protocol, machine: hub.machine, bot_id: hub.bot, cf_access: hub.cf, forwarded: hub.forwarded.size, abandoned: hub.abandoned.size },
+  own_bot: { on: ownBot.on, id: ownBot.id, ...(ownBot.reason ? { reason: ownBot.reason } : {}) },
+});
 
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, "http://x");
+  // the local listener takes no credentials — refuse what is not a local client:
+  //   always: a non-loopback Host (DNS rebinding from a web page) and a browser request (Origin; a page
+  //     could otherwise POST /ask, /shutdown, /pair/start). Local clients (Node fetch, curl, hooks)
+  //     send neither. /chat/* is exempt from the Origin check: it authenticates with its own secrets.
+  //   multi-machine only: a request a proxy forwarded (a tunnel pointed at this port by mistake) — only
+  //     there does a tunnel run next to the relay.
+  const refused = localRefusal(req, { checkOrigin: !url.pathname.startsWith("/chat/"), checkProxy: MULTI });
+  if (refused) { log(`local: 403 ${req.method} ${url.pathname} — ${refused}`); return send(res, 403, { error: refused }); }
+  if (EDGE && await edgeRoute(req, res, url)) return;
   if (await chat.handle(req, res, url)) return;
   if (req.method === "GET" && url.pathname === "/health") {
     // identity + liveness for ensure-relay / `/myna:relay status`. `pending` = gates still waiting
     // for a human answer (ensure-relay will not replace a stale relay while one is open).
     let open = 0; for (const p of pending.values()) if (p.result === undefined) open++;
+    if (EDGE) open += hub.forwarded.size; // questions waiting on the hub count too
     res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify({ ok: true, name: "myna-relay", version: VERSION, provider: provider.name, pid: process.pid, root: ROOT, started_at: STARTED_AT, pending: open, detached: [...pending.values()].filter((p) => p.detached).length, handoff: true, attest: true, approval_ttl_ms: APPROVAL_TTL_MS, journal: PENDING_FILE, chat: !!provider.chatOpen, chat_sessions: chat.count(), net_attempt_ms: NET_ATTEMPT_MS }));
+    res.end(JSON.stringify({ ok: true, name: "myna-relay", version: VERSION, provider: provider.name, pid: process.pid, root: ROOT, started_at: STARTED_AT, pending: open, detached: [...pending.values()].filter((p) => p.detached).length, handoff: true, attest: true, approval_ttl_ms: APPROVAL_TTL_MS, journal: PENDING_FILE, chat: !!provider.chatOpen, chat_sessions: chat.count(), net_attempt_ms: NET_ATTEMPT_MS,
+      role: ROLE, protocol: PROTOCOL, machine: MACHINE_NAME, ...(EDGE ? edgeHealth() : {}), remote: REMOTE_PORT ? { port: REMOTE_PORT, listening: remoteListening, machines: machines.active().length, joining: [...joins.values()].filter((j) => j.status === "pending").length } : null }));
     return;
   }
   // pairing (Telegram): /myna:pair asks for a one-time code; the human sends `/pair <code>` from the
@@ -326,33 +951,8 @@ const server = http.createServer(async (req, res) => {
   if (req.method === "POST" && url.pathname === "/shutdown") {
     res.writeHead(200); res.end("bye"); log("shutdown requested"); setTimeout(() => process.exit(0), 50); return;
   }
-  if (req.method === "POST" && url.pathname === "/session/close") {
-    let body = ""; req.on("data", (c) => (body += c));
-    req.on("end", async () => {
-      let sid; try { sid = JSON.parse(body || "{}").session_id; } catch {}
-      sid = sid ? String(sid) : "";
-      if (sid) cancelPermissions(sid, "session end");
-      if (sid && openFor(sid)) {
-        closing.add(sid); persist();
-        log(`session ${sid} closed with open gate(s) — its topics stay until they are answered`);
-      } else if (sid && provider.closeSession) { try { await provider.closeSession(sid); } catch (e) { log("closeSession err", e.message); } }
-      res.writeHead(200, { "content-type": "application/json" }); res.end("{}");
-    });
-    return;
-  }
-  if (req.method === "POST" && url.pathname === "/session/round-end") {
-    let body = ""; req.on("data", (c) => (body += c));
-    req.on("end", () => {
-      let sid; try { sid = JSON.parse(body || "{}").session_id; } catch {}
-      sid = sid ? String(sid) : "";
-      if (sid) cancelPermissions(sid, "round end");
-      // a gate of this session still waiting (e.g. a background subagent's) → the round is not over
-      const open = sid && [...pending.values()].some((q) => q.session_id === sid && q.result === undefined);
-      if (sid && !open && provider.endRound) { try { provider.endRound(sid); } catch (e) { log("endRound err", e.message); } }
-      res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify({ ended: !!sid && !open }));
-    });
-    return;
-  }
+  if (req.method === "POST" && url.pathname === "/session/close") return handleSessionClose(req, res, LOCAL_SCOPE);
+  if (req.method === "POST" && url.pathname === "/session/round-end") return handleRoundEnd(req, res, LOCAL_SCOPE);
   // /attest: a guard asks whether the human approved exactly this command for this session. Everything
   // after the body is read runs synchronously — look up and mark used in one step, so two concurrent
   // attests for one approval can never both get approved:true (the relay is a single process).
@@ -366,7 +966,9 @@ const server = http.createServer(async (req, res) => {
       const command = normalizeCommand(a.command), now = Date.now();
       let hit, used = false, expired = false;
       for (const ap of approvals.values()) {
-        if (ap.session_id !== a.session_id || ap.command !== command) continue;
+        // bound to (machine, session, command): this listener is the hub's own machine — another
+        // machine's approval never matches here, whatever session id is given
+        if ((ap.machine_id || LOCAL_ID) !== LOCAL_ID || ap.session_id !== a.session_id || ap.command !== command) continue;
         if (ap.used_at) { used = true; continue; }
         if (approvalExpired(ap, now)) { expired = true; continue; }
         if (!hit || Date.parse(ap.answered_at) < Date.parse(hit.answered_at)) hit = ap; // oldest first: it expires first
@@ -382,84 +984,11 @@ const server = http.createServer(async (req, res) => {
     });
     return;
   }
-  if (req.method === "POST" && url.pathname === "/ask") {
-    let body = ""; req.on("data", (c) => (body += c));
-    req.on("end", async () => {
-      let args;
-      try { args = JSON.parse(body || "{}"); } catch (e) {
-        res.writeHead(400, { "content-type": "application/json" }); res.end(JSON.stringify({ error: `bad JSON: ${e.message}` })); return;
-      }
-      // Second line of defense — never ship a button-less menu / markup residue to the phone.
-      const problems = validateAskArgs(args);
-      if (problems.length) {
-        log("rejecting /ask (400):", problems.join("; "));
-        res.writeHead(400, { "content-type": "application/json" }); res.end(JSON.stringify({ error: problems.join("; ") })); return;
-      }
-      const request_id = crypto.randomBytes(5).toString("hex");
-      const entry = newEntry(Date.now(), args.session_id, metaOf(args));
-      // runtime only (persist() never writes it): the command a ✅ tap on THIS question approves
-      // and the one ✅ option whose tap approves it (validateAskArgs allows exactly one)
-      if (typeof args.approves === "string") { entry.approves = normalizeCommand(args.approves); entry.approveOption = approveOptionOf(args.options); }
-      pending.set(request_id, entry);
-      // sendQuestion throws when the question/keyboard could not be delivered to the phone (after the
-      // provider's own transient retries). Resolve the request as {kind:"unreachable"} so the client's
-      // /answer poll returns immediately and the orchestrator falls back to the local picker — instead
-      // of polling forever for an answer to a message the human never received (retro: this was
-      // logged-and-absorbed, so the 3-layer fallback never fired). request_id is still returned so the
-      // client has something to poll and collect the unreachable verdict.
-      try { await provider.sendQuestion(request_id, args); persist(); } // buttons are on the phone → journal them
-      catch (e) {
-        log("sendQuestion delivery failed — resolving unreachable:", e.message);
-        resolveRequest(request_id, { kind: "unreachable", error: `question delivery failed: ${e.message}` });
-      }
-      res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify({ request_id }));
-    });
-    return;
-  }
+  if (req.method === "POST" && url.pathname === "/ask") return handleAsk(req, res, LOCAL_SCOPE);
   const cm = url.pathname.match(/^\/cancel\/([a-f0-9]+)$/);
-  if (req.method === "POST" && cm) {
-    const entry = pending.get(cm[1]);
-    const open = !!entry && entry.result === undefined;
-    if (open) {
-      Promise.resolve(provider.cancelQuestion?.(cm[1])).catch((e) => log("cancelQuestion err", e.message)); // reads its state synchronously, before resolve drops it
-      resolveRequest(cm[1], { kind: "cancelled" });
-    }
-    res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify({ cancelled: open }));
-    return;
-  }
+  if (req.method === "POST" && cm) return handleCancel(res, cm[1], LOCAL_SCOPE);
   const m = url.pathname.match(/^\/answer\/([a-f0-9]+)$/);
-  if (req.method === "GET" && m) {
-    const entry = pending.get(m[1]);
-    if (!entry) { res.writeHead(404); res.end('{"error":"no such request"}'); return; }
-    const json = { "content-type": "application/json" };
-    // handed off: the answer (now or later) belongs to whoever reattaches it — never deliver it here
-    const detachedReply = () => JSON.stringify({ kind: "detached", request_id: m[1], until: new Date(entry.detached.until).toISOString() });
-    if (entry.detached) { res.writeHead(200, json); res.end(detachedReply()); return; }
-    // already answered (human replied while the client was between polls) → deliver and consume.
-    if (entry.result !== undefined) {
-      pending.delete(m[1]); persist();
-      res.writeHead(200, json); res.end(JSON.stringify(entry.result));
-      return;
-    }
-    // bounded long-poll: hold at most ANSWER_HOLD_MS, then return {kind:"pending"} so the client
-    // re-polls on a fresh short-lived socket. entry.promise resolves to a (never-undefined) result;
-    // the timer resolves to undefined — so `=== undefined` cleanly means "hold expired, still waiting".
-    // A detach while held wakes the poll (wake) so the answer is not collected by the old owner.
-    let timer, wake;
-    const held = new Promise((r) => { timer = setTimeout(() => r(undefined), ANSWER_HOLD_MS); wake = () => r(undefined); entry.wake.add(wake); });
-    entry.holders++;
-    const result = await Promise.race([entry.promise, held]);
-    clearTimeout(timer); entry.wake.delete(wake);
-    entry.holders--; entry.lastPoll = Date.now();
-    if (entry.detached) { res.writeHead(200, json); res.end(detachedReply()); return; }
-    if (result === undefined) {
-      res.writeHead(200, json); res.end(JSON.stringify({ kind: "pending" }));
-      return;
-    }
-    pending.delete(m[1]); persist();          // answered while we held → consume
-    res.writeHead(200, json); res.end(JSON.stringify(result));
-    return;
-  }
+  if (req.method === "GET" && m) return handleAnswer(res, m[1], LOCAL_SCOPE);
   const dm = url.pathname.match(/^\/(detach|reattach)\/([a-f0-9]+)$/);
   if (req.method === "POST" && dm) {
     let body = ""; req.on("data", (c) => (body += c));
@@ -525,5 +1054,18 @@ server.on("error", (e) => {
 server.listen(PORT, "127.0.0.1", () => {
   log(`relay v${VERSION} http on http://127.0.0.1:${PORT}  provider=${provider.name}  root=${ROOT}  net_attempt_ms=${NET_ATTEMPT_MS ?? "(Node default)"}`);
   if (adopted && (adopted.open || adopted.answered)) log(`adopted ${adopted.open} open gate(s) + ${adopted.answered} answered-uncollected (${adopted.detached} detached) from the previous relay (v${adopted.from || "?"}, journal ${adopted.saved_at}) — buttons already on the phone stay valid`);
+  if (EDGE) log(`edge → hub ${hub.url} (${hub.reachable ? "reachable" : `not reachable: ${hub.reason}`}; CF Access headers ${hub.cf ? "on" : "off"}); own bot: ${ownBot.on ? `${ownBot.id || provider.name} — fallback while the hub is away` : ownBot.reason}`);
   provider.start();
+  // the remote listener starts only once this process owns the local port (a second relay exits above)
+  if (REMOTE_PORT) {
+    const remote = http.createServer((req, res) => {
+      handleRemote(req, res).catch((e) => { log("remote handler error:", e.message); try { send(res, 500, { error: "internal error" }); } catch {} });
+    });
+    // a port someone else holds: say so loudly, keep serving this machine (the local side is unaffected)
+    remote.on("error", (e) => log(`remote listener on 127.0.0.1:${REMOTE_PORT} failed: ${e.message} — other machines cannot reach this hub until it is fixed (restart the relay)`));
+    remote.listen(REMOTE_PORT, "127.0.0.1", () => {
+      remoteListening = true;
+      log(`remote listener on http://127.0.0.1:${REMOTE_PORT} (protocol ${PROTOCOL}) — ${machines.active().length} machine(s) in ${machines.file}; point the tunnel here, never at :${PORT}`);
+    });
+  }
 });

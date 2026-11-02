@@ -137,7 +137,9 @@ export function create(cfg, ctx) {
 
   async function gatewayOnce() {
     const g = await rest("GET", "/gateway/bot");
+    if (stopped) return;
     const ws = new WebSocket(`${g?.url || "wss://gateway.discord.gg"}?v=10&encoding=json`);
+    current = ws;
     let seq = null, hb = null;
     ws.addEventListener("message", (ev) => {
       let m; try { m = JSON.parse(String(ev.data)); } catch { return; }
@@ -159,17 +161,22 @@ export function create(cfg, ctx) {
     if (hb) clearInterval(hb);
   }
 
+  // stop for good (an edge that found the hub uses this same bot): close the gateway, no reconnect
+  let stopped = false, current = null;
+  function stop() { stopped = true; try { current?.close(); } catch {} }
   async function start() {
     log("Discord gateway loop started");
-    for (;;) {
+    while (!stopped) {
       try { await gatewayOnce(); } catch (e) { log("gateway err", errText(e)); }
+      if (stopped) break;
       log("Discord gateway disconnected — reconnecting in 3s");
       await new Promise((r) => setTimeout(r, 3000));
     }
+    log("Discord gateway loop stopped");
   }
 
   return {
-    name, start, sendQuestion,
+    name, start, stop, sendQuestion,
     onResolve(request_id) {
       for (const [t, v] of tokens) if (v.request_id === request_id) tokens.delete(t);
     },

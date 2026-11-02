@@ -142,7 +142,9 @@ export function create(cfg, ctx) {
   async function socketOnce() {
     const open = await api("apps.connections.open", undefined, APP);
     if (!open.ok || !open.url) throw new Error(`apps.connections.open failed: ${open.error || "no url"}`);
+    if (stopped) return;
     const ws = new WebSocket(open.url);
+    current = ws;
     ws.addEventListener("message", (ev) => {
       let m; try { m = JSON.parse(String(ev.data)); } catch { return; }
       // ack immediately (3s deadline); a bare ack on view_submission also closes the modal
@@ -154,17 +156,22 @@ export function create(cfg, ctx) {
     await new Promise((r) => { ws.addEventListener("close", r); ws.addEventListener("error", r); });
   }
 
+  // stop for good (an edge that found the hub uses this same bot): close the socket, no reconnect
+  let stopped = false, current = null;
+  function stop() { stopped = true; try { current?.close(); } catch {} }
   async function start() {
     log("Slack Socket Mode loop started");
-    for (;;) {
+    while (!stopped) {
       try { await socketOnce(); } catch (e) { log("socket err", errText(e)); }
+      if (stopped) break;
       log("Slack socket disconnected — reconnecting in 3s");
       await new Promise((r) => setTimeout(r, 3000));
     }
+    log("Slack Socket Mode loop stopped");
   }
 
   return {
-    name, start, sendQuestion,
+    name, start, stop, sendQuestion,
     onResolve(request_id) {
       for (const [t, v] of tokens) if (v.request_id === request_id) tokens.delete(t);
     },

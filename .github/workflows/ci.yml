@@ -83,6 +83,9 @@ jobs:
       - name: Smoke — Stop hook (stop-catch + round-end + background-work guard)
         run: node test/smoke-stopcatch.mjs
 
+      - name: Smoke — several machines, one relay (hub remote port + edge relays + join by ✅ tap, stubbed Telegram + Access)
+        run: node test/smoke-remote.mjs
+
       - name: Smoke — relay daemon lifecycle (fake .env — no real bot)
         run: |
           printf 'TELEGRAM_BOT_TOKEN=fake\nTELEGRAM_CHAT_ID=1\nTELEGRAM_API_BASE=http://127.0.0.1:9\n' > "$RUNNER_TEMP/myna.env"
