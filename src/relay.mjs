@@ -123,7 +123,7 @@ const REMOTE_PORT = (() => {
 })();
 let remoteListening = false;
 // several machines are configured on this one (hub with a remote port, or an edge). Without it the
-// relay behaves as 0.19.2: no local-port guards, no /ask body cap.
+// relay takes /ask bodies of any size and does not check the local port for proxy headers (no tunnel).
 const MULTI = !!REMOTE_PORT || EDGE;
 // this machine's short name (topic prefix once other machines have joined; logs)
 const MACHINE_NAME = (String(cfg.MYNA_MACHINE_NAME || os.hostname().split(".")[0] || "").toLowerCase().replace(/[^a-z0-9-]/g, "").slice(0, 16)) || "hub";
@@ -444,13 +444,24 @@ function edgeLink() {
       log(`hub ${h.url} ${h.everUp ? "back" : "reachable"} — v${j.version}, protocol ${j.protocol}, this machine = ${h.machine}; new questions go to the hub`);
       h.everUp = true;
     }
-    if (!was) { h.save(); h.flush(); }
+    if (!was) h.save();
+    h.flush();
   };
+  // cancel at the hub what was given up — retried on every good check until the hub confirms it: 200
+  // (cancelled, or already over) or 404 (it never got the question). Anything else (401, 403, 3xx, 5xx,
+  // timeout) keeps the id for the next check.
+  let flushing = false;
   h.flush = async () => {
-    for (const id of [...h.abandoned]) {
-      try { const r = await fetch(`${h.url}/cancel/${id}`, { method: "POST", headers: h.headers(), signal: AbortSignal.timeout(5000) }); if (r.status < 500) { h.abandoned.delete(id); h.save(); } }
-      catch { return; }
-    }
+    if (flushing || !h.abandoned.size) return;
+    flushing = true;
+    try {
+      for (const id of [...h.abandoned]) {
+        let r;
+        try { r = await fetch(`${h.url}/cancel/${id}`, { method: "POST", headers: h.headers(), redirect: "manual", signal: AbortSignal.timeout(5000) }); }
+        catch { return; }
+        if (r.status === 200 || r.status === 404) { h.abandoned.delete(id); h.save(); log(`edge: question ${id} given up during the outage — ${r.status === 200 ? "cancelled at the hub" : "the hub never had it"}`); }
+      }
+    } finally { flushing = false; }
   };
   h.inGrace = (id) => h.forwarded.has(id) && Date.now() - h.downSince < h.GRACE_MS;
   return h;
@@ -567,7 +578,13 @@ async function handleAsk(req, res, scope, pre) {
   // of polling forever for an answer to a message the human never received (retro: this was
   // logged-and-absorbed, so the 3-layer fallback never fired). request_id is still returned so the
   // client has something to poll and collect the unreachable verdict.
-  try { await provider.sendQuestion(request_id, args); persist(); } // buttons are on the phone → journal them
+  // a remote machine's /cancel waits for this send to finish (entry.sending): an edge that gave the
+  // question up may cancel it while Telegram is still sending it, and only a sent message can be retracted
+  try {
+    const sending = provider.sendQuestion(request_id, args);
+    if (scope.remote) entry.sending = Promise.resolve(sending).catch(() => {});
+    await sending; persist(); // buttons are on the phone → journal them
+  }
   catch (e) {
     log("sendQuestion delivery failed — resolving unreachable:", e.message);
     resolveRequest(request_id, { kind: "unreachable", error: `question delivery failed: ${e.message}` });
@@ -575,10 +592,11 @@ async function handleAsk(req, res, scope, pre) {
   send(res, 200, { request_id });
 }
 
-function handleCancel(res, id, scope) {
-  const entry = pending.get(id);
+async function handleCancel(res, id, scope) {
+  let entry = pending.get(id);
   // another machine's request does not exist for this one (404 — not even its existence leaks)
   if (scope.remote && (!entry || !scope.owns(entry))) return send(res, 404, { error: "no such request" });
+  if (scope.remote && entry.sending) { await entry.sending; entry = pending.get(id); if (!entry) return send(res, 200, { cancelled: false }); }
   const open = !!entry && entry.result === undefined;
   if (open) {
     Promise.resolve(provider.cancelQuestion?.(id)).catch((e) => log("cancelQuestion err", e.message)); // reads its state synchronously, before resolve drops it
@@ -902,11 +920,13 @@ const edgeHealth = () => ({
 
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, "http://x");
-  // multi-machine only: this machine now runs a tunnel next to the relay, so the local listener (no
-  // credentials) refuses what is not a local client — a request a proxy forwarded (the tunnel pointed at
-  // the wrong port), a non-loopback Host, a browser. /chat/* is exempt from the Origin check: it
-  // authenticates with its own secrets. A single machine is left exactly as it was.
-  const refused = MULTI && localRefusal(req, { checkOrigin: !url.pathname.startsWith("/chat/") });
+  // the local listener takes no credentials — refuse what is not a local client:
+  //   always: a non-loopback Host (DNS rebinding from a web page) and a browser request (Origin; a page
+  //     could otherwise POST /ask, /shutdown, /pair/start). Local clients (Node fetch, curl, hooks)
+  //     send neither. /chat/* is exempt from the Origin check: it authenticates with its own secrets.
+  //   multi-machine only: a request a proxy forwarded (a tunnel pointed at this port by mistake) — only
+  //     there does a tunnel run next to the relay.
+  const refused = localRefusal(req, { checkOrigin: !url.pathname.startsWith("/chat/"), checkProxy: MULTI });
   if (refused) { log(`local: 403 ${req.method} ${url.pathname} — ${refused}`); return send(res, 403, { error: refused }); }
   if (EDGE && await edgeRoute(req, res, url)) return;
   if (await chat.handle(req, res, url)) return;

@@ -180,9 +180,10 @@ export const ASK_MAX_BYTES_DEFAULT = 256 * 1024;
 // rebinding from a web page), and a browser request (it carries Origin). Returns why, or "".
 const PROXY_HEADERS = ["forwarded", "x-forwarded-for", "x-forwarded-host", "x-real-ip", "cf-connecting-ip", "cf-ray", "tailscale-user-login"];
 const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "[::1]", "::1"]);
-export function localRefusal(req, { checkOrigin = true } = {}) {
+// checkProxy: only where a tunnel runs next to the relay (multi-machine); checkOrigin: off for /chat/*
+export function localRefusal(req, { checkOrigin = true, checkProxy = true } = {}) {
   const h = req.headers;
-  const proxied = PROXY_HEADERS.find((k) => h[k] !== undefined);
+  const proxied = checkProxy && PROXY_HEADERS.find((k) => h[k] !== undefined);
   if (proxied) return `proxied request (${proxied}) — the local port is for this machine only; point a tunnel at MYNA_REMOTE_PORT`;
   if (h.host !== undefined) {
     let host = String(h.host).trim().toLowerCase();

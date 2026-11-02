@@ -602,7 +602,7 @@ session 取走你的訊息時,那則訊息會被標上 👀。session 正在忙�
 
 ## 多台機器共用一支 bot(v0.20.0)
 
-好幾台電腦都在跑 Claude Code,但手機上只想要一支 bot、一個收件匣時用。**不設定就完全不會用到**:沒有 `MYNA_REMOTE_PORT`、沒有 `MYNA_ROLE=edge` 時,行為跟 0.19.2 一樣(`/health` 多幾個欄位而已;下面「本機 port 的防呆」和 `/ask` 的 body 上限只在設定多機時才開)。
+好幾台電腦都在跑 Claude Code,但手機上只想要一支 bot、一個收件匣時用。**不設定就完全不會用到**:沒有 `MYNA_REMOTE_PORT`、沒有 `MYNA_ROLE=edge` 時,行為跟 0.19.2 一樣,只差兩點:`/health` 多幾個欄位,以及本機 port 會拒絕瀏覽器發出的請求和不是 loopback 的 `Host`(見下面「本機 port 的防呆」)。
 
 - **主節點(hub)**:手機上主要用的那支 bot 在這台。它的 relay 除了本機的 `127.0.0.1:7800`,再開一個給其他機器用的 `127.0.0.1:7801`(每個請求都要 machine token)。
 - **遠端(edge)**:其他機器。它的 relay 把本機的題目加上 machine token 轉到主節點。`ask_human`、權限確認、攔截、stop-catch、你自己的護欄都**不用改**,照樣打 `127.0.0.1:7800`。遠端**可以保留自己原本的 bot**,當主節點不在時的備援;但不能跟主節點是同一支(relay 會比對 bot id,相同就不用自己的,只轉送)。
@@ -643,7 +643,9 @@ MYNA_MACHINE_NAME=win        # 選填,topic 前面的短名稱(預設 hostname)
 - **撤銷**:在主節點 `/myna:machines revoke mbp`,那台的 token 馬上失效,它還開著的題目會被取消(手機按鈕收回)。`/myna:machines` 列出所有機器、最後連線時間和來源。
 - 主節點每台機器每 10 分鐘最多 30 題(`MYNA_REMOTE_ASK_MAX` / `MYNA_REMOTE_ASK_WINDOW_MS`);加入要求同時最多 3 筆、每分鐘 1 筆。
 
-**本機 port 的防呆(只在設定多機時)**:有 `MYNA_REMOTE_PORT` 或 `MYNA_ROLE=edge` 時,這台旁邊會跑一個 tunnel,而 `127.0.0.1:7800` 不需要 credential,所以 relay 拒絕(403)三種不像本機程式的請求,`/ask` 的 body 也限制在 256 KB:帶代理標頭的(`X-Forwarded-For`、`Cf-Connecting-Ip` 等,擋 tunnel 指錯 port)、`Host` 不是 `127.0.0.1` / `localhost` 的(擋 DNS rebinding)、帶 `Origin` 的瀏覽器請求(`/chat/*` 除外)。用 `curl`、Node 的 `fetch` 打 `127.0.0.1` 都不受影響。
+**本機 port 的防呆(v0.20.0)**:`127.0.0.1:7800` 不需要 credential,所以 relay 拒絕(403)不像本機程式的請求:
+- **一律**(單機也是):`Host` 不是 `127.0.0.1` / `localhost` / `[::1]` 的(擋網頁的 DNS rebinding),和帶 `Origin` 的瀏覽器請求(擋網頁直接 POST `/ask`、`/shutdown`、`/pair/start`;`/chat/*` 除外,它本來就要 relay 密鑰)。`curl`、Node 的 `fetch`、hooks、護欄都不帶 `Origin`,也都打 `127.0.0.1`,不受影響。如果你自己用 `/etc/hosts` 取了別的名字指到 127.0.0.1,改回 `127.0.0.1`。
+- **只在設定多機時**(`MYNA_REMOTE_PORT` 或 `MYNA_ROLE=edge`,這時旁邊會跑 tunnel):帶代理標頭的請求(`X-Forwarded-For`、`Cf-Connecting-Ip` 等,擋 tunnel 指錯 port),以及 `/ask` 的 body 上限 256 KB。
 
 ---
 

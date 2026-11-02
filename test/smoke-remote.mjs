@@ -61,13 +61,14 @@ const stub = http.createServer((req, res) => {
   req.on("end", () => {
     const b = (() => { try { return JSON.parse(body || "{}"); } catch { return {}; } })();
     if (/\/getUpdates$/.test(u.pathname)) { const deliver = () => { const out = updates; updates = []; json({ ok: true, result: out }); }; updates.length ? deliver() : setTimeout(deliver, 100); return; }
-    if (/\/sendMessage$/.test(u.pathname)) { b.message_id = ++mid; sent.push(b); json({ ok: true, result: { message_id: b.message_id } }); return; }
+    if (/\/sendMessage$/.test(u.pathname)) { b.message_id = ++mid; sent.push(b); setTimeout(() => json({ ok: true, result: { message_id: b.message_id } }), stubCtl.sendDelayMs); return; }
     if (/\/createForumTopic$/.test(u.pathname)) { b.message_thread_id = ++thread; topicsCreated.push(b); json({ ok: true, result: { message_thread_id: b.message_thread_id } }); return; }
     if (/\/editMessageReplyMarkup$/.test(u.pathname)) { markupEdits.push(b); json({ ok: true, result: true }); return; }
     json({ ok: true, result: true });
   });
 });
 await new Promise((r) => stub.listen(0, "127.0.0.1", r));
+const stubCtl = { sendDelayMs: 0 }; // sendMessage answers this late (a slow Telegram)
 const keyboardWith = (re) => until(() => [...sent].reverse().find((s) => s.reply_markup?.inline_keyboard && re.test(s.text || "")));
 const tap = (msg, row, idx) => updates.push({ update_id: nextUpdateId++, callback_query: { id: `cq${nextUpdateId}`, data: msg.reply_markup.inline_keyboard[row][idx].callback_data, message: { chat: { id: 42 }, message_id: msg.message_id } } });
 // an edge machine's OWN bot (another Telegram stub)
@@ -117,9 +118,11 @@ if (!(await up(`${HUB}/health`))) { console.error("❌ hub relay never came up")
 
 // --- "Cloudflare Access" + tunnel stub in front of a port -----------------------------------------
 function accessProxy(target, { requireCf = true } = {}) {
-  const st = { down: false, seen: [] };
+  // cancelReplies: statuses to answer the next /cancel requests with, instead of passing them on
+  const st = { down: false, seen: [], cancelReplies: [] };
   const srv = http.createServer((req, res) => {
     if (st.down) { res.writeHead(530, { "content-type": "text/html" }); res.end("<html>error 1033: tunnel down</html>"); return; }
+    if (/^\/cancel\//.test(req.url) && st.cancelReplies.length) { const s = st.cancelReplies.shift(); res.writeHead(s, { "content-type": "text/html" }); res.end(`<html>${s}</html>`); return; }
     if (requireCf && (req.headers["cf-access-client-id"] !== CF["CF-Access-Client-Id"] || req.headers["cf-access-client-secret"] !== CF["CF-Access-Client-Secret"])) {
       res.writeHead(403, { "content-type": "text/html" }); res.end("<html>Forbidden — Cloudflare Access</html>"); return;
     }
@@ -173,8 +176,16 @@ ok(r.status === 413, `local /ask over 256 KB → 413 (${r.status})`);
   const c = spawn(process.execPath, [src("src", "relay.mjs")], { env: { ...baseEnv, MYNA_ENV: path.join(TMP, "solo", ".env"), MYNA_PROVIDER: "telegram", TELEGRAM_BOT_TOKEN: "333333:SOLO", TELEGRAM_CHAT_ID: "42", TELEGRAM_API_BASE: solo.url, RELAY_PORT: String(SP) }, stdio: ["ignore", "ignore", "ignore"] });
   children.push(c);
   await up(`${SOLO}/health`);
-  r = await req(`${SOLO}/health`, { headers: { "x-forwarded-for": "198.51.100.9", origin: "https://example.com" } });
-  ok(r.status === 200 && r.json?.role === "hub" && r.json.remote === null, `single machine: no local-port guards (a proxied + browser request still answers 200), remote: null`);
+  r = await req(`${SOLO}/health`, { headers: { "x-forwarded-for": "198.51.100.9" } });
+  ok(r.status === 200 && r.json?.role === "hub" && r.json.remote === null, `single machine: no proxy-header check (no tunnel there) — X-Forwarded-For still answers 200, remote: null`);
+  r = await req(`${SOLO}/shutdown`, { method: "POST", headers: { origin: "https://evil.example.com" } });
+  ok(r.status === 403, `single machine: a browser request (Origin) → 403 — a web page cannot POST /shutdown, /ask, /pair/start (${r.status})`);
+  r = { status: await rawStatus(SP, "/health", { host: "evil.example.com:7800" }) };
+  ok(r.status === 403, `single machine: a non-loopback Host (DNS rebinding) → 403 (${r.status})`);
+  r = await req(`${SOLO}/chat/session?session_id=x`, { headers: { origin: "https://example.com" } });
+  ok(r.status === 200, `single machine: /chat/* is exempt from the Origin check (it has its own secrets) (${r.status})`);
+  r = { status: await rawStatus(SP, "/health", { host: `localhost:${SP}` }) };
+  ok(r.status === 200 && (await req(`${SOLO}/health`)).status === 200, "single machine: local clients (Host 127.0.0.1 / localhost, no Origin) answer as before");
   r = await req(`${SOLO}/ask`, { method: "POST", body: JSON.stringify({ question: `大題 ${"x".repeat(300 * 1024)}`, options: ["a"] }) });
   ok(r.status === 200 && !!r.json?.request_id, `single machine: no /ask body cap (a 300 KB question is taken, as before) (${r.status})`);
   ok(!fs.existsSync(path.join(TMP, "solo", "machines.json")) && !fs.existsSync(path.join(TMP, "solo", "edge-state.json")), "single machine: no multi-machine files are written");
@@ -306,6 +317,13 @@ ok(r.status === 409, `another machine reusing that id → 409 (${r.status})`);
 r = await req(`${REMOTE}/ask`, { method: "POST", headers: { ...authA, "x-myna-request-id": "NOT-HEX" }, body: { question: "q", options: ["a"] } });
 ok(r.status === 400, `a malformed X-Myna-Request-Id → 400 (${r.status})`);
 await req(`${REMOTE}/cancel/abcdef0123`, { method: "POST", headers: authA });
+// a remote question cancelled while Telegram is still sending it: once the message exists it is retracted
+stubCtl.sendDelayMs = 1200;
+const slowAsk = req(`${REMOTE}/ask`, { method: "POST", headers: { ...authA, "x-myna-request-id": "5105105105" }, body: { question: "送很慢的題", options: ["a"] } });
+const slowMsg = await keyboardWith(/送很慢的題/);
+r = await req(`${REMOTE}/cancel/5105105105`, { method: "POST", headers: authA });
+await slowAsk; stubCtl.sendDelayMs = 0;
+ok(r.json?.cancelled === true && !!(await until(() => markupEdits.some((e) => e.message_id === slowMsg?.message_id), 5000)), `cancelled while still being sent → the cancel waits for the send, then retracts the buttons (${JSON.stringify(r.json)})`);
 
 // === 4. edge relays ===================================================================================
 const edgeLogs = [];
@@ -486,8 +504,10 @@ tunnel.st.dropReplies = true;
 const lost = await ask(EDGE_B, { question: "回覆遺失的題", session_id: "bsid", session_name: "b session" });
 const hubCopy = await keyboardWith(/回覆遺失的題/), ownCopy = await botB.keyboardWith(/回覆遺失的題/);
 ok(lost.status === 200 && !!hubCopy && !!ownCopy, "hub got the question but its reply was lost → pc2 asks on its own bot (the hub's copy exists too, for now)");
+tunnel.st.cancelReplies = [403, 500]; // the first cancels fail (Access hiccup, a 5xx) while /health is fine
 tunnel.st.dropReplies = false;
-ok(!!(await until(() => markupEdits.some((e) => e.message_id === hubCopy?.message_id), 8000)), "hub reachable again → pc2's edge cancels the hub's copy (buttons retracted): only one copy stays answerable");
+ok(!!(await until(() => markupEdits.some((e) => e.message_id === hubCopy?.message_id), 8000)) && tunnel.st.cancelReplies.length === 0,
+  "hub reachable again → pc2's edge cancels the hub's copy (buttons retracted), retrying past a 403 and a 500: only one copy stays answerable");
 await until(async () => (await req(`${EDGE_B}/health`)).json?.upstream?.active, 6000);
 if (ownCopy) botB.tap(ownCopy, 0, 0);
 r = await req(`${EDGE_B}/answer/${lost.json?.request_id}`);

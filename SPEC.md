@@ -53,7 +53,7 @@ Remote Control 不合用:它把 session 綁在**當下登入的帳號**,多台�
                          手機(一支 bot)
                               │ 只有主節點 poll
   主節點 hub(MYNA_ROLE 沒設或 =hub)
-    relay ── 127.0.0.1:7800  本機 listener(同 0.19,不需要 credential;設定多機後加三條防呆)
+    relay ── 127.0.0.1:7800  本機 listener(同 0.19,不需要 credential;擋瀏覽器與非 loopback Host,多機時再擋代理標頭)
           └─ 127.0.0.1:7801  遠端 listener(MYNA_REMOTE_PORT;每個請求都要 machine token)
     cloudflared:https://<主節點網址> → 127.0.0.1:7801(前面加 Cloudflare Access)
                               │ HTTPS + CF-Access-Client-Id/Secret + Authorization: Bearer <machine token>
@@ -146,7 +146,7 @@ Remote Control 不合用:它把 session 綁在**當下登入的帳號**,多台�
 | 鍵(`~/.myna/.env`,環境變數優先) | 主節點 hub | 遠端 edge | 說明 |
 |---|---|---|---|
 | `MYNA_ROLE` | `hub`(沒設也是 hub) | `edge` | 其他值:relay 不啟動。兩種 role 都是 `src/relay.mjs`;`ensure-relay` 看到正在跑的 relay role 不同時直接替換(不管版本)。edge 不需要自己的 bot(`MYNA_UPSTREAM` 有設就算設定好) |
-| `MYNA_REMOTE_PORT` | 例如 `7801`;**沒設(也不是 edge)就沒有遠端 listener**,行為同 0.19.2(只有 `/health` 多了 `role`、`protocol`、`machine`、`remote:null`;`:7800` 防呆和 `/ask` body 上限都不開) | — | 只 bind `127.0.0.1`;不能等於 `RELAY_PORT` |
+| `MYNA_REMOTE_PORT` | 例如 `7801`;**沒設(也不是 edge)就沒有遠端 listener**,行為同 0.19.2,只差:`/health` 多了 `role`、`protocol`、`machine`、`remote:null`;`:7800` 拒絕非 loopback 的 `Host` 和帶 `Origin` 的請求(見下面「防呆」)。代理標頭檢查和 `/ask` body 上限不開 | — | 只 bind `127.0.0.1`;不能等於 `RELAY_PORT` |
 | `MYNA_MACHINE_NAME` | 自己的短名稱(預設 hostname) | — | topic 前綴用。遠端的名稱以主節點 `machines.json` 登記的為準 |
 | `MYNA_TOPIC_MACHINE` | `auto`(預設:登記了任何遠端機器才加前綴)/ `on` / `off` | — | |
 | `MYNA_UPSTREAM` | — | 主節點網址,例如 `https://myna.example.com` | 一定是 `https://`;`http://` 只接受 `127.0.0.1` / `localhost`(測試、本機 tunnel) |
@@ -235,6 +235,8 @@ Remote Control 不合用:它把 session 綁在**當下登入的帳號**,多台�
 - 已經轉給主節點、還沒答的題目:斷線後 `MYNA_UPSTREAM_GRACE` 秒內繼續等主節點,`/answer` 先 hold 最多 5 秒再回 `{kind:"pending"}`;這段時間 client 的 `/cancel` 先記下來、回 `{cancelled:true, queued:true}`。
 - 超過 grace:這些題目放棄,`/answer` 回 `{kind:"unreachable", error}`,client 退回本機。**不會**改到自己的 bot 重發:斷的可能只是 tunnel,主節點本身還活著,手機上它那則訊息的按鈕還按得到;再發一份就可能被答兩次。主節點回來後,edge 對放棄的題目送 `/cancel`,收回手機上的按鈕,不留孤兒。
 
+**取消要確認**:放棄的題目,edge 在每次健康檢查正常後都對主節點送 `/cancel`,直到主節點回 200(取消了,或那題已經結束)或 404(主節點沒收到過);401、403、3xx、5xx、逾時都留著下次再試。主節點那邊,遠端的題目如果在「還在送往手機」時就被取消,送完後會再收回一次按鈕。
+
 **重啟不會忘**:轉給主節點還沒答的題目、要在主節點取消的題目、斷線開始的時間,都寫在 `~/.myna/edge-state.json`(0600)。edge 在斷線中重啟(例如升版),grace 照原本的時間繼續算,放棄的題目照樣在主節點回來後取消。
 
 **主節點恢復時**:等 `active` 變回 true(連續幾次檢查正常)後,新題目回到主節點。還在自己的 bot 上等的題目**留在原地答完**,不搬過去;自己的 bot 一直在 poll,所以收得到這些答案。
@@ -250,8 +252,8 @@ Remote Control 不合用:它把 session 綁在**當下登入的帳號**,多台�
 
 ### `:7800`(本機 listener)的防呆
 
-**只在設定多機時套用**(主節點有 `MYNA_REMOTE_PORT`,或 `MYNA_ROLE=edge`),主節點和 edge 的本機 listener 都是。理由是這時旁邊會跑 tunnel,遠端請求經過 tunnel 之後,從 relay 看來源也是 `127.0.0.1`,不能靠來源 IP 判斷。單機沒有 tunnel,保持 0.19.2 的行為不變(DNS rebinding / 瀏覽器的防護對單機也有用,但不在這次範圍,另外再決定)。
-1. 帶代理標頭的請求回 403:`Forwarded`、`X-Forwarded-For`、`X-Forwarded-Host`、`X-Real-Ip`、`Cf-Connecting-Ip`、`Cf-Ray`、`Tailscale-User-Login`。擋「tunnel 不小心指到 7800」。
+本機 listener 不需要 credential。第 2、3 條**一律套用**(單機也是):0.19.2 的 `:7800` 本來就打得到網頁發出的請求(瀏覽器 CSRF、DNS rebinding),而正常的 client(Node `fetch`、curl、hooks、護欄)都打 `127.0.0.1`、不帶 `Origin`,所以擋下來不影響它們。第 1 條**只在設定多機時**(主節點有 `MYNA_REMOTE_PORT`,或 `MYNA_ROLE=edge`):只有那時旁邊會跑 tunnel,經過 tunnel 的請求從 relay 看來源也是 `127.0.0.1`,不能靠來源 IP 判斷。
+1. (只在多機)帶代理標頭的請求回 403:`Forwarded`、`X-Forwarded-For`、`X-Forwarded-Host`、`X-Real-Ip`、`Cf-Connecting-Ip`、`Cf-Ray`、`Tailscale-User-Login`。擋「tunnel 不小心指到 7800」。
 2. `Host` 的主機名必須是 `127.0.0.1`、`localhost` 或 `[::1]`(沒有 `Host` 的請求照舊放行),擋 DNS rebinding。
 3. 帶 `Origin` 的請求(瀏覽器)回 403;`/chat/*` 例外,因為它本來就要 relay 密鑰或 per-session token,而且 chat mod 的 `$.http.fetch` 會不會帶 `Origin` 沒有實測。
 
@@ -316,7 +318,7 @@ Remote Control 不合用:它把 session 綁在**當下登入的帳號**,多台�
 - **v0(spike,見 §13):** 驗命脈——blocking MCP tool + 無限等 + heartbeat 不被 timeout 砍;Telegram 一點就回 + 一次多輪釐清。
 - **v1:** 單機 → Telegram(編號內文 + 精簡按鈕 + ✍️ + ⏹ + `force_reply`)→ relay 路由 → `/feature` gate 接上 + 對話迴圈 + nudge + fallback + gate④ 截圖。端到端一個真 gate(含一次多輪釐清)走通。
 - **v2:** 多機 fan-in、統一收件匣標籤、per-machine token。分階段做(§5.1):
-  - **第 1 階段(0.20.0,本版):** 主節點的遠端 listener(`/health`、`/ask`、`/answer`、`/cancel`、`/session/close`、`/session/round-end`)、machine token、手機核准加入(`/myna:join`)、`machines.mjs list|revoke`、session 與 topic 加機器、`:7800` 防呆和 `/ask` body 上限(都只在設定多機時);遠端的 edge(`MYNA_ROLE=edge`):轉送到主節點,自己的 bot(不能跟主節點同一支)當斷線時的備援,`/attest` 只查本機核准。transport 用 Cloudflare Tunnel + Access。
+  - **第 1 階段(0.20.0,本版):** 主節點的遠端 listener(`/health`、`/ask`、`/answer`、`/cancel`、`/session/close`、`/session/round-end`)、machine token、手機核准加入(`/myna:join`)、`machines.mjs list|revoke`、session 與 topic 加機器、`:7800` 防呆(Host / Origin 一律;代理標頭只在多機)、`/ask` body 上限(只在多機);遠端的 edge(`MYNA_ROLE=edge`):轉送到主節點,自己的 bot(不能跟主節點同一支)當斷線時的備援,`/attest` 只查本機核准。transport 用 Cloudflare Tunnel + Access。
   - **第 2 階段(0.21.0):** 遠端的 `/attest`(綁定機器與 session)、`/detach`、`/reattach`、`/requests`;手機上那一行改成「核准後在 <機器> 執行：」;還有沒用掉的核准時 `ensure-relay` 延後替換 relay。
   - **第 3 階段(0.22.0):** 遠端的 chat(`/chat/*` 轉送、per-session token 改放 `X-Myna-Chat-Token`、`/chat/take?wait=`)、手機上的 `!machines`、`!revoke`。
   - **第 4 階段:** `/machines/rotate`、新來源提醒、`doctor` 從外面檢查 `/health` 要回 401。
