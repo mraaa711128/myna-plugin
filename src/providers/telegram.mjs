@@ -266,7 +266,8 @@ export function create(cfg, ctx) {
     const cur = known ? known.gate : g;   // an ask without `gate` joins the current one
     if (s) s.gateOf = cur;
     if (s?.thread_id && cur) remember(threadGates, `${session_id}\n${s.thread_id}`, cur);
-    const nm = topicName([cur, session_name || s?.label].filter(Boolean).join(" · "));
+    // s.machine: the asking machine's name, set by the relay once several machines share it (0.20)
+    const nm = topicName([s?.machine, cur, session_name || s?.label].filter(Boolean).join(" · "));
     if (known) {
       hold(s, known.thread); // before any await — the rename below must not open a window
       if (stale.length) { known.stale = [...(known.stale || []), ...stale]; saveTopics(); }
@@ -593,10 +594,10 @@ export function create(cfg, ctx) {
   }
   // session_label: a topic name for when this ask has to open one, never a rename of the session's
   // current topic (the permission hook knows the session but not ask_human's ticket-bearing name)
-  async function sendQuestionHeld(request_id, { header, question, options = [], questionNumber, questionTotal, preamble, thread_id, session_id, session_name, session_label, gate, approves } = {}, s) {
+  async function sendQuestionHeld(request_id, { header, question, options = [], questionNumber, questionTotal, preamble, thread_id, session_id, session_name, session_label, gate, approves, machine_label } = {}, s) {
     if (!CHAT_ID) throw new Error("no Telegram chat paired yet — run /myna:pair");
     const chat = CHAT_ID; // a re-pair mid-send must not split this question across two chats
-    Object.assign(s, { thread_id, session_id, session_name, gate, label: session_label });
+    Object.assign(s, { thread_id, session_id, session_name, gate, label: session_label, ...(machine_label ? { machine: machine_label } : {}) });
     // a chat session asks in its chat topic (gate as a header line), never in a gate topic of its own
     const chatPlace = chatOf(session_id);
     if (chatPlace) { s.chatSid = session_id; s.topic = chatPlace.thread ?? undefined; }
@@ -848,15 +849,21 @@ export function create(cfg, ctx) {
       log(me.result.has_topics_enabled ? "bot has Threaded Mode ON — one topic per gate"
         : 'bot has Threaded Mode OFF — all sessions share the flat chat. Enable it in @BotFather → /mybots → Bot Settings → Threaded Mode.');
     }).catch(() => {});
-    for (;;) {
+    while (!stopper.signal.aborted) {
       try {
         // 40s client timeout > 30s server long-poll: a wedged/half-open socket can't hang forever
         // (it throws → caught below → 1s backoff → retry; offset unchanged so no update is lost).
-        const j = await (await fetch(`${API}/getUpdates?timeout=30&offset=${offset}`, { signal: AbortSignal.timeout(40000) })).json();
+        const signal = AbortSignal.any ? AbortSignal.any([AbortSignal.timeout(40000), stopper.signal]) : AbortSignal.timeout(40000);
+        const j = await (await fetch(`${API}/getUpdates?timeout=30&offset=${offset}`, { signal })).json();
+        if (stopper.signal.aborted) break; // stopped meanwhile: leave these updates unconfirmed for whoever polls next
         if (j.ok) for (const u of j.result) { offset = u.update_id + 1; handleUpdate(u).catch((e) => log("handleUpdate err", e.message)); }
-      } catch (e) { log("poll err", errText(e)); await new Promise((r) => setTimeout(r, 1000)); }
+      } catch (e) { if (stopper.signal.aborted) break; log("poll err", errText(e)); await new Promise((r) => setTimeout(r, 1000)); }
     }
+    log("Telegram getUpdates long-poll stopped");
   }
+  // stop polling for good (an edge that found the hub polls this same bot — two pollers get 409)
+  const stopper = new AbortController();
+  function stop() { stopper.abort(); }
 
   // Claude finished its reply and none of the session's gates is open (relay checked): the round —
   // and with it the current gate — is over once the grace passes without another ask (topicFor
@@ -912,6 +919,8 @@ export function create(cfg, ctx) {
     await tg("editMessageReplyMarkup", { chat_id: q.chat ?? CHAT_ID, message_id: q.message_id, reply_markup: { inline_keyboard: [] } });
     const text = why === "expired" ? "⌛ 這題交出後沒有 session 接手,已取消;手機上的按鈕已失效"
       : why === "orphaned" ? "⌛ 這題放太久、已經沒有 session 在等答案,已取消;手機上的按鈕已失效"
+      : why === "join_expired" ? "⌛ 加入要求逾時沒有回應,已取消;手機上的按鈕已失效"
+      : why === "revoked" ? "🚫 發問的機器已被撤銷,這題已取消;手機上的按鈕已失效"
       : "↩️ 這題已在終端機處理,手機上的按鈕已失效";
     await tg("sendMessage", inTopic(q.topic, { chat_id: q.chat ?? CHAT_ID, text }));
     log(`question ${request_id} ${why === "expired" ? "expired after a detach" : why === "orphaned" ? "orphaned" : "cancelled by the asking side"} — buttons retracted`);
@@ -952,7 +961,7 @@ export function create(cfg, ctx) {
   }
 
   return {
-    name, start, sendQuestion, closeSession, endRound, cancelQuestion, transferRequest, startPairing, pairStatus,
+    name, start, stop, sendQuestion, closeSession, endRound, cancelQuestion, transferRequest, startPairing, pairStatus,
     chatOpen, chatProgress, chatTaken, chatClose,
     onResolve(request_id, result) {
       for (const [t, v] of tokens) if (v.request_id === request_id) tokens.delete(t);

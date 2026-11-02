@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 // Ensure the Myna relay running on THIS machine is the one from THIS plugin version — idempotent,
 // singleton, detached. Called by the SessionStart hook (auto-start) and by /myna:relay start|restart.
+// MYNA_ROLE=edge (0.20): the relay forwards to a hub and needs no IM of its own (MYNA_UPSTREAM is what
+// makes it "configured"). A relay of the other role on the port is replaced whatever its version.
 // Safe to run many times:
 //   - no IM provider configured in ~/.myna/.env             -> no-op
 //   - relay on :PORT answers GET /health with OUR version    -> no-op (--force: restart it anyway —
@@ -28,7 +30,6 @@ import { fileURLToPath } from "node:url";
 import { setTimeout as sleep } from "node:timers/promises";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const relayPath = path.join(root, "src", "relay.mjs");
 const envPath = process.env.MYNA_ENV || path.join(os.homedir(), ".myna", ".env");
 const port = Number(process.env.RELAY_PORT || 7800);
 const force = process.argv.includes("--force") || process.env.MYNA_RELAY_FORCE === "1";
@@ -41,13 +42,22 @@ const fileEnv = Object.fromEntries(
     .map((l) => { const i = l.indexOf("="); return [l.slice(0, i).trim(), l.slice(i + 1).trim()]; }),
 );
 const cfg = { ...fileEnv, ...process.env };
-const configured =
-  cfg.TELEGRAM_BOT_TOKEN || // no chat yet is fine: the relay has to be up to take /myna:pair
-  (cfg.DISCORD_BOT_TOKEN && cfg.DISCORD_CHANNEL_ID) ||
-  (cfg.SLACK_BOT_TOKEN && cfg.SLACK_APP_TOKEN && cfg.SLACK_CHANNEL_ID);
-if (!configured) {
-  console.log("myna: not configured — relay not started. Run /myna:setup <token> (Telegram) or /myna:configure discord|slack … (see README).");
-  process.exit(0);
+// role (0.20): hub (default) = the relay other machines forward to; edge = it forwards this machine's
+// questions to a hub (MYNA_UPSTREAM), its own bot — when it has one — being the fallback. Same script.
+const role = String(cfg.MYNA_ROLE || "hub").trim().toLowerCase();
+if (role !== "hub" && role !== "edge") { console.log(`myna: MYNA_ROLE="${role}" is not hub|edge — relay not started. Fix ${envPath}.`); process.exit(0); }
+const relayPath = path.join(root, "src", "relay.mjs");
+if (role === "edge") {
+  if (!String(cfg.MYNA_UPSTREAM || "").trim()) { console.log("myna: MYNA_ROLE=edge but MYNA_UPSTREAM (the hub's URL) is not set — relay not started. Run /myna:join <hub URL> --name <name>."); process.exit(0); }
+} else {
+  const configured =
+    cfg.TELEGRAM_BOT_TOKEN || // no chat yet is fine: the relay has to be up to take /myna:pair
+    (cfg.DISCORD_BOT_TOKEN && cfg.DISCORD_CHANNEL_ID) ||
+    (cfg.SLACK_BOT_TOKEN && cfg.SLACK_APP_TOKEN && cfg.SLACK_CHANNEL_ID);
+  if (!configured) {
+    console.log("myna: not configured — relay not started. Run /myna:setup <token> (Telegram) or /myna:configure discord|slack … (see README).");
+    process.exit(0);
+  }
 }
 
 const base = `http://127.0.0.1:${port}`;
@@ -80,12 +90,16 @@ function compareVersions(a, b) {
 }
 
 const running = await probe();
+// the relay on the port plays the other role (MYNA_ROLE changed in .env): replace it whatever its
+// version — a hub left running on an edge machine would keep polling the bot. Pre-0.20 relays are hubs.
+const roleSwitch = !!running && running.version !== "?" && (running.role || "hub") !== role;
+if (roleSwitch) console.log(`myna: relay on :${port} runs as ${running.role || "hub"}, this machine is now ${role} (MYNA_ROLE) — replacing it${running.pending > 0 ? ` (its ${running.pending} open gate(s) stay in its journal)` : ""}`);
 if (running) {
-  if (running.version === ourVersion && !force) {
+  if (running.version === ourVersion && !force && !roleSwitch) {
     console.log(`myna: relay already running on :${port} (v${ourVersion})`);
     process.exit(0);
   }
-  if (!force && compareVersions(running.version, ourVersion) > 0) {
+  if (!force && !roleSwitch && compareVersions(running.version, ourVersion) > 0) {
     console.log(`myna: relay on :${port} is v${running.version} (newer than this plugin's v${ourVersion}) — leaving it. Update this plugin (/plugin update) to match; /myna:relay restart (ensure-relay --force) replaces it anyway.`);
     process.exit(0);
   }
@@ -111,4 +125,4 @@ const logFile = path.join(logDir, "relay.log");
 const out = fs.openSync(logFile, "a");
 const child = spawn(process.execPath, [relayPath], { detached: true, stdio: ["ignore", out, out], windowsHide: true });
 child.unref();
-console.log(`myna: started relay v${ourVersion} (pid ${child.pid}) on :${port} → ${logFile}`);
+console.log(`myna: started ${role === "edge" ? "relay (edge)" : "relay"} v${ourVersion} (pid ${child.pid}) on :${port} → ${logFile}`);
