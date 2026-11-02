@@ -70,7 +70,7 @@ import { validateAskArgs, normalizeCommand, isApproveOption, approveOptionOf, on
 import { createChat } from "./chat.mjs";
 import { applyNetAttemptTimeout } from "./net.mjs";
 import {
-  PROTOCOL, PROTOCOL_HEADER, ENROLL_SECRET_HEADER, LOCAL_ID, NAME_RE, CODE_RE, ASK_MAX_BYTES_DEFAULT,
+  PROTOCOL, PROTOCOL_HEADER, ENROLL_SECRET_HEADER, REQUEST_ID_HEADER, LOCAL_ID, NAME_RE, CODE_RE, ASK_MAX_BYTES_DEFAULT,
   roleOf, machinesFile, seenFile, machineStore, newMachineId, newMachineToken, sha256hex, sameHex, bearerOf,
   readBody, localRefusal, writePrivate, upstreamUrl, cfHeaders, tokenFile, botIdentity,
 } from "./remote.mjs";
@@ -122,6 +122,9 @@ const REMOTE_PORT = (() => {
   return n;
 })();
 let remoteListening = false;
+// several machines are configured on this one (hub with a remote port, or an edge). Without it the
+// relay behaves as 0.19.2: no local-port guards, no /ask body cap.
+const MULTI = !!REMOTE_PORT || EDGE;
 // this machine's short name (topic prefix once other machines have joined; logs)
 const MACHINE_NAME = (String(cfg.MYNA_MACHINE_NAME || os.hostname().split(".")[0] || "").toLowerCase().replace(/[^a-z0-9-]/g, "").slice(0, 16)) || "hub";
 // MYNA_TOPIC_MACHINE: auto (default) = prefix topic names with the machine name once a remote machine
@@ -388,8 +391,27 @@ function edgeLink() {
     headers: (extra = {}) => ({ authorization: `Bearer ${token()}`, [PROTOCOL_HEADER]: String(PROTOCOL), ...CF, ...extra }),
     onBot: null,           // set below: called when the hub's bot id is learned / changes
   };
+  // forwarded / abandoned / the outage start survive a restart (an upgrade mid-outage must neither
+  // cut a question's grace short nor forget to retract the buttons of one given up): edge-state.json
+  const STATE_FILE = cfg.MYNA_EDGE_STATE_FILE || path.join(path.dirname(ENV_PATH), "edge-state.json");
+  try {
+    const s = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
+    for (const [id, v] of s.forwarded || []) h.forwarded.set(String(id), v);
+    for (const id of s.abandoned || []) h.abandoned.add(String(id));
+    if (Number.isFinite(s.down_since)) h.downSince = s.down_since;
+    if (h.forwarded.size || h.abandoned.size) log(`edge: picked up ${h.forwarded.size} question(s) waiting on the hub and ${h.abandoned.size} to cancel there from ${STATE_FILE}`);
+  } catch {}
+  let saveQueued = false;
+  h.save = () => {
+    if (saveQueued) return; saveQueued = true;
+    setImmediate(() => {
+      saveQueued = false;
+      try { writePrivate(STATE_FILE, JSON.stringify({ forwarded: [...h.forwarded], abandoned: [...h.abandoned], down_since: h.reachable ? null : h.downSince }) + "\n"); }
+      catch (e) { log("edge: could not save", STATE_FILE, e.message); }
+    });
+  };
   h.markDown = (reason) => {
-    if (h.reachable) { h.downSince = Date.now(); log(`hub unreachable: ${reason} — ${ownBot.on ? "new questions go to this machine's own bot" : "local clients fall back to this machine's terminal"} until it is back`); }
+    if (h.reachable) { h.downSince = Date.now(); h.save(); log(`hub unreachable: ${reason} — ${ownBot.on ? "new questions go to this machine's own bot" : "local clients fall back to this machine's terminal"} until it is back`); }
     else if (h.reason !== reason) log(`hub still unavailable: ${reason}`);
     Object.assign(h, { reachable: false, active: false, okStreak: 0, reason, since: Date.now() });
   };
@@ -422,11 +444,11 @@ function edgeLink() {
       log(`hub ${h.url} ${h.everUp ? "back" : "reachable"} — v${j.version}, protocol ${j.protocol}, this machine = ${h.machine}; new questions go to the hub`);
       h.everUp = true;
     }
-    if (!was) h.flush();
+    if (!was) { h.save(); h.flush(); }
   };
   h.flush = async () => {
     for (const id of [...h.abandoned]) {
-      try { const r = await fetch(`${h.url}/cancel/${id}`, { method: "POST", headers: h.headers(), signal: AbortSignal.timeout(5000) }); if (r.status < 500) h.abandoned.delete(id); }
+      try { const r = await fetch(`${h.url}/cancel/${id}`, { method: "POST", headers: h.headers(), signal: AbortSignal.timeout(5000) }); if (r.status < 500) { h.abandoned.delete(id); h.save(); } }
       catch { return; }
     }
   };
@@ -458,8 +480,8 @@ if (EDGE) {
   hub.onBot = (botId) => {
     if (!ownBot.on || !botId || botId !== ownBot.id) return;
     ownBot.on = false; ownBot.reason = `same bot as the hub (${botId}) — stopped using it, forwarding only`;
-    log(`edge: ${ownBot.reason}${provider.stop ? "" : " (this provider cannot stop polling — restart the relay)"}`);
-    try { provider.stop?.(); } catch {}
+    log(`edge: ${ownBot.reason}`);
+    try { provider.stop(); } catch (e) { log("could not stop the provider:", e.message, "— exiting so the next start sees the hub's bot id (upstream.json) and never starts it"); process.exit(1); }
     provider = NO_IM; chat.attach(provider);
   };
   hub.onBot(hub.bot);
@@ -475,7 +497,7 @@ function edgeGraceCheck() {
   if (hub.reachable || !hub.forwarded.size || Date.now() - hub.downSince < hub.GRACE_MS) return;
   log(`hub away for over ${hub.GRACE_MS / 1000}s — giving up ${hub.forwarded.size} question(s) waiting on it; they are cancelled at the hub once it is back`);
   for (const id of hub.forwarded.keys()) hub.abandoned.add(id);
-  hub.forwarded.clear();
+  hub.forwarded.clear(); hub.save();
 }
 const adopted = adopt();
 
@@ -497,7 +519,8 @@ const remotePolls = new Map();  // machine_id -> /answer polls held now
 
 // pre: the body when the caller already read it (an edge that fell back from forwarding)
 async function handleAsk(req, res, scope, pre) {
-  const { body, tooLarge } = pre || await readBody(req, ASK_MAX_BYTES);
+  // body cap only where a question can come from another machine (a single machine keeps no cap, as before)
+  const { body, tooLarge } = pre || await readBody(req, MULTI ? ASK_MAX_BYTES : Infinity);
   if (tooLarge) { log(`rejecting /ask (413): body over ${ASK_MAX_BYTES} bytes${scope.remote ? ` from machine=${scope.name}` : ""}`); return send(res, 413, { error: `request body over ${ASK_MAX_BYTES} bytes` }); }
   const { v: args, err } = jsonOf(body);
   if (err) return send(res, 400, { error: `bad JSON: ${err.message}` });
@@ -506,6 +529,16 @@ async function handleAsk(req, res, scope, pre) {
   if (problems.length) {
     log("rejecting /ask (400):", problems.join("; "));
     return send(res, 400, { error: problems.join("; ") });
+  }
+  // an edge may pick the request id (X-Myna-Request-Id, 10 hex) so it can cancel the question even when
+  // this reply never reaches it; the same id again from the same machine returns that request (idempotent)
+  let request_id;
+  if (scope.remote && req.headers[REQUEST_ID_HEADER] !== undefined) {
+    const want = String(req.headers[REQUEST_ID_HEADER]).trim().toLowerCase();
+    if (!/^[a-f0-9]{10}$/.test(want)) return send(res, 400, { error: "X-Myna-Request-Id must be 10 lowercase hex characters" });
+    const ex = pending.get(want);
+    if (ex) return machineOf(ex) === scope.id ? send(res, 200, { request_id: want }) : send(res, 409, { error: "request id in use — pick another" });
+    request_id = want;
   }
   if (scope.remote) {
     const now = Date.now(), recent = (remoteAsks.get(scope.id) || []).filter((t) => now - t < REMOTE_ASK_WINDOW_MS);
@@ -521,7 +554,7 @@ async function handleAsk(req, res, scope, pre) {
   delete args.machine_label;
   const label = topicMachine(scope);
   if (label) args.machine_label = label;
-  const request_id = crypto.randomBytes(5).toString("hex");
+  request_id ||= crypto.randomBytes(5).toString("hex");
   const entry = newEntry(Date.now(), args.session_id, metaOf(args), scope.id);
   // runtime only (persist() never writes it): the command a ✅ tap on THIS question approves
   // and the one ✅ option whose tap approves it (validateAskArgs allows exactly one)
@@ -736,7 +769,7 @@ async function joinPoll(req, res, enrollId) {
 }
 // finished join requests nobody collected: dropped after a TTL; an approved one's machine is revoked
 // again (its token was never handed out — nobody can use it)
-setInterval(() => {
+if (machines) setInterval(() => {
   for (const [eid, j] of joins) {
     if (j.status === "pending" || Date.now() - j.doneAt < JOIN_TTL_MS) continue;
     joins.delete(eid);
@@ -786,11 +819,11 @@ async function handleRemote(req, res) {
 //     never asked for in this version (fail closed)
 const dropConn = (req) => { req.socket.destroy(); };
 const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
-async function edgeForward(req, p, body, timeoutMs) {
+async function edgeForward(req, p, body, timeoutMs, extra = {}) {
   let r, text;
   try {
     r = await fetch(`${hub.url}${p}`, {
-      method: req.method, headers: hub.headers(body !== undefined ? { "content-type": "application/json" } : {}),
+      method: req.method, headers: hub.headers({ ...(body !== undefined ? { "content-type": "application/json" } : {}), ...extra }),
       ...(body !== undefined ? { body } : {}), redirect: "manual", signal: AbortSignal.timeout(timeoutMs),
     });
     text = await r.text();
@@ -805,7 +838,7 @@ async function edgeAnswer(req, res, id) {
   if (hub.reachable) {
     const r = await edgeForward(req, `/answer/${id}`, undefined, ANSWER_HOLD_MS + 30000);
     if (r.ok) {
-      if (r.status === 404 || (r.status === 200 && r.json?.kind && r.json.kind !== "pending")) hub.forwarded.delete(id);
+      if (r.status === 404 || (r.status === 200 && r.json?.kind && r.json.kind !== "pending")) { hub.forwarded.delete(id); hub.save(); }
       return relayBack(res, r);
     }
   }
@@ -832,16 +865,21 @@ async function edgeRoute(req, res, url) {
     const id = cm[1];
     if (pending.has(id)) return false;
     await readBody(req, SMALL_BODY_BYTES);
-    if (hub.reachable) { const r = await edgeForward(req, `/cancel/${id}`, "{}", 10000); if (r.ok) { hub.forwarded.delete(id); return relayBack(res, r), true; } }
-    if (hub.forwarded.has(id)) { hub.forwarded.delete(id); hub.abandoned.add(id); send(res, 200, { cancelled: true, queued: true }); return true; }
+    if (hub.reachable) { const r = await edgeForward(req, `/cancel/${id}`, "{}", 10000); if (r.ok) { hub.forwarded.delete(id); hub.save(); return relayBack(res, r), true; } }
+    if (hub.forwarded.has(id)) { hub.forwarded.delete(id); hub.abandoned.add(id); hub.save(); send(res, 200, { cancelled: true, queued: true }); return true; }
     dropConn(req); return true;
   }
   if (M === "POST" && p === "/ask") {
     const pre = await readBody(req, ASK_MAX_BYTES);
     if (pre.tooLarge) { send(res, 413, { error: `request body over ${ASK_MAX_BYTES} bytes` }); return true; }
     if (hub.active) {
-      const r = await edgeForward(req, "/ask", pre.body, 30000);
-      if (r.ok) { if (r.status === 200 && r.json?.request_id) hub.forwarded.set(String(r.json.request_id), { at: Date.now() }); relayBack(res, r); return true; }
+      // the edge picks the request id (X-Myna-Request-Id): when the forward fails it still knows which
+      // question the hub may have put on the phone (the reply lost in a broken link), and cancels it
+      // there once the hub is back — a copy that might exist does not stay answerable
+      const rid = crypto.randomBytes(5).toString("hex");
+      const r = await edgeForward(req, "/ask", pre.body, 30000, { [REQUEST_ID_HEADER]: rid });
+      if (r.ok) { if (r.status === 200 && r.json?.request_id) { hub.forwarded.set(String(r.json.request_id), { at: Date.now() }); hub.save(); } relayBack(res, r); return true; }
+      hub.abandoned.add(rid); hub.save();
     }
     if (ownBot.on) { log(`hub away (${hub.reason}) — asking on this machine's own bot`); await handleAsk(req, res, LOCAL_SCOPE, pre); return true; }
     dropConn(req); return true;
@@ -864,9 +902,11 @@ const edgeHealth = () => ({
 
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, "http://x");
-  // the local listener takes no credentials — refuse what is not a local client (proxied, non-loopback
-  // Host, browser). /chat/* is exempt from the Origin check: it authenticates with its own secrets.
-  const refused = localRefusal(req, { checkOrigin: !url.pathname.startsWith("/chat/") });
+  // multi-machine only: this machine now runs a tunnel next to the relay, so the local listener (no
+  // credentials) refuses what is not a local client — a request a proxy forwarded (the tunnel pointed at
+  // the wrong port), a non-loopback Host, a browser. /chat/* is exempt from the Origin check: it
+  // authenticates with its own secrets. A single machine is left exactly as it was.
+  const refused = MULTI && localRefusal(req, { checkOrigin: !url.pathname.startsWith("/chat/") });
   if (refused) { log(`local: 403 ${req.method} ${url.pathname} — ${refused}`); return send(res, 403, { error: refused }); }
   if (EDGE && await edgeRoute(req, res, url)) return;
   if (await chat.handle(req, res, url)) return;

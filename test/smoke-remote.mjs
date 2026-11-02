@@ -126,7 +126,11 @@ function accessProxy(target, { requireCf = true } = {}) {
     st.seen.push({ method: req.method, url: req.url, auth: req.headers.authorization || "" });
     const headers = { ...req.headers, "cf-connecting-ip": "203.0.113.7", "x-forwarded-for": "203.0.113.7", "cf-ray": "0000-TEST" };
     delete headers["cf-access-client-id"]; delete headers["cf-access-client-secret"];
-    const up = http.request({ host: "127.0.0.1", port: target, method: req.method, path: req.url, headers }, (r) => { res.writeHead(r.statusCode, r.headers); r.pipe(res); });
+    // dropReplies: the hub gets the request, its reply is lost on the way back (a broken link)
+    const up = http.request({ host: "127.0.0.1", port: target, method: req.method, path: req.url, headers }, (r) => {
+      if (st.dropReplies) { r.resume(); req.socket.destroy(); return; }
+      res.writeHead(r.statusCode, r.headers); r.pipe(res);
+    });
     up.on("error", () => { res.writeHead(502); res.end("bad gateway"); });
     req.pipe(up);
   });
@@ -161,6 +165,21 @@ r = { status: await rawStatus(H, "/health", { host: `localhost:${H}` }) };
 ok(r.status === 200, `local port + Host localhost → 200 (${r.status})`);
 r = await req(`${HUB}/ask`, { method: "POST", body: JSON.stringify({ question: "x".repeat(300 * 1024), options: ["a"] }) });
 ok(r.status === 413, `local /ask over 256 KB → 413 (${r.status})`);
+
+// --- a single machine (no MYNA_REMOTE_PORT, no MYNA_ROLE=edge) is left as 0.19.2 had it --------------
+{
+  const solo = await botStub(), SP = freePort(), SOLO = `http://127.0.0.1:${SP}`;
+  fs.mkdirSync(path.join(TMP, "solo"), { recursive: true });
+  const c = spawn(process.execPath, [src("src", "relay.mjs")], { env: { ...baseEnv, MYNA_ENV: path.join(TMP, "solo", ".env"), MYNA_PROVIDER: "telegram", TELEGRAM_BOT_TOKEN: "333333:SOLO", TELEGRAM_CHAT_ID: "42", TELEGRAM_API_BASE: solo.url, RELAY_PORT: String(SP) }, stdio: ["ignore", "ignore", "ignore"] });
+  children.push(c);
+  await up(`${SOLO}/health`);
+  r = await req(`${SOLO}/health`, { headers: { "x-forwarded-for": "198.51.100.9", origin: "https://example.com" } });
+  ok(r.status === 200 && r.json?.role === "hub" && r.json.remote === null, `single machine: no local-port guards (a proxied + browser request still answers 200), remote: null`);
+  r = await req(`${SOLO}/ask`, { method: "POST", body: JSON.stringify({ question: `大題 ${"x".repeat(300 * 1024)}`, options: ["a"] }) });
+  ok(r.status === 200 && !!r.json?.request_id, `single machine: no /ask body cap (a 300 KB question is taken, as before) (${r.status})`);
+  ok(!fs.existsSync(path.join(TMP, "solo", "machines.json")) && !fs.existsSync(path.join(TMP, "solo", "edge-state.json")), "single machine: no multi-machine files are written");
+  c.kill(); solo.close();
+}
 
 // === 2. joining: mbp through scripts/join.mjs, by a ✅ tap ==========================================
 const A_DIR = path.join(TMP, "mbp");
@@ -276,6 +295,17 @@ r = await req(`${REMOTE}/health`, { headers: { ...authA, "x-myna-protocol": "2" 
 ok(r.status === 426 && r.json?.protocol === 1, `a client speaking remote protocol 2 → 426 (${r.status})`);
 r = await req(`${REMOTE}/ask`, { method: "POST", headers: authA, body: JSON.stringify({ question: "x".repeat(300 * 1024), options: ["a"] }) });
 ok(r.status === 413, `remote /ask over 256 KB → 413 (${r.status})`);
+// X-Myna-Request-Id: the edge picks the id; the same id again from the same machine is the same request
+const idem = { ...authA, "x-myna-request-id": "abcdef0123" };
+const i1 = await req(`${REMOTE}/ask`, { method: "POST", headers: idem, body: { question: "冪等的題", options: ["a"] } });
+const i2 = await req(`${REMOTE}/ask`, { method: "POST", headers: idem, body: { question: "冪等的題", options: ["a"] } });
+await keyboardWith(/冪等的題/); await sleep(200);
+ok(i1.json?.request_id === "abcdef0123" && i2.json?.request_id === "abcdef0123" && sent.filter((s) => /冪等的題/.test(s.text || "") && s.reply_markup).length === 1, "X-Myna-Request-Id: the hub uses the edge's id, and a repeat is the same request (one message on the phone)");
+r = await req(`${REMOTE}/ask`, { method: "POST", headers: { authorization: `Bearer ${bToken}`, "x-myna-request-id": "abcdef0123" }, body: { question: "q", options: ["a"] } });
+ok(r.status === 409, `another machine reusing that id → 409 (${r.status})`);
+r = await req(`${REMOTE}/ask`, { method: "POST", headers: { ...authA, "x-myna-request-id": "NOT-HEX" }, body: { question: "q", options: ["a"] } });
+ok(r.status === 400, `a malformed X-Myna-Request-Id → 400 (${r.status})`);
+await req(`${REMOTE}/cancel/abcdef0123`, { method: "POST", headers: authA });
 
 // === 4. edge relays ===================================================================================
 const edgeLogs = [];
@@ -288,7 +318,8 @@ const startEdge = (port, env) => {
 };
 // mbp: what join.mjs wrote (.env + machine-token file), started by ensure-relay like SessionStart does
 const EA = freePort(), EDGE_A = `http://127.0.0.1:${EA}`;
-const ens = spawnSync(process.execPath, [src("scripts", "ensure-relay.mjs")], { env: { ...baseEnv, MYNA_ENV: A_ENV, RELAY_PORT: String(EA), ...EDGE_TIMING }, encoding: "utf8", timeout: 10000 });
+const A_TIMING = { ...EDGE_TIMING, MYNA_UPSTREAM_GRACE: "6" }; // mbp gets a longer grace: it is restarted mid-outage below
+const ens = spawnSync(process.execPath, [src("scripts", "ensure-relay.mjs")], { env: { ...baseEnv, MYNA_ENV: A_ENV, RELAY_PORT: String(EA), ...A_TIMING }, encoding: "utf8", timeout: 10000 });
 ok(/started relay \(edge\)/.test(ens.stdout), `ensure-relay with MYNA_ROLE=edge (no bot of its own) starts the relay as an edge → ${ens.stdout.trim().split("\n").pop()}`);
 const edgePid = Number(/pid (\d+)/.exec(ens.stdout)?.[1]);
 process.on("exit", () => { try { process.kill(edgePid); } catch {} });
@@ -313,6 +344,26 @@ startEdge(EC, { MYNA_ENV: path.join(TMP, "pc9", ".env"), MYNA_ROLE: "edge", MYNA
 r = await until(async () => { const x = await req(`http://127.0.0.1:${EC}/health`); return x.json?.upstream?.active ? x : null; });
 await sleep(800);
 ok(r?.json?.own_bot?.on === false && /same bot as the hub/.test(r.json.own_bot.reason || "") && botC.polls === 0, `an edge whose bot is the hub's (same id) never polls it — "${r?.json?.own_bot?.reason}" (polls=${botC.polls})`);
+// pc7: starts while the hub is unreachable and nothing is known about its bot → uses its own; once the
+// hub answers with the same bot id it stops polling at once; a restart then never starts it
+const tunnel2 = await accessProxy(R); tunnel2.st.down = true;
+const botE = await botStub();
+const EE = freePort(), EDGE_E = `http://127.0.0.1:${EE}`;
+fs.mkdirSync(path.join(TMP, "pc7"), { recursive: true });
+const pc7Env = { MYNA_ENV: path.join(TMP, "pc7", ".env"), MYNA_ROLE: "edge", MYNA_UPSTREAM: tunnel2.url, MYNA_MACHINE_TOKEN: aToken, ...CF_ENV, TELEGRAM_BOT_TOKEN: "111111:LEARNED-LATER", TELEGRAM_CHAT_ID: "42", TELEGRAM_API_BASE: botE.url };
+const pc7 = startEdge(EE, pc7Env);
+r = await until(async () => { const x = await req(`${EDGE_E}/health`); return x.json?.own_bot ? x : null; }, 10000);
+ok(r?.json?.own_bot?.on === true && !!(await until(() => botE.polls > 0, 3000)), "hub unreachable at start, its bot unknown → the edge starts its own bot");
+tunnel2.st.down = false;
+r = await until(async () => { const x = await req(`${EDGE_E}/health`); return x.json?.own_bot?.on === false ? x : null; }, 5000);
+await sleep(300); const p0 = botE.polls; await sleep(1000);
+ok(!!r && /same bot as the hub/.test(r.json.own_bot.reason) && botE.polls === p0, `…the hub then reports the same bot id → it stops polling at once (polls ${p0} → ${botE.polls})`);
+pc7.kill(); await until(async () => (await req(`${EDGE_E}/health`)).status === 0, 3000);
+tunnel2.st.down = true; const p1 = botE.polls;
+startEdge(EE, pc7Env);
+r = await until(async () => { const x = await req(`${EDGE_E}/health`); return x.json?.own_bot ? x : null; }, 10000);
+await sleep(500);
+ok(r?.json?.own_bot?.on === false && botE.polls === p1, `restarted while the hub is away: the remembered hub bot id (upstream.json) keeps its own bot off (${r?.json?.own_bot?.reason})`);
 r = await req(`${EDGE_A}/attest`, { method: "POST", body: { command: "git push origin main", session_id: "same-sid" } });
 ok(r.status === 200 && r.json?.approved === false, `edge /attest with no local approval → approved:false (a hub approval is never asked for: fail closed) (${JSON.stringify(r.json)})`);
 r = await req(`${EDGE_A}/pair/start`, { method: "POST" });
@@ -385,6 +436,15 @@ const down = await call({ question: "hub 不在時問的?", options: ["a", "b"],
 ok(down.kind === "unreachable", `hub away, no own bot: ask_human → unreachable (terminal picker takes over) → ${JSON.stringify(down)}`);
 r = await req(`${EDGE_A}/answer/${AQ}`);
 ok(r.status === 200 && r.json?.kind === "pending", `hub away, within the grace: an already-forwarded question's /answer → pending (${r.status} ${r.json?.kind})`);
+// the edge restarts mid-outage (an upgrade): it still knows the question and its grace
+try { process.kill(edgePid); } catch {}
+await until(async () => (await req(`${EDGE_A}/health`)).status === 0, 3000);
+startEdge(EA, { MYNA_ENV: A_ENV, ...A_TIMING });
+await up(`${EDGE_A}/health`);
+r = await until(async () => { const x = await req(`${EDGE_A}/health`); return x.json?.upstream ? x : null; });
+ok(r?.json?.upstream?.forwarded === 1, `edge restarted mid-outage: still tracks the question waiting on the hub (forwarded=${r?.json?.upstream?.forwarded})`);
+r = await req(`${EDGE_A}/answer/${AQ}`);
+ok(r.status === 200 && r.json?.kind === "pending", `…and its /answer is still pending within the grace (${r.status} ${r.json?.kind})`);
 // pc2 has its own bot → new questions fail over to it at once
 await until(async () => (await req(`${EDGE_B}/health`)).json?.upstream?.reachable === false, 5000);
 const fo = await ask(EDGE_B, { question: "備援:可以 push 嗎?", options: ["✅ 核准", "❌ 不要"], approves: "git push origin GH-1", session_id: "bsid", session_name: "b session" });
@@ -402,9 +462,8 @@ ok(r.json?.approved === false && r.json.reason === "already_used", `…exactly o
 const stay = await ask(EDGE_B, { question: "留在 pc2 的題", session_id: "bsid", session_name: "b session" });
 const kstay = await botB.keyboardWith(/留在 pc2 的題/);
 ok(!!kstay, "another question while the hub is away → pc2's own bot too (left open across the recovery)");
-await sleep(3600);
-r = await req(`${EDGE_A}/answer/${AQ}`);
-ok(r.status === 200 && r.json?.kind === "unreachable", `hub away past MYNA_UPSTREAM_GRACE: the forwarded question's /answer → unreachable, the client falls back — not re-sent on another bot (${JSON.stringify(r.json)})`);
+r = await until(async () => { const x = await req(`${EDGE_A}/answer/${AQ}`); return x.json?.kind === "pending" ? null : x; }, 10000);
+ok(r?.status === 200 && r.json?.kind === "unreachable", `hub away past MYNA_UPSTREAM_GRACE: the forwarded question's /answer → unreachable, the client falls back — not re-sent on another bot (${JSON.stringify(r.json)})`);
 tunnel.st.down = false;
 const tUp = Date.now(); let bReach = 0, bActive = 0;
 const watchB = (async () => { while (!bActive && Date.now() - tUp < 8000) { const x = await req(`${EDGE_B}/health`); if (x.json?.upstream?.reachable && !bReach) bReach = Date.now(); if (x.json?.upstream?.active) bActive = Date.now(); await sleep(40); } })();
@@ -421,11 +480,24 @@ if (kstay) botB.tap(kstay, 0, 1);
 r = await req(`${EDGE_B}/answer/${stay.json?.request_id}`);
 ok(r.json?.kind === "selection" && r.json.value === "b", `the question left on pc2's own bot is answered there, in place (${JSON.stringify(r.json)})`);
 
+// the hub takes a question but its reply is lost (broken link): the edge falls back to its own bot and,
+// once the hub is back, cancels the copy that reached the hub's phone (it picked that request id itself)
+tunnel.st.dropReplies = true;
+const lost = await ask(EDGE_B, { question: "回覆遺失的題", session_id: "bsid", session_name: "b session" });
+const hubCopy = await keyboardWith(/回覆遺失的題/), ownCopy = await botB.keyboardWith(/回覆遺失的題/);
+ok(lost.status === 200 && !!hubCopy && !!ownCopy, "hub got the question but its reply was lost → pc2 asks on its own bot (the hub's copy exists too, for now)");
+tunnel.st.dropReplies = false;
+ok(!!(await until(() => markupEdits.some((e) => e.message_id === hubCopy?.message_id), 8000)), "hub reachable again → pc2's edge cancels the hub's copy (buttons retracted): only one copy stays answerable");
+await until(async () => (await req(`${EDGE_B}/health`)).json?.upstream?.active, 6000);
+if (ownCopy) botB.tap(ownCopy, 0, 0);
+r = await req(`${EDGE_B}/answer/${lost.json?.request_id}`);
+ok(r.json?.kind === "selection", `…and the own-bot copy is the one that answers (${JSON.stringify(r.json)})`);
+
 // === 8. per-machine ask rate limit ===================================================================
-// pc2 asked the hub twice so far (its first question, and the one after the recovery)
+// pc2 asked the hub three times so far (its first question, the one after the recovery, the lost reply)
 let codes = [], bOpen = null;
-for (let i = 0; i < 5; i++) { const x = await ask(EDGE_B, { question: `rate ${i}`, session_id: "rate" }); codes.push(x.status); bOpen ||= x.json?.request_id; }
-ok(codes.join(",") === "200,200,200,200,429", `pc2: asks beyond MYNA_REMOTE_ASK_MAX=6 per window → 429 (${codes.join(",")})`);
+for (let i = 0; i < 4; i++) { const x = await ask(EDGE_B, { question: `rate ${i}`, session_id: "rate" }); codes.push(x.status); bOpen ||= x.json?.request_id; }
+ok(codes.join(",") === "200,200,200,429", `pc2: asks beyond MYNA_REMOTE_ASK_MAX=6 per window → 429 (${codes.join(",")})`);
 r = await ask(EDGE_A, { question: "mbp still fine", session_id: "rate" });
 ok(r.status === 200, "…another machine's budget is its own");
 
@@ -448,7 +520,7 @@ if (failed) {
   for (const [port, out] of edgeLogs) console.log(`--- edge :${port} log ---\n${out.join("").split("\n").slice(-15).join("\n")}`);
   console.log(`--- hub log (tail) ---\n${hubLog.join("").split("\n").slice(-30).join("\n")}`);
 }
-cleanup(); stub.close(); botB.close(); botC.close(); tunnel.close(); misTunnel.close(); clearTimeout(watchdog);
+cleanup(); stub.close(); botB.close(); botC.close(); botE.close(); tunnel2.close(); tunnel.close(); misTunnel.close(); clearTimeout(watchdog);
 fs.rmSync(TMP, { recursive: true, force: true });
 console.log(failed === 0 ? "\n✅ REMOTE (hub + edge + join) PASS" : `\n❌ ${failed} check(s) FAILED`);
 process.exit(failed ? 1 : 0);

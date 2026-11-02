@@ -18,6 +18,7 @@ import crypto from "node:crypto";
 export const PROTOCOL = 1;
 export const PROTOCOL_HEADER = "x-myna-protocol";
 export const ENROLL_SECRET_HEADER = "x-myna-enroll-secret";
+export const REQUEST_ID_HEADER = "x-myna-request-id";
 export const CF_ID_HEADER = "CF-Access-Client-Id";
 export const CF_SECRET_HEADER = "CF-Access-Client-Secret";
 

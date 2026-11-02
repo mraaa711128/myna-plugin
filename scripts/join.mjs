@@ -85,7 +85,9 @@ async function wait() {
     console.log(`myna join: approved — this machine is "${j.name}" (${j.machine_id}) on ${st.upstream}. Token saved to ${tokenFile(cfg)}; ${cfg.MYNA_ENV} now has MYNA_ROLE=edge and MYNA_UPSTREAM.`);
     if (!flag("--no-start")) {
       const ensure = path.join(path.dirname(fileURLToPath(import.meta.url)), "ensure-relay.mjs");
-      const out = spawnSync(process.execPath, [ensure], { encoding: "utf8", windowsHide: true });
+      // --force: a relay already running (same version, maybe already an edge of another hub) must
+      // restart to read the new hub URL, token and CF headers
+      const out = spawnSync(process.execPath, [ensure, "--force"], { encoding: "utf8", windowsHide: true });
       process.stdout.write(out.stdout || ""); process.stderr.write(out.stderr || "");
     }
     return;
