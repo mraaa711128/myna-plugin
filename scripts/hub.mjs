@@ -90,19 +90,23 @@ if (cmd === "on") {
   const port = had || DEFAULT_REMOTE_PORT;
   console.log(`myna hub：${envPath} — MYNA_REMOTE_PORT=${port}${had ? "（保留原本的值）" : "（新增）"}${name ? `、MYNA_MACHINE_NAME=${name}` : ""}`);
   const h = await restart(true);
-  if (!h.remote) console.log(`遠端 listener 沒有開：MYNA_REMOTE_PORT=${port} 可能不是有效的 port，或跟 RELAY_PORT 一樣。看 relay.log。`);
-  else if (!h.remote.listening) console.log(`遠端 listener 沒有在聽 :${h.remote.port}（port 被佔用？）。看 relay.log。`);
-  console.log(tunnelHint(h.remote?.port || port));
+  const log = path.join(path.dirname(envPath), "relay.log");
+  if (!h.remote) fail(`relay 重啟了，但遠端 listener 沒有開：MYNA_REMOTE_PORT=${port} 可能不是有效的 port，或跟 RELAY_PORT 一樣。看 ${log}。`);
+  if (!h.remote.listening) fail(`relay 重啟了，但遠端 listener 沒有在聽 :${h.remote.port}（port 被佔用？）。看 ${log}。`);
+  console.log(tunnelHint(h.remote.port));
   console.log("其他機器用 /myna:join <這台的網址> --name <名稱> 加入；/myna:machines 看已加入的機器。");
   process.exit(0);
 }
 
 if (cmd === "off") {
+  // an environment variable wins over .env (and the relay inherits it): removing the line would not help
+  if (String(process.env.MYNA_REMOTE_PORT ?? "").trim()) fail(`MYNA_REMOTE_PORT=${process.env.MYNA_REMOTE_PORT} 是環境變數設定的，優先於 .env，拿掉 .env 那行也關不掉。先移除這個環境變數。沒有改任何設定。`);
   const had = fileValue("MYNA_REMOTE_PORT");
   unset("MYNA_REMOTE_PORT");
   if (had) save();
   console.log(`myna hub：${had ? `已從 ${envPath} 拿掉 MYNA_REMOTE_PORT=${had}` : `${envPath} 本來就沒有 MYNA_REMOTE_PORT`}。${path.basename(machinesFile(cfg))} 保留，之後再 on 時已加入的機器照舊有效。`);
-  await restart(false);
+  const h = await restart(false);
+  if (h.remote) fail(`relay 重啟了，但遠端 listener 還開著（remote.port ${h.remote.port}）。看 ${path.join(path.dirname(envPath), "relay.log")}。`);
   process.exit(0);
 }
 

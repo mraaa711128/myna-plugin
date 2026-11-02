@@ -10,6 +10,7 @@
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import fs from "node:fs";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 
@@ -36,8 +37,8 @@ const RP = freePort();
 const BOT = "TELEGRAM_BOT_TOKEN=123456:FAKE\nTELEGRAM_CHAT_ID=1\nTELEGRAM_API_BASE=http://127.0.0.1:9\n";
 
 const dir = (name) => { const d = path.join(TMP, name); fs.mkdirSync(d, { recursive: true }); return d; };
-const hub = (envFile, args = [], port = RP) => {
-  const r = spawnSync(process.execPath, [HUB, ...args], { env: { ...baseEnv, MYNA_ENV: envFile, RELAY_PORT: String(port) }, encoding: "utf8", timeout: 45000 });
+const hub = (envFile, args = [], port = RP, extra = {}) => {
+  const r = spawnSync(process.execPath, [HUB, ...args], { env: { ...baseEnv, MYNA_ENV: envFile, RELAY_PORT: String(port), ...extra }, encoding: "utf8", timeout: 45000 });
   return { out: ((r.stdout || "") + (r.stderr || "")).trim(), status: r.status };
 };
 const stop = (envFile, port = RP) => spawnSync(process.execPath, [STOP], { env: { ...baseEnv, MYNA_ENV: envFile, RELAY_PORT: String(port) }, encoding: "utf8", timeout: 10000 });
@@ -134,13 +135,30 @@ try {
   h = await health();
   ok(h?.pid === pidCustom, `the refused runs did not restart the relay (pid ${pidCustom} → ${h?.pid})`);
 
+  // --- off refuses while MYNA_REMOTE_PORT comes from the environment (it wins over .env) -----------
+  const envBefore = read(ENV);
+  r = hub(ENV, ["off"], RP, { MYNA_REMOTE_PORT: String(CUSTOM) });
+  show("off (env override)", r);
+  h = await health();
+  ok(r.status !== 0 && /環境變數/.test(r.out) && read(ENV) === envBefore && h?.pid === pidCustom, "off with MYNA_REMOTE_PORT set in the environment: refused, .env unchanged, relay not restarted");
+
+  // --- on fails (exit ≠ 0) when the remote port is taken — the listener did not come up -----------
+  const BUSY = freePort();
+  const blocker = net.createServer().listen(BUSY, "127.0.0.1");
+  await new Promise((res) => blocker.once("listening", res));
+  fs.writeFileSync(ENV, envBefore.replace(/^MYNA_REMOTE_PORT=.*$/m, `MYNA_REMOTE_PORT=${BUSY}`));
+  r = hub(ENV, ["on"]);
+  show("on (port taken)", r);
+  h = await health();
+  ok(r.status !== 0 && /沒有在聽/.test(r.out) && h?.remote?.port === BUSY && h?.remote?.listening === false, `on with :${BUSY} already taken: fails and says the listener is not listening`);
+  await new Promise((res) => blocker.close(res));
+
   // --- off: MYNA_REMOTE_PORT gone, remote null, machines.json kept ------------------------------
   r = hub(ENV, ["off"]);
   show("off", r);
   env = read(ENV); h = await health();
   ok(r.status === 0 && !/^MYNA_REMOTE_PORT=/m.test(env) && /^MYNA_MACHINE_NAME=hubtest$/m.test(env) && env.startsWith(BOT), "off: MYNA_REMOTE_PORT removed, the rest of .env kept");
-  ok(h && h.remote === null && h.pid !== pidCustom, "off: relay restarted, /health remote is null");
-  ok(read(MACHINES) === machinesBefore, "off: machines.json kept as it was");
+  ok(h && h.remote === null && h.pid !== pidCustom, "off: relay restarted, /health remote is null");  ok(read(MACHINES) === machinesBefore, "off: machines.json kept as it was");
 
   snap = snapshot(TMP); r = hub(ENV);
   show("status, hub off", r);
