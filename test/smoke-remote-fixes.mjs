@@ -1,0 +1,320 @@
+#!/usr/bin/env node
+// Several machines, one relay — regressions for the fixes of issue #5 (0.20.2). Everything on this one
+// machine: temp HOME and MYNA_ENV, random ports (never :7800 / :7801), Telegram API stubs, no real bot.
+//   machines.json: add (hub) and revoke (machines.mjs) in two processes at once lose nothing; a half-written
+//     file is never read as "no machines" (no mass revoke, no overwrite)
+//   remote port: an oversized /machines/join body that never ends gets 413 at once
+//   hub restart: a machine revoked while the hub was down → its journaled questions are cancelled at start
+//   join.mjs: refuses on a hub with the remote listener on; a failed local write keeps the token for
+//     --wait; a relay that does not come up as an edge fails the join; stale edge files are removed
+//   edge: MYNA_PROVIDER without keys still forwards; a restart mid-outage still needs MYNA_UPSTREAM_RECOVER
+//     good checks; questions on its own bot are given back when that bot turns out to be the hub's, and
+//     stop() cuts the poll at once even without AbortSignal.any; edge files of another hub are ignored
+// MYNA_TEST_ROOT=<another checkout> runs the same checks against that code (0.20.1 → must fail).
+import http from "node:http";
+import crypto from "node:crypto";
+import { spawn, spawnSync } from "node:child_process";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+
+const HERE = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const ROOT = process.env.MYNA_TEST_ROOT ? path.resolve(process.env.MYNA_TEST_ROOT) : HERE;
+const src = (...p) => path.join(ROOT, ...p);
+let failed = 0;
+const ok = (c, m) => { console.log(`${c ? "✅" : "❌"} ${m}`); if (!c) failed++; return c; };
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const until = async (fn, ms = 8000) => { const t0 = Date.now(); for (;;) { const v = await fn(); if (v) return v; if (Date.now() - t0 > ms) return null; await sleep(60); } };
+const children = [];
+const relayPids = new Set(); // relays started detached by ensure-relay (join without --no-start)
+const cleanup = () => { for (const c of children) { try { c.kill(); } catch {} } for (const p of relayPids) { try { process.kill(p); } catch {} } };
+const watchdog = setTimeout(() => { console.error("❌ TIMEOUT — smoke did not finish in 180s"); cleanup(); process.exit(1); }, 180000);
+process.on("exit", cleanup);
+
+const TMP = fs.mkdtempSync(path.join(os.tmpdir(), "myna-fixes-"));
+const used = new Set([7800, 7801]);
+const freePort = () => { for (;;) { const p = 20000 + Math.floor(Math.random() * 20000); if (!used.has(p)) { used.add(p); return p; } } };
+// a clean env: nothing of the developer's own myna setup leaks into the children; HOME is a temp dir
+const baseEnv = (() => {
+  const e = { ...process.env };
+  for (const k of Object.keys(e)) if (/^(MYNA_|TELEGRAM_|DISCORD_|SLACK_|RELAY_PORT$|CLAUDE_CODE_SESSION_ID$)/.test(k)) delete e[k];
+  e.HOME = e.USERPROFILE = path.join(TMP, "home");
+  fs.mkdirSync(e.HOME, { recursive: true });
+  return e;
+})();
+const dir = (name) => { const d = path.join(TMP, name); fs.mkdirSync(d, { recursive: true }); return d; };
+const sha = (s) => crypto.createHash("sha256").update(s).digest("hex");
+const newMachine = (name) => { const id = crypto.randomBytes(6).toString("hex"); const token = `myna_m_${id}_${crypto.randomBytes(32).toString("base64url")}`; return { id, name, token, rec: { id, name, sha256: sha(token), os: "Linux", hostname: `host-${name}`, created_at: new Date().toISOString() } }; };
+const req = async (url, { method = "GET", headers = {}, body } = {}) => {
+  try {
+    const r = await fetch(url, { method, headers, ...(body !== undefined ? { body: typeof body === "string" ? body : JSON.stringify(body) } : {}), signal: AbortSignal.timeout(8000) });
+    const text = await r.text(); let json = null; try { json = JSON.parse(text); } catch {}
+    return { status: r.status, json, text };
+  } catch (e) { return { status: 0, error: e.cause?.code || e.message }; }
+};
+
+// === 1. machines.json: two writers in two processes ====================================================
+{
+  const file = path.join(dir("store"), "machines.json");
+  const seeded = Array.from({ length: 150 }, (_, i) => newMachine(`r${i}`).rec);
+  fs.writeFileSync(file, JSON.stringify({ version: 1, machines: seeded }, null, 2));
+  const worker = path.join(TMP, "store-worker.mjs");
+  fs.writeFileSync(worker, `import { machineStore } from ${JSON.stringify(pathToFileURL(src("src", "remote.mjs")).href)};
+const [mode, file, list] = process.argv.slice(2);
+const store = machineStore(file);
+for (const x of JSON.parse(list)) { if (mode === "add") store.add(x); else store.revoke(x); }
+`);
+  const adds = Array.from({ length: 150 }, (_, i) => newMachine(`a${i}`).rec);
+  const run = (mode, list) => new Promise((resolve) => { const c = spawn(process.execPath, [worker, mode, file, JSON.stringify(list)], { env: baseEnv, stdio: ["ignore", "ignore", "pipe"] }); let err = ""; c.stderr.on("data", (d) => (err += d)); c.on("exit", (rc) => resolve({ rc, err })); });
+  const [ra, rr] = await Promise.all([run("add", adds), run("revoke", seeded.map((m) => m.id))]);
+  let final = [];
+  try { final = JSON.parse(fs.readFileSync(file, "utf8")).machines; } catch {}
+  const byId = new Map(final.map((m) => [m.id, m]));
+  const lostAdds = adds.filter((m) => !byId.has(m.id)).length;
+  const unrevoked = seeded.filter((m) => !byId.get(m.id)?.revoked_at).length;
+  ok(ra.rc === 0 && rr.rc === 0 && lostAdds === 0 && unrevoked === 0,
+    `machines.json: 150 joins (hub) and 150 revokes (machines.mjs) in two processes at once → no join lost, no revoke undone (lost joins ${lostAdds}, revoked machines back to active ${unrevoked}, rc ${ra.rc}/${rr.rc}${ra.err || rr.err ? ` — ${(ra.err || rr.err).trim().split("\n").pop()}` : ""})`);
+
+  // a half-written file (another process mid-write) is not "no machines"
+  const { machineStore } = await import(pathToFileURL(src("src", "remote.mjs")).href);
+  const f2 = path.join(dir("store2"), "machines.json"), keep = newMachine("keep");
+  fs.writeFileSync(f2, JSON.stringify({ version: 1, machines: [keep.rec] }, null, 2));
+  const gone = [];
+  const store = machineStore(f2, { onRevoked: (ids) => gone.push(...ids) });
+  ok(!!store.verify(keep.token), "store: a registered machine's token verifies");
+  fs.writeFileSync(f2, '{"version":1,"machines":[{"id":"'); // truncated
+  store.refresh();
+  ok(gone.length === 0 && !!store.verify(keep.token), `store: a half-written machines.json keeps the last good list — no machine treated as revoked (notified ${JSON.stringify(gone)})`);
+  let threw = false;
+  try { store.add(newMachine("late").rec); } catch { threw = true; }
+  ok(threw && fs.readFileSync(f2, "utf8").startsWith('{"version":1,"machines":[{"id":"'), "store: add() on an unreadable machines.json fails instead of overwriting it with one machine");
+}
+
+// --- Telegram API stubs ---------------------------------------------------------------------------------
+// hang: getUpdates never answers (a long-poll in flight) — records when the client gives up on it
+async function botStub({ hang = false } = {}) {
+  const s = { sent: [], edits: [], updates: [], polls: 0, n: 1, mid: 100, held: [] };
+  const srv = http.createServer((rq, res) => {
+    const u = new URL(rq.url, "http://x");
+    const json = (o) => { res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify(o)); };
+    let body = ""; rq.on("data", (c) => (body += c));
+    rq.on("end", () => {
+      const b = (() => { try { return JSON.parse(body || "{}"); } catch { return {}; } })();
+      if (/\/getUpdates$/.test(u.pathname)) {
+        s.polls++;
+        if (hang) { const h = { at: Date.now(), closedAt: 0 }; s.held.push(h); res.on("close", () => (h.closedAt = Date.now())); return; }
+        const deliver = () => { const out = s.updates; s.updates = []; json({ ok: true, result: out }); }; s.updates.length ? deliver() : setTimeout(deliver, 100); return;
+      }
+      if (/\/sendMessage$/.test(u.pathname)) { b.message_id = ++s.mid; s.sent.push(b); json({ ok: true, result: { message_id: b.message_id } }); return; }
+      if (/\/createForumTopic$/.test(u.pathname)) { json({ ok: true, result: { message_thread_id: 77 } }); return; }
+      if (/\/editMessageReplyMarkup$/.test(u.pathname)) { s.edits.push(b); json({ ok: true, result: true }); return; }
+      json({ ok: true, result: true });
+    });
+  });
+  await new Promise((r) => srv.listen(0, "127.0.0.1", r));
+  s.url = `http://127.0.0.1:${srv.address().port}`;
+  s.close = () => { srv.closeAllConnections?.(); srv.close(); };
+  s.keyboardWith = (re, ms) => until(() => [...s.sent].reverse().find((m) => m.reply_markup?.inline_keyboard && re.test(m.text || "")), ms);
+  s.tap = (msg, row, idx) => s.updates.push({ update_id: s.n++, callback_query: { id: `cq${s.n}`, data: msg.reply_markup.inline_keyboard[row][idx].callback_data, message: { chat: { id: 42 }, message_id: msg.message_id } } });
+  return s;
+}
+const hubBot = await botStub();
+const HUB_BOT = "111111:HUB-SECRET";
+// a tunnel that can go down (530, like a dead cloudflared)
+function tunnelTo(port) {
+  const st = { down: false };
+  const srv = http.createServer((rq, res) => {
+    if (st.down) { res.writeHead(530, { "content-type": "text/html" }); res.end("<html>tunnel down</html>"); return; }
+    const up = http.request({ host: "127.0.0.1", port, method: rq.method, path: rq.url, headers: rq.headers }, (r) => { res.writeHead(r.statusCode, r.headers); r.pipe(res); });
+    up.on("error", () => { res.writeHead(502); res.end("bad gateway"); });
+    rq.pipe(up);
+  });
+  return new Promise((r) => srv.listen(0, "127.0.0.1", () => r({ st, url: `http://127.0.0.1:${srv.address().port}`, close: () => { srv.closeAllConnections?.(); srv.close(); } })));
+}
+
+// --- hub ------------------------------------------------------------------------------------------------
+const H = freePort(), R = freePort();
+const HUB = `http://127.0.0.1:${H}`, REMOTE = `http://127.0.0.1:${R}`;
+const HUB_DIR = dir("hub"), MACHINES = path.join(HUB_DIR, "machines.json");
+const M = Object.fromEntries(["pc1", "pc3", "pc4", "pc5", "gone"].map((n) => [n, newMachine(n)]));
+fs.writeFileSync(MACHINES, JSON.stringify({ version: 1, machines: Object.values(M).map((m) => m.rec) }, null, 2));
+const hubLog = [];
+let hub;
+const startHub = async () => {
+  hub = spawn(process.execPath, [src("src", "relay.mjs")], {
+    env: { ...baseEnv, MYNA_ENV: path.join(HUB_DIR, ".env"), MYNA_PROVIDER: "telegram", TELEGRAM_BOT_TOKEN: HUB_BOT, TELEGRAM_CHAT_ID: "42", TELEGRAM_API_BASE: hubBot.url,
+      RELAY_PORT: String(H), MYNA_REMOTE_PORT: String(R), MYNA_MACHINES_FILE: MACHINES, MYNA_MACHINE_NAME: "win", MYNA_ANSWER_HOLD_MS: "1500", TELEGRAM_TOPIC_ROUND_GRACE: "0",
+      MYNA_JOIN_TTL_MS: "20000", MYNA_JOIN_INTERVAL_MS: "0", MYNA_JOIN_MAX_OPEN: "3", MYNA_REMOTE_ASK_MAX: "100" },
+    stdio: ["ignore", "ignore", "pipe"],
+  });
+  children.push(hub); hub.stderr.on("data", (d) => hubLog.push(String(d)));
+  return until(async () => (await req(`${HUB}/health`)).status === 200 && (await req(`${REMOTE}/health`, { headers: { authorization: `Bearer ${M.pc1.token}` } })).status === 200, 8000);
+};
+if (!(await startHub())) { console.error("❌ hub relay never came up"); console.error(hubLog.join("")); process.exit(1); }
+
+// === 2. remote port: an oversized body that never ends ================================================
+{
+  const t0 = Date.now();
+  const r = await new Promise((resolve) => {
+    const q = http.request({ host: "127.0.0.1", port: R, method: "POST", path: "/machines/join", headers: { "content-type": "application/json", "content-length": String(10 * 1024 * 1024) } }, (res) => { res.resume(); resolve({ status: res.statusCode, ms: Date.now() - t0 }); });
+    q.on("error", (e) => resolve({ error: e.code, ms: Date.now() - t0 }));
+    q.write("x".repeat(16 * 1024)); // over the 4 KB cap — and the rest never comes
+    setTimeout(() => { resolve({ timeout: true, ms: Date.now() - t0 }); q.destroy(); }, 4000);
+  });
+  ok(r.status === 413 && r.ms < 3000, `remote /machines/join: a body over the cap that never ends → 413 at once, not when (if ever) it ends (${JSON.stringify(r)})`);
+}
+
+// === 3. hub restart: a machine revoked while the hub was down ==========================================
+{
+  const auth = { authorization: `Bearer ${M.gone.token}` };
+  const a = await req(`${REMOTE}/ask`, { method: "POST", headers: auth, body: { question: "停機前問的題", options: ["a", "b"], session_id: "s1" } });
+  const qmsg = await hubBot.keyboardWith(/停機前問的題/);
+  ok(a.status === 200 && !!qmsg, `a remote question of "gone" is open on the phone (${a.status})`);
+  hub.kill(); await until(async () => (await req(`${HUB}/health`)).status === 0, 5000);
+  const rev = spawnSync(process.execPath, [src("scripts", "machines.mjs"), "revoke", "gone"], { env: { ...baseEnv, MYNA_MACHINES_FILE: MACHINES }, encoding: "utf8" });
+  ok(rev.status === 0, `hub down: machines.mjs revoke gone (${rev.stdout.trim() || rev.stderr.trim()})`);
+  await startHub();
+  const r = await until(async () => { const x = await req(`${HUB}/answer/${a.json?.request_id}`); return x.json?.kind && x.json.kind !== "pending" ? x : null; }, 4000);
+  ok(r?.json?.kind === "cancelled" && r.json.reason === "machine revoked" && hubBot.edits.some((e) => e.message_id === qmsg?.message_id),
+    `hub restarted: the revoked machine's journaled question is cancelled at start and its buttons retracted (${JSON.stringify(r?.json)})`);
+}
+
+// === 4. join.mjs ==========================================================================================
+// joins straight to the remote port; the test taps ✅ on the hub's phone for the machine named
+const approveJoin = async (name) => { const m = await hubBot.keyboardWith(new RegExp(`🆕[\\s\\S]*${name}`), 10000); if (m) hubBot.tap(m, 0, 0); return !!m; };
+const runJoin = (args, env) => new Promise((resolve) => {
+  // a join that starts the relay must never touch the real one on :7800
+  if (!args.includes("--no-start") && !args.includes("--no-wait") && (!env.RELAY_PORT || [7800, 7801].includes(Number(env.RELAY_PORT)))) throw new Error("runJoin without --no-start needs a test RELAY_PORT");
+  const c = spawn(process.execPath, [src("scripts", "join.mjs"), ...args], { env: { ...baseEnv, MYNA_ANSWER_HOLD_MS: "1000", ...env }, stdio: ["ignore", "pipe", "pipe"] });
+  children.push(c);
+  let out = ""; c.stdout.on("data", (d) => (out += d)); c.stderr.on("data", (d) => (out += d));
+  c.on("exit", (rc) => resolve({ rc, out }));
+});
+{
+  // a hub with its remote listener on does not turn itself into an edge
+  const d = dir("pc9"), env = path.join(d, ".env"), before = `TELEGRAM_BOT_TOKEN=999999:X\nTELEGRAM_CHAT_ID=1\nMYNA_REMOTE_PORT=7801\n`;
+  fs.writeFileSync(env, before);
+  const r = await runJoin([REMOTE, "--name", "pc9", "--no-wait"], { MYNA_ENV: env });
+  await sleep(500);
+  ok(r.rc !== 0 && /hub off/.test(r.out) && fs.readFileSync(env, "utf8") === before && !hubBot.sent.some((m) => /pc9/.test(m.text || "")),
+    `join.mjs on a hub with MYNA_REMOTE_PORT → refused before asking (rc=${r.rc}), .env unchanged — "${r.out.trim().split("\n").pop()}"`);
+}
+{
+  // the token cannot be saved → the token stays in join-pending.json, --wait finishes the job later
+  const d = dir("pc6"), env = path.join(d, ".env"), badTok = dir("pc6/token-is-a-dir"), goodTok = path.join(d, "machine-token");
+  const p = runJoin([REMOTE, "--name", "pc6", "--no-start"], { MYNA_ENV: env, MYNA_MACHINE_TOKEN_FILE: badTok });
+  ok(await approveJoin("pc6"), "pc6's join request reached the phone — ✅ tapped");
+  const r1 = await p;
+  const state = (() => { try { return JSON.parse(fs.readFileSync(path.join(d, "join-pending.json"), "utf8")); } catch { return null; } })();
+  ok(r1.rc !== 0 && /^myna_m_/.test(state?.token || ""), `approved but the token file cannot be written → join fails (rc=${r1.rc}) and keeps the token in join-pending.json for --wait`);
+  const r2 = await runJoin(["--wait", "--no-start"], { MYNA_ENV: env, MYNA_MACHINE_TOKEN_FILE: goodTok });
+  const tok = fs.existsSync(goodTok) ? fs.readFileSync(goodTok, "utf8").trim() : "";
+  ok(r2.rc === 0 && !!tok && fs.readFileSync(MACHINES, "utf8").includes(sha(tok)) && !fs.existsSync(path.join(d, "join-pending.json")) && /^MYNA_ROLE=edge$/m.test(fs.readFileSync(env, "utf8")),
+    `join.mjs --wait afterwards finishes without asking the hub again: token saved, .env written, join-pending.json removed (rc=${r2.rc}) ${r2.rc ? r2.out.trim().split("\n").pop() : ""}`);
+}
+{
+  // ensure-relay cannot bring up an edge (something else holds the port) → the join reports it; files
+  // left by an edge of another hub are removed
+  const d = dir("pc7"), env = path.join(d, ".env");
+  fs.writeFileSync(path.join(d, "upstream.json"), JSON.stringify({ bot_id: "telegram:424242", seen_at: new Date().toISOString() }));
+  fs.writeFileSync(path.join(d, "edge-state.json"), JSON.stringify({ forwarded: [["aaaaaaaaaa", { at: Date.now() }]], abandoned: ["bbbbbbbbbb"], down_since: null }));
+  const squat = http.createServer((rq, res) => { res.writeHead(404); res.end("not a relay"); });
+  const SQ = freePort(); await new Promise((r) => squat.listen(SQ, "127.0.0.1", r));
+  const p = runJoin([REMOTE, "--name", "pc7"], { MYNA_ENV: env, RELAY_PORT: String(SQ) });
+  await approveJoin("pc7");
+  const r = await p;
+  squat.close();
+  ok(r.rc !== 0 && /relay/.test(r.out.trim().split("\n").pop()), `join approved but no edge relay came up on the port → join.mjs fails (rc=${r.rc}) — "${r.out.trim().split("\n").pop()}"`);
+  ok(!fs.existsSync(path.join(d, "upstream.json")) && !fs.existsSync(path.join(d, "edge-state.json")), "a new join removes upstream.json / edge-state.json left by an earlier hub");
+  // and the normal case: the relay comes up as an edge of this hub
+  const d8 = dir("pc8"), env8 = path.join(d8, ".env"), P8 = freePort();
+  const p8 = runJoin([REMOTE, "--name", "pc8"], { MYNA_ENV: env8, RELAY_PORT: String(P8) });
+  await approveJoin("pc8");
+  const r8 = await p8;
+  for (const m of r8.out.matchAll(/\(pid (\d+)\)/g)) relayPids.add(Number(m[1])); // started detached: stopped at the end whatever happens
+  const h8 = await req(`http://127.0.0.1:${P8}/health`);
+  if (h8.json?.pid) relayPids.add(h8.json.pid);
+  ok(r8.rc === 0 && h8.json?.role === "edge" && h8.json.upstream?.url === REMOTE, `join with ensure-relay: rc=0 and the relay on the port is an edge of this hub (${h8.json?.role} → ${h8.json?.upstream?.url}) ${r8.rc ? r8.out.trim().split("\n").pop() : ""}`);
+  await req(`http://127.0.0.1:${P8}/shutdown`, { method: "POST" });
+}
+
+// === 5. edges ==============================================================================================
+const EDGE_TIMING = { MYNA_UPSTREAM_CHECK_MS: "250", MYNA_UPSTREAM_GRACE: "30", MYNA_ANSWER_HOLD_MS: "1500" };
+const edgeLogs = [];
+const startEdge = (port, env, nodeArgs = []) => {
+  const c = spawn(process.execPath, [...nodeArgs, src("src", "relay.mjs")], { env: { ...baseEnv, RELAY_PORT: String(port), MYNA_ROLE: "edge", ...EDGE_TIMING, ...env }, stdio: ["ignore", "ignore", "pipe"] });
+  children.push(c); const out = []; edgeLogs.push([port, out]); c.stderr.on("data", (d) => out.push(String(d)));
+  c.on("exit", (rc) => out.push(`(exited rc=${rc})\n`));
+  return c;
+};
+{
+  // an edge whose .env still names a provider it has no keys for: forwards only, does not exit
+  const P = freePort();
+  startEdge(P, { MYNA_ENV: path.join(dir("pc1"), ".env"), MYNA_UPSTREAM: REMOTE, MYNA_MACHINE_TOKEN: M.pc1.token, MYNA_PROVIDER: "telegram" });
+  const r = await until(async () => { const x = await req(`http://127.0.0.1:${P}/health`); return x.json?.upstream?.active ? x : null; }, 8000);
+  ok(r?.json?.role === "edge" && r.json.own_bot?.on === false, `edge with MYNA_PROVIDER=telegram but no Telegram keys → runs, forwarding only (${r ? `own_bot.on=${r.json.own_bot?.on}` : "relay not up"})`);
+}
+{
+  // restarted mid-outage: the recovery still takes MYNA_UPSTREAM_RECOVER good checks in a row
+  const bot3 = await botStub(), tun = await tunnelTo(R), P = freePort(), E = `http://127.0.0.1:${P}`;
+  const env = { MYNA_ENV: path.join(dir("pc3"), ".env"), MYNA_UPSTREAM: tun.url, MYNA_MACHINE_TOKEN: M.pc3.token, MYNA_UPSTREAM_RECOVER: "4",
+    TELEGRAM_BOT_TOKEN: "333333:PC3", TELEGRAM_CHAT_ID: "42", TELEGRAM_API_BASE: bot3.url };
+  let c = startEdge(P, env);
+  ok(!!(await until(async () => (await req(`${E}/health`)).json?.upstream?.active, 8000)), "pc3 (own bot) forwards to the hub");
+  tun.st.down = true;
+  await until(async () => (await req(`${E}/health`)).json?.upstream?.reachable === false, 5000);
+  c.kill(); await until(async () => (await req(`${E}/health`)).status === 0, 4000);
+  c = startEdge(P, env);
+  ok(!!(await until(async () => (await req(`${E}/health`)).json?.upstream?.reachable === false, 10000)), "pc3 restarted while the hub is still away");
+  tun.st.down = false;
+  const t0 = Date.now(); let reach = 0, active = 0;
+  while (!active && Date.now() - t0 < 8000) { const x = await req(`${E}/health`); if (x.json?.upstream?.reachable && !reach) reach = Date.now(); if (x.json?.upstream?.active) active = Date.now(); await sleep(30); }
+  ok(reach > 0 && active > 0 && active - reach >= 500, `restarted mid-outage: new questions go back to the hub only after 4 good checks in a row (${active && reach ? `${active - reach} ms after it was reachable` : "never active"}, checks every 250 ms)`);
+  c.kill(); tun.close(); bot3.close();
+}
+{
+  // started while the hub was away, its bot unknown → its own bot took a question; then the hub reports
+  // that same bot. The question goes back to the terminal, its buttons retracted; the stop cuts the
+  // in-flight getUpdates at once — also on a Node without AbortSignal.any
+  const bot4 = await botStub({ hang: true }), tun = await tunnelTo(R), P = freePort(), E = `http://127.0.0.1:${P}`;
+  tun.st.down = true;
+  startEdge(P, { MYNA_ENV: path.join(dir("pc4"), ".env"), MYNA_UPSTREAM: tun.url, MYNA_MACHINE_TOKEN: M.pc4.token, TELEGRAM_BOT_TOKEN: "111111:SAME-AS-HUB", TELEGRAM_CHAT_ID: "42", TELEGRAM_API_BASE: bot4.url },
+    ["--import", "data:text/javascript,delete AbortSignal.any;"]);
+  const h0 = await until(async () => { const x = await req(`${E}/health`); return x.json?.own_bot?.on ? x : null; }, 10000);
+  ok(!!h0 && !!(await until(() => bot4.held.length > 0, 3000)), "pc4: hub away, its bot unknown → own bot on (a getUpdates is in flight)");
+  const a = await req(`${E}/ask`, { method: "POST", body: { question: "自己 bot 上的題", options: ["a", "b"], session_id: "s4" } });
+  const msg = await bot4.keyboardWith(/自己 bot 上的題/, 4000);
+  ok(a.status === 200 && !!msg, `pc4: a question asked meanwhile is on its own bot (${a.status})`);
+  tun.st.down = false;
+  const off = await until(async () => { const x = await req(`${E}/health`); return x.json?.own_bot?.on === false ? Date.now() : null; }, 6000);
+  ok(!!off, "pc4: the hub reports the same bot → own bot off");
+  const ans = await until(async () => { const x = await req(`${E}/answer/${a.json?.request_id}`); return x.json?.kind && x.json.kind !== "pending" ? x : null; }, 4000);
+  ok(ans?.json?.kind === "unreachable" && bot4.edits.some((e) => e.message_id === msg?.message_id),
+    `pc4: the question on the stopped bot is given back (/answer → ${JSON.stringify(ans?.json)}), its buttons retracted`);
+  const cut = await until(() => bot4.held.every((h) => h.closedAt), 3000);
+  ok(!!cut, `pc4: stop() aborts the getUpdates in flight at once, without AbortSignal.any (${bot4.held.map((h) => (h.closedAt ? `closed ${h.closedAt - (off || h.closedAt)} ms after own bot off` : "still open")).join(", ")})`);
+  tun.close(); bot4.close();
+}
+{
+  // edge files written for another hub are not used for this one
+  const bot5 = await botStub(), tun = await tunnelTo(R), P = freePort(), E = `http://127.0.0.1:${P}`, d = dir("pc5");
+  tun.st.down = true;
+  fs.writeFileSync(path.join(d, "upstream.json"), JSON.stringify({ upstream: "https://old-hub.example.com", bot_id: "telegram:555555", seen_at: new Date().toISOString() }));
+  fs.writeFileSync(path.join(d, "edge-state.json"), JSON.stringify({ upstream: "https://old-hub.example.com", forwarded: [["aaaaaaaaaa", { at: Date.now() }]], abandoned: ["bbbbbbbbbb"], down_since: Date.now() }));
+  startEdge(P, { MYNA_ENV: path.join(d, ".env"), MYNA_UPSTREAM: tun.url, MYNA_MACHINE_TOKEN: M.pc5.token, TELEGRAM_BOT_TOKEN: "555555:PC5", TELEGRAM_CHAT_ID: "42", TELEGRAM_API_BASE: bot5.url });
+  const r = await until(async () => { const x = await req(`${E}/health`); return x.json?.own_bot ? x : null; }, 10000);
+  ok(r?.json?.own_bot?.on === true && r.json.upstream?.forwarded === 0 && r.json.upstream?.abandoned === 0,
+    `edge files of another hub are ignored: the old hub's bot id does not switch its own bot off, no old question ids (own_bot.on=${r?.json?.own_bot?.on}, forwarded=${r?.json?.upstream?.forwarded}, abandoned=${r?.json?.upstream?.abandoned})`);
+  tun.close(); bot5.close();
+}
+
+if (failed) {
+  for (const [port, out] of edgeLogs) console.log(`--- edge :${port} log ---\n${out.join("").split("\n").slice(-12).join("\n")}`);
+  console.log(`--- hub log (tail) ---\n${hubLog.join("").split("\n").slice(-25).join("\n")}`);
+}
+cleanup(); hubBot.close(); clearTimeout(watchdog);
+await sleep(300);
+try { fs.rmSync(TMP, { recursive: true, force: true }); } catch {}
+console.log(failed === 0 ? "\n✅ REMOTE FIXES (issue #5) PASS" : `\n❌ ${failed} check(s) FAILED`);
+process.exit(failed ? 1 : 0);
