@@ -255,7 +255,9 @@ r = await until(async () => { const x = await pollJoin(jB.id, jB.secret); return
 const bToken = r?.json?.token || "";
 ok(r?.json?.status === "approved" && /^myna_m_[a-f0-9]{12}_/.test(bToken) && r.json.name === "pc2", `✅ tapped → approved, token handed out (${r?.json?.status})`);
 r = await pollJoin(jB.id, jB.secret);
-ok(r.status === 404 && !r.json?.token, `the token is handed out only once — a second poll → 404 (${r.status})`);
+ok(r.status === 200 && r.json?.status === "approved" && r.json.token === bToken, `a second poll with the same secret (the first reply lost on the way back) → the same token (${r.status})`);
+r = await pollJoin(jB.id, "not-the-secret");
+ok(r.status === 404 && !r.json?.token, `a wrong enroll secret after the token was handed out → 404, no token (${r.status})`);
 const B_ID = /^myna_m_([a-f0-9]{12})_/.exec(bToken)?.[1];
 // ⏹ on the phone also issues nothing
 const jE = await rawJoin("pc5");
