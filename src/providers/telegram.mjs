@@ -853,8 +853,9 @@ export function create(cfg, ctx) {
       try {
         // 40s client timeout > 30s server long-poll: a wedged/half-open socket can't hang forever
         // (it throws → caught below → 1s backoff → retry; offset unchanged so no update is lost).
-        const signal = AbortSignal.any ? AbortSignal.any([AbortSignal.timeout(40000), stopper.signal]) : AbortSignal.timeout(40000);
-        const j = await (await fetch(`${API}/getUpdates?timeout=30&offset=${offset}`, { signal })).json();
+        const { signal, done } = pollSignal(40000);
+        let j;
+        try { j = await (await fetch(`${API}/getUpdates?timeout=30&offset=${offset}`, { signal })).json(); } finally { done(); }
         if (stopper.signal.aborted) break; // stopped meanwhile: leave these updates unconfirmed for whoever polls next
         if (j.ok) for (const u of j.result) { offset = u.update_id + 1; handleUpdate(u).catch((e) => log("handleUpdate err", e.message)); }
       } catch (e) { if (stopper.signal.aborted) break; log("poll err", errText(e)); await new Promise((r) => setTimeout(r, 1000)); }
@@ -864,6 +865,17 @@ export function create(cfg, ctx) {
   // stop polling for good (an edge that found the hub polls this same bot — two pollers get 409)
   const stopper = new AbortController();
   function stop() { stopper.abort(); }
+  // a poll's signal: aborts on its timeout or on stop(). AbortSignal.any is Node 18.17+ / 20.3+; on an
+  // older Node the two are combined by hand, so stop() still cuts the poll in flight at once (two pollers
+  // on one bot get 409). done() drops the listener on stopper once the poll is over.
+  function pollSignal(ms) {
+    if (AbortSignal.any) return { signal: AbortSignal.any([AbortSignal.timeout(ms), stopper.signal]), done() {} };
+    const c = new AbortController();
+    const t = setTimeout(() => c.abort(new DOMException("The operation was aborted due to timeout", "TimeoutError")), ms);
+    const onStop = () => c.abort(stopper.signal.reason);
+    if (stopper.signal.aborted) onStop(); else stopper.signal.addEventListener("abort", onStop, { once: true });
+    return { signal: c.signal, done() { clearTimeout(t); stopper.signal.removeEventListener("abort", onStop); } };
+  }
 
   // Claude finished its reply and none of the session's gates is open (relay checked): the round —
   // and with it the current gate — is over once the grace passes without another ask (topicFor
@@ -921,6 +933,7 @@ export function create(cfg, ctx) {
       : why === "orphaned" ? "⌛ 這題放太久、已經沒有 session 在等答案,已取消;手機上的按鈕已失效"
       : why === "join_expired" ? "⌛ 加入要求逾時沒有回應,已取消;手機上的按鈕已失效"
       : why === "revoked" ? "🚫 發問的機器已被撤銷,這題已取消;手機上的按鈕已失效"
+      : why === "same_bot" ? "↩️ 這台機器的 bot 就是主節點那支,不再用它發問;這題改回終端機處理,手機上的按鈕已失效"
       : "↩️ 這題已在終端機處理,手機上的按鈕已失效";
     await tg("sendMessage", inTopic(q.topic, { chat_id: q.chat ?? CHAT_ID, text }));
     log(`question ${request_id} ${why === "expired" ? "expired after a detach" : why === "orphaned" ? "orphaned" : "cancelled by the asking side"} — buttons retracted`);

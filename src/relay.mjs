@@ -72,7 +72,7 @@ import { applyNetAttemptTimeout } from "./net.mjs";
 import {
   PROTOCOL, PROTOCOL_HEADER, ENROLL_SECRET_HEADER, REQUEST_ID_HEADER, LOCAL_ID, NAME_RE, CODE_RE, ASK_MAX_BYTES_DEFAULT,
   roleOf, machinesFile, seenFile, machineStore, newMachineId, newMachineToken, sha256hex, sameHex, bearerOf,
-  readBody, localRefusal, writePrivate, upstreamUrl, cfHeaders, tokenFile, botIdentity,
+  readBody, refuseTooLarge, localRefusal, writePrivate, upstreamUrl, cfHeaders, tokenFile, botIdentity,
 } from "./remote.mjs";
 
 const PROVIDERS = [telegram, discord, slack]; // auto-pick order when MYNA_PROVIDER is unset
@@ -180,7 +180,12 @@ let mod;
 if (want) {
   mod = PROVIDERS.find((p) => p.name === want);
   if (!mod) { log(`unknown MYNA_PROVIDER "${want}" — use telegram | discord | slack`); process.exit(1); }
-  if (!mod.configured(cfg) && !mod.pairable?.(cfg)) { log(`MYNA_PROVIDER=${want} but its keys are missing in ${ENV_PATH} — see .env.example`); process.exit(1); }
+  if (!mod.configured(cfg) && !mod.pairable?.(cfg)) {
+    // an edge needs no IM of its own (SPEC §5.1): a provider named without its keys (an .env from before
+    // the join) means it has none — forward only, do not refuse to run
+    if (EDGE) { log(`MYNA_PROVIDER=${want} but its keys are missing in ${ENV_PATH} — this edge has no bot of its own, forwarding only`); mod = undefined; }
+    else { log(`MYNA_PROVIDER=${want} but its keys are missing in ${ENV_PATH} — see .env.example`); process.exit(1); }
+  }
 } else {
   // a fully configured provider first; else one that only waits to be paired (telegram: token, no chat yet)
   mod = PROVIDERS.find((p) => p.configured(cfg)) || PROVIDERS.find((p) => p.pairable?.(cfg));
@@ -376,13 +381,16 @@ function edgeLink() {
   const TOKEN_FILE = tokenFile(cfg);
   const token = () => { if (cfg.MYNA_MACHINE_TOKEN) return String(cfg.MYNA_MACHINE_TOKEN).trim(); try { return fs.readFileSync(TOKEN_FILE, "utf8").trim(); } catch { return ""; } };
   const BOT_FILE = path.join(path.dirname(ENV_PATH), "upstream.json"); // the hub's bot id last seen (decides at start while the hub is away)
+  // upstream.json and edge-state.json say which hub they were written for: a file of another hub (this
+  // machine joined a new one) is ignored. Files without it (0.20.0 / 0.20.1) are taken as before.
+  const forThisHub = (s) => !s?.upstream || s.upstream === up.url;
   const h = {
     url: up.url, cf: !!Object.keys(CF).length, tokenFile: TOKEN_FILE,
     reachable: false,      // the last check (or forward) reached the hub
     active: false,         // new questions go to the hub (after MYNA_UPSTREAM_RECOVER good checks in a row once it was away)
     everUp: false, okStreak: 0, reason: "not checked yet", since: Date.now(), downSince: Date.now(),
     version: null, protocol: null, machine: null,
-    bot: (() => { try { return JSON.parse(fs.readFileSync(BOT_FILE, "utf8")).bot_id || null; } catch { return null; } })(),
+    bot: (() => { try { const s = JSON.parse(fs.readFileSync(BOT_FILE, "utf8")); return forThisHub(s) ? s.bot_id || null : null; } catch { return null; } })(),
     forwarded: new Map(),  // request_id -> {at}: forwarded to the hub, answer not collected yet
     abandoned: new Set(),  // given up while the hub was away → cancelled at the hub once it is back
     CHECK_MS: intCfg("MYNA_UPSTREAM_CHECK_MS", 10000, 50),
@@ -392,21 +400,26 @@ function edgeLink() {
     onBot: null,           // set below: called when the hub's bot id is learned / changes
   };
   // forwarded / abandoned / the outage start survive a restart (an upgrade mid-outage must neither
-  // cut a question's grace short nor forget to retract the buttons of one given up): edge-state.json
+  // cut a question's grace short nor forget to retract the buttons of one given up): edge-state.json.
+  // ever_up too: a restart mid-outage is a recovery, not a first connection — the hub gets new questions
+  // back only after MYNA_UPSTREAM_RECOVER good checks, as without the restart
   const STATE_FILE = cfg.MYNA_EDGE_STATE_FILE || path.join(path.dirname(ENV_PATH), "edge-state.json");
   try {
     const s = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
-    for (const [id, v] of s.forwarded || []) h.forwarded.set(String(id), v);
-    for (const id of s.abandoned || []) h.abandoned.add(String(id));
-    if (Number.isFinite(s.down_since)) h.downSince = s.down_since;
-    if (h.forwarded.size || h.abandoned.size) log(`edge: picked up ${h.forwarded.size} question(s) waiting on the hub and ${h.abandoned.size} to cancel there from ${STATE_FILE}`);
+    if (!forThisHub(s)) log(`edge: ${STATE_FILE} was written for another hub (${s.upstream}) — not using it`);
+    else {
+      for (const [id, v] of s.forwarded || []) h.forwarded.set(String(id), v);
+      for (const id of s.abandoned || []) h.abandoned.add(String(id));
+      if (Number.isFinite(s.down_since)) { h.downSince = s.down_since; if (s.ever_up) h.everUp = true; }
+      if (h.forwarded.size || h.abandoned.size) log(`edge: picked up ${h.forwarded.size} question(s) waiting on the hub and ${h.abandoned.size} to cancel there from ${STATE_FILE}`);
+    }
   } catch {}
   let saveQueued = false;
   h.save = () => {
     if (saveQueued) return; saveQueued = true;
     setImmediate(() => {
       saveQueued = false;
-      try { writePrivate(STATE_FILE, JSON.stringify({ forwarded: [...h.forwarded], abandoned: [...h.abandoned], down_since: h.reachable ? null : h.downSince }) + "\n"); }
+      try { writePrivate(STATE_FILE, JSON.stringify({ upstream: h.url, forwarded: [...h.forwarded], abandoned: [...h.abandoned], down_since: h.reachable ? null : h.downSince, ever_up: h.everUp }) + "\n"); }
       catch (e) { log("edge: could not save", STATE_FILE, e.message); }
     });
   };
@@ -433,13 +446,15 @@ function edgeLink() {
     h.okStreak++;
     if ((j.bot_id || null) !== h.bot) {
       h.bot = j.bot_id || null;
-      try { writePrivate(BOT_FILE, JSON.stringify({ bot_id: h.bot, seen_at: new Date().toISOString() }) + "\n"); } catch {}
+      try { writePrivate(BOT_FILE, JSON.stringify({ upstream: h.url, bot_id: h.bot, seen_at: new Date().toISOString() }) + "\n"); } catch {}
     }
     h.onBot?.(h.bot);
     // back after an outage: new questions return to the hub only after RECOVER good checks in a row
     // (a flapping link must not bounce questions between two bots). Without a bot of its own there
-    // is nothing to bounce to — forward again at once.
-    if (!h.active && (!h.everUp || !ownBot.on || h.okStreak >= h.RECOVER)) {
+    // is nothing to bounce to — forward again at once. The very first check runs before the own bot is
+    // decided: count the bot as on when it will be (configured, not the hub's).
+    const fallback = ownBot.decided ? ownBot.on : !!mod && !(h.bot && ownBot.id && h.bot === ownBot.id);
+    if (!h.active && (!h.everUp || !fallback || h.okStreak >= h.RECOVER)) {
       h.active = true;
       log(`hub ${h.url} ${h.everUp ? "back" : "reachable"} — v${j.version}, protocol ${j.protocol}, this machine = ${h.machine}; new questions go to the hub`);
       h.everUp = true;
@@ -477,6 +492,7 @@ if (EDGE) {
     if (!hub.bot) log(`the hub's bot id is not known yet (hub ${hub.reachable ? "reports none" : "not reachable"}) — starting this machine's own bot; it is stopped if it turns out to be the hub's`);
   }
   if (!ownBot.on) log(`edge: ${ownBot.reason}`);
+  ownBot.decided = true;
 }
 const chat = createChat({ cfg, log, dir: path.dirname(ENV_PATH) });
 let provider;
@@ -492,7 +508,17 @@ if (EDGE) {
     if (!ownBot.on || !botId || botId !== ownBot.id) return;
     ownBot.on = false; ownBot.reason = `same bot as the hub (${botId}) — stopped using it, forwarding only`;
     log(`edge: ${ownBot.reason}`);
-    try { provider.stop(); } catch (e) { log("could not stop the provider:", e.message, "— exiting so the next start sees the hub's bot id (upstream.json) and never starts it"); process.exit(1); }
+    const old = provider;
+    try { old.stop(); } catch (e) { log("could not stop the provider:", e.message, "— exiting so the next start sees the hub's bot id (upstream.json) and never starts it"); process.exit(1); }
+    // questions already sent on that bot: their button tokens live only in the provider just stopped, and
+    // the hub — polling the same bot — cannot resolve a tap on them. Retract the buttons (cancelQuestion
+    // uses the Bot API, not the poll) and give each back to its client as unreachable (terminal picker).
+    for (const [id, p] of pending) {
+      if (p.result !== undefined) continue;
+      log(`request ${id}: on this machine's own bot, which is the hub's — giving it back to the terminal`);
+      Promise.resolve(old.cancelQuestion?.(id, "same_bot")).catch((e) => log("cancelQuestion err", e.message)); // reads its state before resolve drops it
+      resolveRequest(id, { kind: "unreachable", error: "this machine's own bot turned out to be the hub's — the question was withdrawn there" });
+    }
     provider = NO_IM; chat.attach(provider);
   };
   hub.onBot(hub.bot);
@@ -522,7 +548,7 @@ const remoteScope = (m) => ({ id: m.id, name: m.name, remote: true, sid: (s) => 
 const send = (res, code, o) => { res.writeHead(code, { "content-type": "application/json" }); res.end(JSON.stringify(o)); };
 const jsonOf = (body) => { try { return { v: JSON.parse(body || "{}") }; } catch (e) { return { err: e }; } };
 // machines.json is read only when the remote listener is on — without it nothing below changes a topic
-const machines = REMOTE_PORT ? machineStore(machinesFile(cfg), { onRevoked: (ids) => machinesRevoked(ids) }) : null;
+const machines = REMOTE_PORT ? machineStore(machinesFile(cfg), { onRevoked: (ids) => machinesRevoked(ids), onError: (m) => log(`machines: ${m}`) }) : null;
 // the machine-name prefix a question's topic gets (see MYNA_TOPIC_MACHINE)
 const topicMachine = (scope) => (TOPIC_MACHINE === "on" || (TOPIC_MACHINE === "auto" && machines && machines.active().length > 0) ? scope.name : "");
 const remoteAsks = new Map();   // machine_id -> timestamps of its recent /ask (rate limit)
@@ -532,7 +558,7 @@ const remotePolls = new Map();  // machine_id -> /answer polls held now
 async function handleAsk(req, res, scope, pre) {
   // body cap only where a question can come from another machine (a single machine keeps no cap, as before)
   const { body, tooLarge } = pre || await readBody(req, MULTI ? ASK_MAX_BYTES : Infinity);
-  if (tooLarge) { log(`rejecting /ask (413): body over ${ASK_MAX_BYTES} bytes${scope.remote ? ` from machine=${scope.name}` : ""}`); return send(res, 413, { error: `request body over ${ASK_MAX_BYTES} bytes` }); }
+  if (tooLarge) { log(`rejecting /ask (413): body over ${ASK_MAX_BYTES} bytes${scope.remote ? ` from machine=${scope.name}` : ""}`); return refuseTooLarge(req, res, `request body over ${ASK_MAX_BYTES} bytes`); }
   const { v: args, err } = jsonOf(body);
   if (err) return send(res, 400, { error: `bad JSON: ${err.message}` });
   // Second line of defense — never ship a button-less menu / markup residue to the phone.
@@ -739,7 +765,7 @@ function expireJoin(enrollId) {
 }
 async function joinStart(req, res) {
   const { body, tooLarge } = await readBody(req, 4096);
-  if (tooLarge) return send(res, 413, { error: "request body too large" });
+  if (tooLarge) return refuseTooLarge(req, res, "request body too large");
   const a = jsonOf(body).v;
   if (!a || typeof a !== "object") return send(res, 400, { error: "bad JSON" });
   const name = String(a.name ?? "").trim().toLowerCase();
@@ -790,8 +816,11 @@ async function joinPoll(req, res, enrollId) {
 if (machines) setInterval(() => {
   for (const [eid, j] of joins) {
     if (j.status === "pending" || Date.now() - j.doneAt < JOIN_TTL_MS) continue;
+    if (j.status === "approved") {
+      try { machines.revoke(j.machine.id); log(`join: ${j.name}'s token was never collected — machine ${j.machine.id} revoked`); }
+      catch (e) { log(`join: could not revoke ${j.name}'s uncollected machine ${j.machine.id} (${e.message}) — trying again next time`); continue; }
+    }
     joins.delete(eid);
-    if (j.status === "approved") { machines.revoke(j.machine.id); log(`join: ${j.name}'s token was never collected — machine ${j.machine.id} revoked`); }
   }
 }, Math.min(60000, JOIN_TTL_MS)).unref();
 
@@ -889,7 +918,7 @@ async function edgeRoute(req, res, url) {
   }
   if (M === "POST" && p === "/ask") {
     const pre = await readBody(req, ASK_MAX_BYTES);
-    if (pre.tooLarge) { send(res, 413, { error: `request body over ${ASK_MAX_BYTES} bytes` }); return true; }
+    if (pre.tooLarge) { refuseTooLarge(req, res, `request body over ${ASK_MAX_BYTES} bytes`); return true; }
     if (hub.active) {
       // the edge picks the request id (X-Myna-Request-Id): when the forward fails it still knows which
       // question the hub may have put on the phone (the reply lost in a broken link), and cancels it
@@ -1056,9 +1085,19 @@ server.listen(PORT, "127.0.0.1", () => {
   if (adopted && (adopted.open || adopted.answered)) log(`adopted ${adopted.open} open gate(s) + ${adopted.answered} answered-uncollected (${adopted.detached} detached) from the previous relay (v${adopted.from || "?"}, journal ${adopted.saved_at}) — buttons already on the phone stay valid`);
   if (EDGE) log(`edge → hub ${hub.url} (${hub.reachable ? "reachable" : `not reachable: ${hub.reason}`}; CF Access headers ${hub.cf ? "on" : "off"}); own bot: ${ownBot.on ? `${ownBot.id || provider.name} — fallback while the hub is away` : ownBot.reason}`);
   provider.start();
+  // machines revoked while no relay ran (machines.mjs revoke during a restart): the first read of
+  // machines.json reports no change, so their journaled questions are cancelled here — once this process
+  // owns the port (a second relay that exits above never touches the journal)
+  if (machines) {
+    const revoked = new Set(machines.all().filter((m) => m.revoked_at).map((m) => m.id));
+    const hit = [...new Set([...pending.values()].filter((p) => p.result === undefined && revoked.has(machineOf(p))).map(machineOf))];
+    if (hit.length) machinesRevoked(hit);
+  }
   // the remote listener starts only once this process owns the local port (a second relay exits above)
   if (REMOTE_PORT) {
-    const remote = http.createServer((req, res) => {
+    // a request must arrive whole within 30 s (headers within 15 s) — a slow or never-ending body cannot
+    // hold a socket for long; the time spent answering (the /answer long-poll) does not count
+    const remote = http.createServer({ requestTimeout: 30000, headersTimeout: 15000, connectionsCheckingInterval: 5000 }, (req, res) => {
       handleRemote(req, res).catch((e) => { log("remote handler error:", e.message); try { send(res, 500, { error: "internal error" }); } catch {} });
     });
     // a port someone else holds: say so loudly, keep serving this machine (the local side is unaffected)

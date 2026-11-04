@@ -113,19 +113,30 @@ export function writePrivate(file, text) {
 // changed on disk, so `machines.mjs revoke` takes effect on the very next request without a restart.
 // last_seen_at / last_addr live in machines-seen.json, written by the hub alone (machines.json is
 // written by the hub only when a machine joins, and by machines.mjs — never both on a timer).
-export function machineStore(file, { onRevoked } = {}) {
+// Those two writers are two processes: every read-modify-write holds <file>.lock (see withFileLock), so
+// neither writes back a stale copy over the other's change (a join lost, or a revoked machine revived).
+// A file that cannot be parsed (half-written by the plain-write fallback of writePrivate, or edited by
+// hand) is never taken for "no machines": a look keeps the last good list, a write refuses.
+export function machineStore(file, { onRevoked, onError } = {}) {
   let sig = null, list = [], first = true;
+  // [] only when there is no file at all; anything else unreadable throws
   const read = () => {
-    try { const j = JSON.parse(fs.readFileSync(file, "utf8")); return Array.isArray(j?.machines) ? j.machines : []; }
-    catch { return []; }
+    let text;
+    try { text = fs.readFileSync(file, "utf8"); } catch (e) { if (e.code === "ENOENT") return []; throw e; }
+    const j = JSON.parse(text);
+    if (!Array.isArray(j?.machines)) throw new Error("no machines array");
+    return j.machines;
   };
   const stat = () => { try { const s = fs.statSync(file); return `${s.mtimeMs}:${s.size}`; } catch { return "none"; } };
   // returns the ids that turned revoked (or disappeared) since the last look
   function refresh() {
     const s = stat();
     if (s === sig) return [];
+    let next;
+    try { next = read(); }
+    catch (e) { if (onError) { try { onError(`${file} unreadable (${e.message}) — keeping the last good list`); } catch {} } return []; } // sig unchanged: look again next time
     const before = new Set(list.filter((m) => !m.revoked_at).map((m) => m.id));
-    sig = s; list = read();
+    sig = s; list = next;
     const now = new Set(list.filter((m) => !m.revoked_at).map((m) => m.id));
     const gone = first ? [] : [...before].filter((id) => !now.has(id));
     first = false;
@@ -134,6 +145,7 @@ export function machineStore(file, { onRevoked } = {}) {
   }
   refresh();
   const save = (machines) => { writePrivate(file, JSON.stringify({ version: 1, machines }, null, 2) + "\n"); sig = null; refresh(); };
+  const update = (fn) => withFileLock(file, () => { let cur; try { cur = read(); } catch (e) { throw new Error(`${file} is unreadable (${e.message}) — fix or restore it first`); } return fn(cur); });
   return {
     file, refresh,
     all: () => (refresh(), list),
@@ -147,29 +159,62 @@ export function machineStore(file, { onRevoked } = {}) {
       if (!m || m.revoked_at || !sameHex(sha256hex(token), m.sha256)) return null;
       return m;
     },
-    add(rec) { const cur = read(); cur.push(rec); save(cur); },
+    add(rec) { update((cur) => { cur.push(rec); save(cur); }); },
     revoke(key) {
-      const cur = read(), now = new Date().toISOString(), hit = [];
-      for (const m of cur) if (!m.revoked_at && (m.id === key || m.name === key)) { m.revoked_at = now; hit.push(m); }
-      if (hit.length) save(cur);
-      return hit;
+      return update((cur) => {
+        const now = new Date().toISOString(), hit = [];
+        for (const m of cur) if (!m.revoked_at && (m.id === key || m.name === key)) { m.revoked_at = now; hit.push(m); }
+        if (hit.length) save(cur);
+        return hit;
+      });
     },
   };
 }
 
+// Run fn while holding <file>.lock — an exclusive-create lock file shared by every process that writes
+// `file`. Synchronous (the callers are), waits up to 10 s; a lock older than 30 s is a holder that died
+// mid-write and is taken over.
+const LOCK_WAIT_MS = 10000, LOCK_STALE_MS = 30000;
+export function withFileLock(file, fn) {
+  const lock = `${file}.lock`, until = Date.now() + LOCK_WAIT_MS;
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  for (;;) {
+    try { fs.writeFileSync(lock, `${process.pid}\n`, { flag: "wx", mode: 0o600 }); break; }
+    catch (e) {
+      // EPERM / EACCES: Windows while the previous holder's delete is still pending
+      if (!["EEXIST", "EPERM", "EACCES"].includes(e.code)) throw e;
+      try { if (Date.now() - fs.statSync(lock).mtimeMs > LOCK_STALE_MS) { fs.rmSync(lock, { force: true }); continue; } } catch {}
+      if (Date.now() > until) throw new Error(`${lock} is held by another process — try again`);
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 15);
+    }
+  }
+  try { return fn(); } finally { try { fs.rmSync(lock, { force: true }); } catch {} }
+}
+
 // --- request helpers -------------------------------------------------------------------------------
-// read a request body, at most `max` bytes: past it → {tooLarge:true} (the rest is not buffered)
+// read a request body, at most `max` bytes: past it → {tooLarge:true} at once — the rest is neither
+// buffered nor waited for (a body that never ends must not hold the request); answer with refuseTooLarge
 export function readBody(req, max) {
   return new Promise((resolve) => {
-    let size = 0, chunks = [], over = false;
+    let size = 0, chunks = [], done = false;
+    const finish = (v) => { if (!done) { done = true; resolve(v); } };
     req.on("data", (c) => {
-      if (over) return;
+      if (done) return;
       size += c.length;
-      if (size > max) { over = true; chunks = []; return; }
+      if (size > max) { chunks = []; finish({ tooLarge: true }); return; }
       chunks.push(c);
     });
-    req.on("end", () => resolve(over ? { tooLarge: true } : { body: Buffer.concat(chunks).toString("utf8") }));
-    req.on("error", () => resolve({ tooLarge: false, body: "", error: true }));
+    req.on("end", () => finish({ body: Buffer.concat(chunks).toString("utf8") }));
+    req.on("error", () => finish({ tooLarge: false, body: "", error: true }));
+  });
+}
+// 413 for a body readBody gave up on, then close the connection: the rest of that body is discarded
+// for at most 2 s, never read to its end
+export function refuseTooLarge(req, res, error) {
+  res.writeHead(413, { "content-type": "application/json", connection: "close" });
+  res.end(JSON.stringify({ error }), () => {
+    req.resume();
+    setTimeout(() => req.socket.destroy(), 2000).unref();
   });
 }
 export const ASK_MAX_BYTES_DEFAULT = 256 * 1024;
