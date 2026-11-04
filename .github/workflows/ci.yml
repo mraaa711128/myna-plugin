@@ -86,6 +86,9 @@ jobs:
       - name: Smoke — several machines, one relay (hub remote port + edge relays + join by ✅ tap, stubbed Telegram + Access)
         run: node test/smoke-remote.mjs
 
+      - name: Smoke — multi-machine fixes (machines.json lock, 413 at once, revoke across a hub restart, join recovery, edge state per hub)
+        run: node test/smoke-remote-fixes.mjs
+
       - name: Smoke — /myna:hub on / off / status (temp HOME, fake bot, never :7800)
         run: node test/smoke-hub.mjs
 
