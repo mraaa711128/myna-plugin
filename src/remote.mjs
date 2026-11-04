@@ -117,7 +117,8 @@ export function writePrivate(file, text) {
 // neither writes back a stale copy over the other's change (a join lost, or a revoked machine revived).
 // A file that cannot be parsed (half-written by the plain-write fallback of writePrivate, or edited by
 // hand) is never taken for "no machines": a look keeps the last good list, a write refuses.
-export function machineStore(file, { onRevoked, onError } = {}) {
+// onLoad: called once, after the first successful read (a file unreadable at start is read later).
+export function machineStore(file, { onRevoked, onError, onLoad } = {}) {
   let sig = null, list = [], first = true;
   // [] only when there is no file at all; anything else unreadable throws
   const read = () => {
@@ -139,7 +140,9 @@ export function machineStore(file, { onRevoked, onError } = {}) {
     sig = s; list = next;
     const now = new Set(list.filter((m) => !m.revoked_at).map((m) => m.id));
     const gone = first ? [] : [...before].filter((id) => !now.has(id));
+    const wasFirst = first;
     first = false;
+    if (wasFirst && onLoad) { try { onLoad(list); } catch {} }
     if (gone.length && onRevoked) { try { onRevoked(gone); } catch {} }
     return gone;
   }
@@ -147,7 +150,7 @@ export function machineStore(file, { onRevoked, onError } = {}) {
   const save = (machines) => { writePrivate(file, JSON.stringify({ version: 1, machines }, null, 2) + "\n"); sig = null; refresh(); };
   const update = (fn) => withFileLock(file, () => { let cur; try { cur = read(); } catch (e) { throw new Error(`${file} is unreadable (${e.message}) — fix or restore it first`); } return fn(cur); });
   return {
-    file, refresh,
+    file, refresh, loaded: () => !first,
     all: () => (refresh(), list),
     active: () => (refresh(), list.filter((m) => !m.revoked_at)),
     // the active machine a token belongs to, or null (unknown id, wrong secret, revoked)
@@ -172,23 +175,39 @@ export function machineStore(file, { onRevoked, onError } = {}) {
 }
 
 // Run fn while holding <file>.lock — an exclusive-create lock file shared by every process that writes
-// `file`. Synchronous (the callers are), waits up to 10 s; a lock older than 30 s is a holder that died
-// mid-write and is taken over.
+// `file`, holding a random owner token. Synchronous (the callers are), waits up to 10 s. A holder only
+// ever removes a lock that still carries its own token. A lock older than 30 s (held for milliseconds
+// normally) is a holder that died mid-write: it is taken over by renaming it away — atomic, so of two
+// processes that both saw it stale only one gets it — and the renamed file is checked to be that same
+// stale lock (same token); a fresh lock grabbed by mistake is put back, never deleted.
 const LOCK_WAIT_MS = 10000, LOCK_STALE_MS = 30000;
+const sleepSync = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 export function withFileLock(file, fn) {
-  const lock = `${file}.lock`, until = Date.now() + LOCK_WAIT_MS;
+  const lock = `${file}.lock`, until = Date.now() + LOCK_WAIT_MS, mine = `${process.pid} ${crypto.randomBytes(12).toString("hex")}\n`;
+  const readLock = (f) => { try { return fs.readFileSync(f, "utf8"); } catch { return null; } };
   fs.mkdirSync(path.dirname(file), { recursive: true });
   for (;;) {
-    try { fs.writeFileSync(lock, `${process.pid}\n`, { flag: "wx", mode: 0o600 }); break; }
+    try { fs.writeFileSync(lock, mine, { flag: "wx", mode: 0o600 }); break; }
     catch (e) {
       // EPERM / EACCES: Windows while the previous holder's delete is still pending
       if (!["EEXIST", "EPERM", "EACCES"].includes(e.code)) throw e;
-      try { if (Date.now() - fs.statSync(lock).mtimeMs > LOCK_STALE_MS) { fs.rmSync(lock, { force: true }); continue; } } catch {}
+      let st = null; try { st = fs.statSync(lock); } catch {}
+      const owner = st && Date.now() - st.mtimeMs > LOCK_STALE_MS ? readLock(lock) : null;
+      if (owner) {
+        const away = `${lock}.${crypto.randomBytes(6).toString("hex")}.stale`;
+        let moved = false;
+        try { fs.renameSync(lock, away); moved = true; } catch {}
+        if (moved) {
+          if (readLock(away) === owner) fs.rmSync(away, { force: true });
+          else { try { fs.linkSync(away, lock); } catch {} fs.rmSync(away, { force: true }); } // someone's fresh lock: put it back (unless a third took the name)
+          continue;
+        }
+      }
       if (Date.now() > until) throw new Error(`${lock} is held by another process — try again`);
-      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 15);
+      sleepSync(15);
     }
   }
-  try { return fn(); } finally { try { fs.rmSync(lock, { force: true }); } catch {} }
+  try { return fn(); } finally { if (readLock(lock) === mine) { try { fs.rmSync(lock, { force: true }); } catch {} } }
 }
 
 // --- request helpers -------------------------------------------------------------------------------

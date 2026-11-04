@@ -29,7 +29,7 @@ const until = async (fn, ms = 8000) => { const t0 = Date.now(); for (;;) { const
 const children = [];
 const relayPids = new Set(); // relays started detached by ensure-relay (join without --no-start)
 const cleanup = () => { for (const c of children) { try { c.kill(); } catch {} } for (const p of relayPids) { try { process.kill(p); } catch {} } };
-const watchdog = setTimeout(() => { console.error("❌ TIMEOUT — smoke did not finish in 180s"); cleanup(); process.exit(1); }, 180000);
+const watchdog = setTimeout(() => { console.error("❌ TIMEOUT — smoke did not finish in 240s"); cleanup(); process.exit(1); }, 240000);
 process.on("exit", cleanup);
 
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), "myna-fixes-"));
@@ -76,6 +76,23 @@ for (const x of JSON.parse(list)) { if (mode === "add") store.add(x); else store
   ok(ra.rc === 0 && rr.rc === 0 && lostAdds === 0 && unrevoked === 0,
     `machines.json: 150 joins (hub) and 150 revokes (machines.mjs) in two processes at once → no join lost, no revoke undone (lost joins ${lostAdds}, revoked machines back to active ${unrevoked}, rc ${ra.rc}/${rr.rc}${ra.err || rr.err ? ` — ${(ra.err || rr.err).trim().split("\n").pop()}` : ""})`);
 
+  // a lock left by a holder that died (older than 30 s): both writers take it over, still one at a time
+  {
+    const f3 = path.join(dir("store3"), "machines.json");
+    const seeded3 = Array.from({ length: 100 }, (_, i) => newMachine(`s${i}`).rec), adds3 = Array.from({ length: 100 }, (_, i) => newMachine(`t${i}`).rec);
+    fs.writeFileSync(f3, JSON.stringify({ version: 1, machines: seeded3 }));
+    fs.writeFileSync(`${f3}.lock`, "99999 deadbeef\n");
+    const old = new Date(Date.now() - 120000); fs.utimesSync(`${f3}.lock`, old, old);
+    const [x, y] = await Promise.all([
+      new Promise((resolve) => { const c = spawn(process.execPath, [worker, "add", f3, JSON.stringify(adds3)], { env: baseEnv, stdio: "ignore" }); c.on("exit", resolve); }),
+      new Promise((resolve) => { const c = spawn(process.execPath, [worker, "revoke", f3, JSON.stringify(seeded3.map((m) => m.id))], { env: baseEnv, stdio: "ignore" }); c.on("exit", resolve); }),
+    ]);
+    let fin = []; try { fin = JSON.parse(fs.readFileSync(f3, "utf8")).machines; } catch {}
+    const ids = new Map(fin.map((m) => [m.id, m]));
+    ok(x === 0 && y === 0 && adds3.every((m) => ids.has(m.id)) && seeded3.every((m) => ids.get(m.id)?.revoked_at) && !fs.existsSync(`${f3}.lock`),
+      `a stale machines.json.lock (dead holder) is taken over safely by two writers at once: nothing lost, no lock left behind (rc ${x}/${y}, lost joins ${adds3.filter((m) => !ids.has(m.id)).length}, unrevoked ${seeded3.filter((m) => !ids.get(m.id)?.revoked_at).length})`);
+  }
+
   // a half-written file (another process mid-write) is not "no machines"
   const { machineStore } = await import(pathToFileURL(src("src", "remote.mjs")).href);
   const f2 = path.join(dir("store2"), "machines.json"), keep = newMachine("keep");
@@ -93,7 +110,7 @@ for (const x of JSON.parse(list)) { if (mode === "add") store.add(x); else store
 
 // --- Telegram API stubs ---------------------------------------------------------------------------------
 // hang: getUpdates never answers (a long-poll in flight) — records when the client gives up on it
-async function botStub({ hang = false } = {}) {
+async function botStub({ hang = false, sendDelayMs = 0 } = {}) {
   const s = { sent: [], edits: [], updates: [], polls: 0, n: 1, mid: 100, held: [] };
   const srv = http.createServer((rq, res) => {
     const u = new URL(rq.url, "http://x");
@@ -106,7 +123,7 @@ async function botStub({ hang = false } = {}) {
         if (hang) { const h = { at: Date.now(), closedAt: 0 }; s.held.push(h); res.on("close", () => (h.closedAt = Date.now())); return; }
         const deliver = () => { const out = s.updates; s.updates = []; json({ ok: true, result: out }); }; s.updates.length ? deliver() : setTimeout(deliver, 100); return;
       }
-      if (/\/sendMessage$/.test(u.pathname)) { b.message_id = ++s.mid; s.sent.push(b); json({ ok: true, result: { message_id: b.message_id } }); return; }
+      if (/\/sendMessage$/.test(u.pathname)) { b.message_id = ++s.mid; s.sent.push(b); setTimeout(() => json({ ok: true, result: { message_id: b.message_id } }), b.reply_markup ? sendDelayMs : 0); return; }
       if (/\/createForumTopic$/.test(u.pathname)) { json({ ok: true, result: { message_thread_id: 77 } }); return; }
       if (/\/editMessageReplyMarkup$/.test(u.pathname)) { s.edits.push(b); json({ ok: true, result: true }); return; }
       json({ ok: true, result: true });
@@ -141,14 +158,18 @@ const M = Object.fromEntries(["pc1", "pc3", "pc4", "pc5", "gone"].map((n) => [n,
 fs.writeFileSync(MACHINES, JSON.stringify({ version: 1, machines: Object.values(M).map((m) => m.rec) }, null, 2));
 const hubLog = [];
 let hub;
-const startHub = async () => {
-  hub = spawn(process.execPath, [src("src", "relay.mjs")], {
+const spawnHub = () => {
+  const h = spawn(process.execPath, [src("src", "relay.mjs")], {
     env: { ...baseEnv, MYNA_ENV: path.join(HUB_DIR, ".env"), MYNA_PROVIDER: "telegram", TELEGRAM_BOT_TOKEN: HUB_BOT, TELEGRAM_CHAT_ID: "42", TELEGRAM_API_BASE: hubBot.url,
       RELAY_PORT: String(H), MYNA_REMOTE_PORT: String(R), MYNA_MACHINES_FILE: MACHINES, MYNA_MACHINE_NAME: "win", MYNA_ANSWER_HOLD_MS: "1500", TELEGRAM_TOPIC_ROUND_GRACE: "0",
       MYNA_JOIN_TTL_MS: "20000", MYNA_JOIN_INTERVAL_MS: "0", MYNA_JOIN_MAX_OPEN: "3", MYNA_REMOTE_ASK_MAX: "100" },
     stdio: ["ignore", "ignore", "pipe"],
   });
-  children.push(hub); hub.stderr.on("data", (d) => hubLog.push(String(d)));
+  children.push(h); h.stderr.on("data", (d) => hubLog.push(String(d)));
+  return h;
+};
+const startHub = async () => {
+  hub = spawnHub();
   return until(async () => (await req(`${HUB}/health`)).status === 200 && (await req(`${REMOTE}/health`, { headers: { authorization: `Bearer ${M.pc1.token}` } })).status === 200, 8000);
 };
 if (!(await startHub())) { console.error("❌ hub relay never came up"); console.error(hubLog.join("")); process.exit(1); }
@@ -178,6 +199,23 @@ if (!(await startHub())) { console.error("❌ hub relay never came up"); console
   const r = await until(async () => { const x = await req(`${HUB}/answer/${a.json?.request_id}`); return x.json?.kind && x.json.kind !== "pending" ? x : null; }, 4000);
   ok(r?.json?.kind === "cancelled" && r.json.reason === "machine revoked" && hubBot.edits.some((e) => e.message_id === qmsg?.message_id),
     `hub restarted: the revoked machine's journaled question is cancelled at start and its buttons retracted (${JSON.stringify(r?.json)})`);
+  // the same, but machines.json is unreadable when the hub starts: done at its first good read
+  const g2 = newMachine("gone2");
+  const good = JSON.parse(fs.readFileSync(MACHINES, "utf8")); good.machines.push(g2.rec); fs.writeFileSync(MACHINES, JSON.stringify(good, null, 2));
+  await until(async () => (await req(`${REMOTE}/health`, { headers: { authorization: `Bearer ${g2.token}` } })).status === 200, 7000);
+  const a2 = await req(`${REMOTE}/ask`, { method: "POST", headers: { authorization: `Bearer ${g2.token}` }, body: { question: "停機前問的第二題", options: ["a", "b"], session_id: "s2" } });
+  await hubBot.keyboardWith(/停機前問的第二題/);
+  hub.kill(); await until(async () => (await req(`${HUB}/health`)).status === 0, 5000);
+  spawnSync(process.execPath, [src("scripts", "machines.mjs"), "revoke", "gone2"], { env: { ...baseEnv, MYNA_MACHINES_FILE: MACHINES } });
+  const revokedText = fs.readFileSync(MACHINES, "utf8");
+  fs.writeFileSync(MACHINES, revokedText.slice(0, 40)); // half-written when the hub starts
+  hub = spawnHub();
+  await until(async () => (await req(`${HUB}/health`)).status === 200, 8000);
+  await sleep(500);
+  fs.writeFileSync(MACHINES, revokedText);
+  const r2 = await until(async () => { const x = await req(`${HUB}/answer/${a2.json?.request_id}`); return x.json?.kind && x.json.kind !== "pending" ? x : null; }, 9000);
+  ok(r2?.json?.kind === "cancelled" && r2.json.reason === "machine revoked", `machines.json unreadable when the hub starts: once it reads again, the question of a machine revoked meanwhile is cancelled (${JSON.stringify(r2?.json)})`);
+  await until(async () => (await req(`${REMOTE}/health`, { headers: { authorization: `Bearer ${M.pc1.token}` } })).status === 200, 8000);
 }
 
 // === 4. join.mjs ==========================================================================================
@@ -271,6 +309,21 @@ const startEdge = (port, env, nodeArgs = []) => {
   const t0 = Date.now(); let reach = 0, active = 0;
   while (!active && Date.now() - t0 < 8000) { const x = await req(`${E}/health`); if (x.json?.upstream?.reachable && !reach) reach = Date.now(); if (x.json?.upstream?.active) active = Date.now(); await sleep(30); }
   ok(reach > 0 && active > 0 && active - reach >= 500, `restarted mid-outage: new questions go back to the hub only after 4 good checks in a row (${active && reach ? `${active - reach} ms after it was reachable` : "never active"}, checks every 250 ms)`);
+  // restarted again in the middle of a recovery (reachable, not yet active): still a recovery
+  tun.st.down = true;
+  await until(async () => (await req(`${E}/health`)).json?.upstream?.reachable === false, 5000);
+  c.kill(); await until(async () => (await req(`${E}/health`)).status === 0, 4000);
+  c = startEdge(P, { ...env, MYNA_UPSTREAM_RECOVER: "12" });
+  await until(async () => (await req(`${E}/health`)).json?.upstream?.reachable === false, 10000);
+  tun.st.down = false;
+  const mid = await until(async () => { const x = await req(`${E}/health`); return x.json?.upstream?.reachable ? x : null; }, 5000);
+  ok(mid?.json?.upstream?.active === false, "pc3 reachable again, still recovering (12 checks needed)");
+  await sleep(300); // edge-state.json is written
+  c.kill(); await until(async () => (await req(`${E}/health`)).status === 0, 4000);
+  c = startEdge(P, env);
+  const t1 = Date.now(); let reach2 = 0, active2 = 0;
+  while (!active2 && Date.now() - t1 < 10000) { const x = await req(`${E}/health`); if (x.json?.upstream?.reachable && !reach2) reach2 = Date.now(); if (x.json?.upstream?.active) active2 = Date.now(); await sleep(30); }
+  ok(reach2 > 0 && active2 > 0 && active2 - reach2 >= 500, `restarted mid-recovery: still 4 good checks before the hub gets new questions (${active2 && reach2 ? `${active2 - reach2} ms after reachable` : "never active"})`);
   c.kill(); tun.close(); bot3.close();
 }
 {
@@ -295,6 +348,22 @@ const startEdge = (port, env, nodeArgs = []) => {
   const cut = await until(() => bot4.held.every((h) => h.closedAt), 3000);
   ok(!!cut, `pc4: stop() aborts the getUpdates in flight at once, without AbortSignal.any (${bot4.held.map((h) => (h.closedAt ? `closed ${h.closedAt - (off || h.closedAt)} ms after own bot off` : "still open")).join(", ")})`);
   tun.close(); bot4.close();
+}
+{
+  // the hub reports the same bot while a question is still being sent on the own bot: withdrawn once sent
+  const bot6 = await botStub({ sendDelayMs: 2500 }), tun = await tunnelTo(R), P = freePort(), E = `http://127.0.0.1:${P}`;
+  tun.st.down = true;
+  startEdge(P, { MYNA_ENV: path.join(dir("pc4b"), ".env"), MYNA_UPSTREAM: tun.url, MYNA_MACHINE_TOKEN: M.pc4.token, TELEGRAM_BOT_TOKEN: "111111:SAME-AS-HUB-2", TELEGRAM_CHAT_ID: "42", TELEGRAM_API_BASE: bot6.url });
+  await until(async () => (await req(`${E}/health`)).json?.own_bot?.on, 10000);
+  const pa = req(`${E}/ask`, { method: "POST", body: { question: "送到一半的題", options: ["a", "b"], session_id: "s6" } });
+  const msg = await bot6.keyboardWith(/送到一半的題/, 4000); // the request reached the bot, its reply is 2.5 s away
+  tun.st.down = false;
+  await until(async () => (await req(`${E}/health`)).json?.own_bot?.on === false, 4000);
+  const a = await pa;
+  const ans = await until(async () => { const x = await req(`${E}/answer/${a.json?.request_id}`); return x.json?.kind && x.json.kind !== "pending" ? x : null; }, 6000);
+  ok(!!msg && ans?.json?.kind === "unreachable" && !!(await until(() => bot6.edits.some((e) => e.message_id === msg.message_id), 4000)),
+    `same bot found while the question is still being sent: once sent, its buttons are retracted and it is given back (${JSON.stringify(ans?.json)})`);
+  tun.close(); bot6.close();
 }
 {
   // edge files written for another hub are not used for this one

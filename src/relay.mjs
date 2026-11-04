@@ -401,8 +401,9 @@ function edgeLink() {
   };
   // forwarded / abandoned / the outage start survive a restart (an upgrade mid-outage must neither
   // cut a question's grace short nor forget to retract the buttons of one given up): edge-state.json.
-  // ever_up too: a restart mid-outage is a recovery, not a first connection — the hub gets new questions
-  // back only after MYNA_UPSTREAM_RECOVER good checks, as without the restart
+  // recovering too (it had been up, and new questions do not go to it yet): a restart mid-outage or
+  // mid-recovery is a recovery, not a first connection — the hub gets new questions back only after
+  // MYNA_UPSTREAM_RECOVER good checks in a row after the restart
   const STATE_FILE = cfg.MYNA_EDGE_STATE_FILE || path.join(path.dirname(ENV_PATH), "edge-state.json");
   try {
     const s = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
@@ -410,7 +411,8 @@ function edgeLink() {
     else {
       for (const [id, v] of s.forwarded || []) h.forwarded.set(String(id), v);
       for (const id of s.abandoned || []) h.abandoned.add(String(id));
-      if (Number.isFinite(s.down_since)) { h.downSince = s.down_since; if (s.ever_up) h.everUp = true; }
+      if (Number.isFinite(s.down_since)) h.downSince = s.down_since;
+      if (s.recovering) h.everUp = true;
       if (h.forwarded.size || h.abandoned.size) log(`edge: picked up ${h.forwarded.size} question(s) waiting on the hub and ${h.abandoned.size} to cancel there from ${STATE_FILE}`);
     }
   } catch {}
@@ -419,7 +421,7 @@ function edgeLink() {
     if (saveQueued) return; saveQueued = true;
     setImmediate(() => {
       saveQueued = false;
-      try { writePrivate(STATE_FILE, JSON.stringify({ upstream: h.url, forwarded: [...h.forwarded], abandoned: [...h.abandoned], down_since: h.reachable ? null : h.downSince, ever_up: h.everUp }) + "\n"); }
+      try { writePrivate(STATE_FILE, JSON.stringify({ upstream: h.url, forwarded: [...h.forwarded], abandoned: [...h.abandoned], down_since: h.reachable ? null : h.downSince, recovering: h.everUp && !h.active }) + "\n"); }
       catch (e) { log("edge: could not save", STATE_FILE, e.message); }
     });
   };
@@ -458,6 +460,7 @@ function edgeLink() {
       h.active = true;
       log(`hub ${h.url} ${h.everUp ? "back" : "reachable"} — v${j.version}, protocol ${j.protocol}, this machine = ${h.machine}; new questions go to the hub`);
       h.everUp = true;
+      h.save();
     }
     if (!was) h.save();
     h.flush();
@@ -513,11 +516,18 @@ if (EDGE) {
     // questions already sent on that bot: their button tokens live only in the provider just stopped, and
     // the hub — polling the same bot — cannot resolve a tap on them. Retract the buttons (cancelQuestion
     // uses the Bot API, not the poll) and give each back to its client as unreachable (terminal picker).
+    // A question still being sent is withdrawn once its message exists (only a sent message can be retracted).
     for (const [id, p] of pending) {
       if (p.result !== undefined) continue;
       log(`request ${id}: on this machine's own bot, which is the hub's — giving it back to the terminal`);
-      Promise.resolve(old.cancelQuestion?.(id, "same_bot")).catch((e) => log("cancelQuestion err", e.message)); // reads its state before resolve drops it
-      resolveRequest(id, { kind: "unreachable", error: "this machine's own bot turned out to be the hub's — the question was withdrawn there" });
+      const withdraw = () => {
+        if (p.result !== undefined) return;
+        const result = { kind: "unreachable", error: "this machine's own bot turned out to be the hub's — the question was withdrawn there" };
+        Promise.resolve(old.cancelQuestion?.(id, "same_bot")).catch((e) => log("cancelQuestion err", e.message)); // reads its state before its tokens are dropped
+        if (provider !== old) old.onResolve?.(id, result); // resolveRequest tells only the current provider (NO_IM by now)
+        resolveRequest(id, result);
+      };
+      if (p.sending) p.sending.then(withdraw); else withdraw();
     }
     provider = NO_IM; chat.attach(provider);
   };
@@ -548,7 +558,9 @@ const remoteScope = (m) => ({ id: m.id, name: m.name, remote: true, sid: (s) => 
 const send = (res, code, o) => { res.writeHead(code, { "content-type": "application/json" }); res.end(JSON.stringify(o)); };
 const jsonOf = (body) => { try { return { v: JSON.parse(body || "{}") }; } catch (e) { return { err: e }; } };
 // machines.json is read only when the remote listener is on — without it nothing below changes a topic
-const machines = REMOTE_PORT ? machineStore(machinesFile(cfg), { onRevoked: (ids) => machinesRevoked(ids), onError: (m) => log(`machines: ${m}`) }) : null;
+// onLoad: machines.json unreadable when this relay started → the revoked-while-down check runs once it reads
+let listening = false;
+const machines = REMOTE_PORT ? machineStore(machinesFile(cfg), { onRevoked: (ids) => machinesRevoked(ids), onError: (m) => log(`machines: ${m}`), onLoad: () => { if (listening) revokedWhileDown(); } }) : null;
 // the machine-name prefix a question's topic gets (see MYNA_TOPIC_MACHINE)
 const topicMachine = (scope) => (TOPIC_MACHINE === "on" || (TOPIC_MACHINE === "auto" && machines && machines.active().length > 0) ? scope.name : "");
 const remoteAsks = new Map();   // machine_id -> timestamps of its recent /ask (rate limit)
@@ -608,7 +620,8 @@ async function handleAsk(req, res, scope, pre) {
   // question up may cancel it while Telegram is still sending it, and only a sent message can be retracted
   try {
     const sending = provider.sendQuestion(request_id, args);
-    if (scope.remote) entry.sending = Promise.resolve(sending).catch(() => {});
+    // a remote /cancel, or an edge giving its own bot up (hub.onBot), waits for the send to finish
+    entry.sending = Promise.resolve(sending).catch(() => {});
     await sending; persist(); // buttons are on the phone → journal them
   }
   catch (e) {
@@ -706,6 +719,13 @@ function machinesRevoked(ids) {
   for (const id of ids) log(`machine ${id} revoked — its token no longer works`);
 }
 if (machines) setInterval(() => machines.refresh(), 5000).unref();
+// machines revoked while no relay ran (machines.mjs revoke during a restart): the first read of
+// machines.json reports no change, so their journaled questions are cancelled here
+function revokedWhileDown() {
+  const revoked = new Set(machines.all().filter((m) => m.revoked_at).map((m) => m.id));
+  const hit = [...new Set([...pending.values()].filter((p) => p.result === undefined && revoked.has(machineOf(p))).map(machineOf))];
+  if (hit.length) machinesRevoked(hit);
+}
 
 // when a machine was last seen and from where (Cf-Connecting-Ip behind Cloudflare) — machines-seen.json,
 // written by the hub alone, at most once a minute
@@ -1085,14 +1105,10 @@ server.listen(PORT, "127.0.0.1", () => {
   if (adopted && (adopted.open || adopted.answered)) log(`adopted ${adopted.open} open gate(s) + ${adopted.answered} answered-uncollected (${adopted.detached} detached) from the previous relay (v${adopted.from || "?"}, journal ${adopted.saved_at}) — buttons already on the phone stay valid`);
   if (EDGE) log(`edge → hub ${hub.url} (${hub.reachable ? "reachable" : `not reachable: ${hub.reason}`}; CF Access headers ${hub.cf ? "on" : "off"}); own bot: ${ownBot.on ? `${ownBot.id || provider.name} — fallback while the hub is away` : ownBot.reason}`);
   provider.start();
-  // machines revoked while no relay ran (machines.mjs revoke during a restart): the first read of
-  // machines.json reports no change, so their journaled questions are cancelled here — once this process
-  // owns the port (a second relay that exits above never touches the journal)
-  if (machines) {
-    const revoked = new Set(machines.all().filter((m) => m.revoked_at).map((m) => m.id));
-    const hit = [...new Set([...pending.values()].filter((p) => p.result === undefined && revoked.has(machineOf(p))).map(machineOf))];
-    if (hit.length) machinesRevoked(hit);
-  }
+  // machines revoked while no relay ran: checked once this process owns the port (a second relay that
+  // exits above never touches the journal) — now, or at the first good read of machines.json
+  listening = true;
+  if (machines?.loaded()) revokedWhileDown();
   // the remote listener starts only once this process owns the local port (a second relay exits above)
   if (REMOTE_PORT) {
     // a request must arrive whole within 30 s (headers within 15 s) — a slow or never-ending body cannot
