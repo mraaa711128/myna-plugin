@@ -10,7 +10,12 @@
 //   edge: MYNA_PROVIDER without keys still forwards; a restart mid-outage still needs MYNA_UPSTREAM_RECOVER
 //     good checks; questions on its own bot are given back when that bot turns out to be the hub's, and
 //     stop() cuts the poll at once even without AbortSignal.any; edge files of another hub are ignored
-// MYNA_TEST_ROOT=<another checkout> runs the same checks against that code (0.20.1 → must fail).
+//   a reply lost on the way back (0.20.3): the answer of a remote question (given before the poll, or while
+//     it is held) and an approved join's token are handed out again to the same machine / enroll secret
+//     within their window — another machine, a wrong secret, a denied join, the local port, or past the
+//     window → 404; a collected join is not revoked when its record expires, an uncollected one still is
+// MYNA_TEST_ROOT=<another checkout> runs the same checks against that code (0.20.1 → must fail; 0.20.2 →
+// the section "a reply lost on the way back" must fail).
 import http from "node:http";
 import crypto from "node:crypto";
 import { spawn, spawnSync } from "node:child_process";
@@ -29,7 +34,7 @@ const until = async (fn, ms = 8000) => { const t0 = Date.now(); for (;;) { const
 const children = [];
 const relayPids = new Set(); // relays started detached by ensure-relay (join without --no-start)
 const cleanup = () => { for (const c of children) { try { c.kill(); } catch {} } for (const p of relayPids) { try { process.kill(p); } catch {} } };
-const watchdog = setTimeout(() => { console.error("❌ TIMEOUT — smoke did not finish in 240s"); cleanup(); process.exit(1); }, 240000);
+const watchdog = setTimeout(() => { console.error("❌ TIMEOUT — smoke did not finish in 300s"); cleanup(); process.exit(1); }, 300000);
 process.on("exit", cleanup);
 
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), "myna-fixes-"));
@@ -396,6 +401,140 @@ const startEdge = (port, env, nodeArgs = []) => {
   ok(r?.json?.own_bot?.on === true && r.json.upstream?.forwarded === 0 && r.json.upstream?.abandoned === 0,
     `edge files of another hub are ignored: the old hub's bot id does not switch its own bot off, no old question ids (own_bot.on=${r?.json?.own_bot?.on}, forwarded=${r?.json?.upstream?.forwarded}, abandoned=${r?.json?.upstream?.abandoned})`);
   tun.close(); bot5.close();
+}
+
+// === 6. a reply lost on the way back (issue #5: /answer and the join token) ================================
+// A hub of its own with short windows (MYNA_ANSWER_REDELIVER_MS, MYNA_JOIN_TTL_MS) and no answer sweep in
+// between (MYNA_SWEEP_MS) — the handlers judge the window themselves. The tunnel drops the next reply that
+// carries a result: the hub did the work, the edge / joining machine never sees it (a broken link).
+function lossyTunnelTo(port) {
+  const st = { drop: 0, dropped: [] };
+  const srv = http.createServer((rq, res) => {
+    const up = http.request({ host: "127.0.0.1", port, method: rq.method, path: rq.url, headers: rq.headers }, (r) => {
+      const chunks = []; r.on("data", (c) => chunks.push(c));
+      r.on("end", () => {
+        const body = Buffer.concat(chunks).toString(); let j = null; try { j = JSON.parse(body); } catch {}
+        const result = /^\/(answer|machines\/join)\//.test(rq.url) && r.statusCode === 200 && !!j && ((j.kind && j.kind !== "pending") || (j.status && j.status !== "pending"));
+        if (result && st.drop > 0) { st.drop--; st.dropped.push(body); rq.socket.destroy(); return; }
+        const h = { ...r.headers }; delete h["content-length"]; delete h["transfer-encoding"];
+        res.writeHead(r.statusCode, h); res.end(body);
+      });
+    });
+    up.on("error", () => { res.writeHead(502); res.end("bad gateway"); });
+    rq.pipe(up);
+  });
+  return new Promise((r) => srv.listen(0, "127.0.0.1", () => r({ st, url: `http://127.0.0.1:${srv.address().port}`, close: () => { srv.closeAllConnections?.(); srv.close(); } })));
+}
+{
+  const bot = await botStub(), H2 = freePort(), R2 = freePort(), HUB2 = `http://127.0.0.1:${H2}`, REMOTE2 = `http://127.0.0.1:${R2}`;
+  const d = dir("hub-redeliver"), MF = path.join(d, "machines.json"), X = { a: newMachine("xa"), b: newMachine("xb") };
+  fs.writeFileSync(MF, JSON.stringify({ version: 1, machines: [X.a.rec, X.b.rec] }, null, 2));
+  const WINDOW = 6000, TTL = 4000;
+  const spawnHub2 = () => {
+    const h = spawn(process.execPath, [src("src", "relay.mjs")], {
+      env: { ...baseEnv, MYNA_ENV: path.join(d, ".env"), MYNA_PROVIDER: "telegram", TELEGRAM_BOT_TOKEN: "222222:HUB2", TELEGRAM_CHAT_ID: "42", TELEGRAM_API_BASE: bot.url,
+        RELAY_PORT: String(H2), MYNA_REMOTE_PORT: String(R2), MYNA_MACHINES_FILE: MF, MYNA_MACHINE_NAME: "hub2", MYNA_ANSWER_HOLD_MS: "3000", TELEGRAM_TOPIC_ROUND_GRACE: "0",
+        MYNA_ANSWER_REDELIVER_MS: String(WINDOW), MYNA_SWEEP_MS: "600000", MYNA_JOIN_TTL_MS: String(TTL), MYNA_JOIN_INTERVAL_MS: "0", MYNA_JOIN_MAX_OPEN: "3", MYNA_REMOTE_ASK_MAX: "100" },
+      stdio: ["ignore", "ignore", "pipe"],
+    });
+    children.push(h); h.stderr.on("data", (x) => hubLog.push(`[hub2] ${x}`));
+    return h;
+  };
+  let h2 = spawnHub2();
+  const authA = { authorization: `Bearer ${X.a.token}` }, authB = { authorization: `Bearer ${X.b.token}` };
+  ok(!!(await until(async () => (await req(`${REMOTE2}/health`, { headers: authA })).status === 200, 8000)), "hub2 (short re-delivery windows) is up");
+  const tun = await lossyTunnelTo(R2), P = freePort(), E = `http://127.0.0.1:${P}`;
+  startEdge(P, { MYNA_ENV: path.join(dir("xa"), ".env"), MYNA_UPSTREAM: tun.url, MYNA_MACHINE_TOKEN: X.a.token });
+  ok(!!(await until(async () => (await req(`${E}/health`)).json?.upstream?.active, 8000)), "xa: an edge (no bot of its own) forwarding through a tunnel that can lose a reply");
+  // the client's polls through the edge until a result (or a 404) comes back
+  const pollEdge = async (id, ms = 12000) => { const seen = []; const r = await until(async () => { const x = await req(`${E}/answer/${id}`); seen.push(x.status === 0 ? `conn ${x.error}` : `${x.status} ${x.json?.kind || x.json?.error || ""}`); return x.status === 404 || (x.json?.kind && x.json.kind !== "pending") ? x : null; }, ms); return { r, seen }; };
+
+  // X3 (a): answered before the client polls; the reply carrying the answer is lost once
+  const a1 = await req(`${E}/ask`, { method: "POST", body: { question: "回程遺失 A", options: ["好", "不好"], session_id: "x3" } });
+  const m1 = await bot.keyboardWith(/回程遺失 A/, 6000);
+  if (m1) bot.tap(m1, 0, 0);
+  await sleep(1000);
+  tun.st.drop = 1;
+  const p1 = await pollEdge(a1.json?.request_id);
+  const firstAt = Date.now();
+  ok(tun.st.dropped.length === 1 && p1.r?.status === 200 && p1.r.json?.kind === "selection" && p1.r.json.value === "好" && p1.r.text === tun.st.dropped[0],
+    `answered before the poll, the reply carrying it lost once → the edge's retry gets the very same answer (${p1.seen.join(" | ")})`);
+  let r = await req(`${REMOTE2}/answer/${a1.json?.request_id}`, { headers: authA });
+  ok(r.status === 200 && r.text === tun.st.dropped[0], `the same machine asks for the delivered id again → the same result (${r.status} ${r.text})`);
+  r = await req(`${REMOTE2}/answer/${a1.json?.request_id}`, { headers: authB });
+  ok(r.status === 404, `another machine asks for the delivered id → 404 (${r.status})`);
+  r = await req(`${REMOTE2}/cancel/${a1.json?.request_id}`, { method: "POST", headers: authA, body: {} });
+  ok(r.status === 200 && r.json?.cancelled === false, `/cancel on a delivered id → {cancelled:false} (${r.status} ${r.text})`);
+  // the hub restarts (an upgrade, a crash) within the window: the journal keeps the answer and when it was
+  // first handed out — still there for that machine, and the window is not restarted (checked further down)
+  await sleep(700);
+  h2.kill(); await until(async () => (await req(`${HUB2}/health`)).status === 0, 5000);
+  h2 = spawnHub2();
+  await until(async () => (await req(`${REMOTE2}/health`, { headers: authA })).status === 200, 8000);
+  r = await req(`${REMOTE2}/answer/${a1.json?.request_id}`, { headers: authA });
+  ok(r.status === 200 && r.text === tun.st.dropped[0], `hub restarted within the window: the same machine still gets the same result (${r.status} ${r.text})`);
+  ok(!!(await until(async () => (await req(`${E}/health`)).json?.upstream?.active, 8000)), "xa forwards to the restarted hub again");
+
+  // X3 (b): the human answers while the poll is held; that reply is lost once
+  const a2 = await req(`${E}/ask`, { method: "POST", body: { question: "回程遺失 B", options: ["甲", "乙"], session_id: "x3" } });
+  const m2 = await bot.keyboardWith(/回程遺失 B/, 6000);
+  tun.st.drop = 1;
+  const held = pollEdge(a2.json?.request_id);
+  await sleep(400);
+  if (m2) bot.tap(m2, 0, 1);
+  const p2 = await held;
+  ok(tun.st.dropped.length === 2 && p2.r?.status === 200 && p2.r.json?.value === "乙" && p2.r.text === tun.st.dropped[1],
+    `answered while the poll is held, that reply lost once → the edge's retry gets the very same answer (${p2.seen.join(" | ")})`);
+
+  // the local port is unchanged: handed out once, then 404
+  const l = await req(`${HUB2}/ask`, { method: "POST", body: { question: "本機的題", options: ["x", "y"], session_id: "loc" } });
+  const ml = await bot.keyboardWith(/本機的題/, 6000);
+  if (ml) bot.tap(ml, 0, 0);
+  const l1 = await until(async () => { const x = await req(`${HUB2}/answer/${l.json?.request_id}`); return x.json?.kind && x.json.kind !== "pending" ? x : null; }, 6000);
+  r = await req(`${HUB2}/answer/${l.json?.request_id}`);
+  ok(l1?.json?.value === "x" && r.status === 404, `local port: the answer is handed out once, a second poll → 404 (${r.status})`);
+
+  // past the window → 404 (the handler judges; the sweep is off here)
+  await sleep(Math.max(0, firstAt + WINDOW + 500 - Date.now()));
+  r = await req(`${REMOTE2}/answer/${a1.json?.request_id}`, { headers: authA });
+  ok(r.status === 404, `the same machine asks ${WINDOW / 1000}s after the first delivery (a hub restart in between does not restart the window) → 404 (${r.status} ${r.text})`);
+
+  // X4: xj1 approved, its reply lost once; xj3 denied; xj2 (asked after xj1 was collected) approved, never collected
+  const join = async (name, code) => {
+    const secret = crypto.randomBytes(32).toString("base64url");
+    const x = await req(`${REMOTE2}/machines/join`, { method: "POST", headers: { "content-type": "application/json" }, body: { name, os: "Linux", hostname: `host-${name}`, code, enroll_secret_hash: sha(secret) } });
+    return { id: x.json?.enroll_id, secret, status: x.status };
+  };
+  const pollJoin = (base, j, secret = j.secret) => req(`${base}/machines/join/${j.id}`, { headers: { "x-myna-enroll-secret": secret } });
+  const tapJoin = async (name, idx) => { const m = await bot.keyboardWith(new RegExp(`🆕[\\s\\S]*${name}`), 6000); if (m) bot.tap(m, 0, idx); return !!m; };
+  const j1 = await join("xj1", "ABC-234"), j3 = await join("xj3", "GHJ-456");
+  ok(j1.status === 202 && j3.status === 202, `two join requests → 202 (${j1.status}/${j3.status})`);
+  await tapJoin("xj1", 0); await tapJoin("xj3", 1);
+  await sleep(800);
+  tun.st.drop = 1;
+  const q1 = await pollJoin(tun.url, j1);
+  const q2 = await pollJoin(tun.url, j1);
+  const collectedAt = Date.now();
+  const jtok = q2.json?.token || "";
+  ok(tun.st.dropped.length === 3 && q1.status === 0 && q2.status === 200 && q2.json?.status === "approved" && q2.text === tun.st.dropped[2],
+    `approved, the reply carrying the token lost once → the retry gets the very same token (poll 1 ${q1.status === 0 ? `conn ${q1.error}` : q1.status}, poll 2 ${q2.status} ${q2.json?.status || q2.json?.error})`);
+  ok((await req(`${REMOTE2}/health`, { headers: { authorization: `Bearer ${jtok}` } })).status === 200, "that token works on the hub");
+  r = await pollJoin(REMOTE2, j1, "not-the-secret");
+  ok(r.status === 404 && !r.json?.token, `a wrong enroll secret for the collected join → 404, no token (${r.status})`);
+  r = await pollJoin(REMOTE2, j3);
+  const r3 = await pollJoin(REMOTE2, j3);
+  ok(r.json?.status === "denied" && r3.status === 404, `a denied join: handed out once, then 404 (${r.json?.status}, then ${r3.status})`);
+  const j2 = await join("xj2", "DEF-345");
+  ok(j2.status === 202 && await tapJoin("xj2", 0), `a third join request (xj2) → 202, ✅ tapped, never collected (${j2.status})`);
+  await sleep(Math.max(0, collectedAt + TTL + 500 - Date.now()));
+  r = await pollJoin(REMOTE2, j1);
+  ok(r.status === 404 && !r.json?.token, `the same secret ${TTL / 1000}s after the token was first handed out → 404 (${r.status})`);
+  const xj2Revoked = await until(() => { try { return JSON.parse(fs.readFileSync(MF, "utf8")).machines.find((m) => m.name === "xj2")?.revoked_at; } catch { return null; } }, 3 * TTL + 3000);
+  const xj1 = (() => { try { return JSON.parse(fs.readFileSync(MF, "utf8")).machines.find((m) => m.name === "xj1"); } catch { return null; } })();
+  ok(!!xj2Revoked, "an approved join whose token was never collected → its machine is revoked after the TTL (as before)");
+  ok(!!xj1 && !xj1.revoked_at && xj1.sha256 === sha(jtok) && (await req(`${REMOTE2}/health`, { headers: { authorization: `Bearer ${jtok}` } })).status === 200,
+    "the collected join's record expired too, but that machine is not revoked — its token still works");
+  tun.close(); bot.close();
 }
 
 if (failed) {

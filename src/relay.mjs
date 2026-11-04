@@ -52,6 +52,9 @@
 // /session/close, /session/round-end and the join endpoints exist, and a machine sees only its own
 // requests (session ids become m:<machine_id>:<session_id>). A new machine joins by asking
 // (POST /machines/join): the phone gets ✅/❌ buttons and only a human tap issues its token.
+// A reply lost on the way back (a tunnel cut mid-reply) loses nothing (0.20.3): a remote question's
+// answer stays MYNA_ANSWER_REDELIVER_MS after it was first handed out, an approved join's token
+// MYNA_JOIN_TTL_MS — the same machine / enroll secret asking again gets the very same result.
 // As an EDGE (MYNA_ROLE=edge) this same relay forwards this machine's questions to the hub and keeps
 // its own bot (if any, and not the hub's) as the fallback while the hub is away — see "edge" below.
 // Without MYNA_REMOTE_PORT and MYNA_ROLE=edge nothing of this runs.
@@ -140,6 +143,11 @@ const REMOTE_MAX_POLLS = intCfg("MYNA_REMOTE_MAX_POLLS", 50, 1);             // 
 const JOIN_TTL_MS = intCfg("MYNA_JOIN_TTL_MS", 600000, 1000);                // a join request waits this long for the tap
 const JOIN_INTERVAL_MS = intCfg("MYNA_JOIN_INTERVAL_MS", 60000, 0);          // at most one new join request per interval
 const JOIN_MAX_OPEN = intCfg("MYNA_JOIN_MAX_OPEN", 3, 1);                    // join requests waiting at once
+// a remote question's answer, once handed out, stays this long for the same machine to ask again: the
+// reply may have been lost on the way back, and the edge retries the same /answer. Covers the edge's
+// MYNA_UPSTREAM_GRACE (default 120 s — past it the edge gives the question up and never asks again)
+// plus checks and recovery. A grace set longer than this, with an outage longer than this, can still lose it.
+const REDELIVER_MS = intCfg("MYNA_ANSWER_REDELIVER_MS", 900000, 1000);
 // how long each address gets to connect (Happy Eyeballs) — before any provider call goes out (src/net.mjs)
 const NET_ATTEMPT_MS = applyNetAttemptTimeout(cfg, log);
 // journal of open gates (write-through) — next to .env so it survives plugin updates like the topics map
@@ -194,7 +202,9 @@ if (want) {
 }
 
 // state
-// request_id -> {promise, resolve, result?, resolvedAt?, created, session_id?, meta?, detached?}
+// request_id -> {promise, resolve, result?, resolvedAt?, deliveredAt?, created, session_id?, meta?, detached?}
+//   deliveredAt = when a remote machine was first handed the answer (kept for REDELIVER_MS, then gone);
+//   such an entry is over — only that machine's /answer still sees it
 //   meta = {gate, thread_id, header, question, options} of the ask (what a session taking it over needs);
 //   detached = {at, until, by} while handed off; runtime only: wake (held /answer polls to interrupt),
 //   holders (polls held now), lastPoll (when the last one ended), expiry (detach TTL timer)
@@ -221,6 +231,7 @@ function persist() {
     for (const [id, p] of pending) requests[id] = {
       created: p.created, ...(p.session_id ? { session_id: p.session_id } : {}), ...(p.machine_id ? { machine_id: p.machine_id } : {}), ...(p.meta ? { meta: p.meta } : {}),
       ...(p.detached ? { detached: p.detached } : {}), ...(p.result !== undefined ? { result: p.result, resolvedAt: p.resolvedAt } : {}),
+      ...(p.deliveredAt !== undefined ? { deliveredAt: p.deliveredAt } : {}),
     };
     const doc = { version: VERSION, saved_at: new Date().toISOString(), requests, closing: [...closing], provider: provider?.exportState?.() ?? null };
     fs.mkdirSync(path.dirname(PENDING_FILE), { recursive: true });
@@ -281,8 +292,11 @@ function adopt() {
   const detached = [];
   for (const [id, r] of Object.entries(doc.requests || {})) {
     const e = newEntry(r.created || Date.now(), r.session_id, r.meta, r.machine_id);
-    if (r.result !== undefined) { e.result = r.result; e.resolvedAt = Date.now(); e.resolve(r.result); answered++; } // fresh TTL — give the client time to collect
-    else open++;
+    if (r.result !== undefined) {
+      e.result = r.result; e.resolvedAt = Date.now(); e.resolve(r.result); answered++; // fresh TTL — give the client time to collect
+      // handed out before the restart: its window goes on (never later than now — the journal is agent-writable)
+      if (Number.isFinite(r.deliveredAt)) e.deliveredAt = Math.min(r.deliveredAt, Date.now());
+    } else open++;
     pending.set(id, e);
     if (r.detached) { e.detached = r.detached; detached.push(id); }
   }
@@ -324,12 +338,16 @@ function resolveFromIM(request_id, result) {
 // unanswered entries are left alone — the human may still answer later — until they turn orphan
 // (ORPHAN_TTL_MS old and nobody polling): then cancelled like an expired detach, buttons retracted.
 // A detached answer waits for its new session until the detach expires (expireDetached drops it then).
+// A remote answer already handed out goes REDELIVER_MS after its first hand-out instead.
 function sweep() {
   const now = Date.now();
   let swept = 0;
   for (const [id, p] of pending) {
     if (p.detached) continue;
-    if (p.result !== undefined) { if (now - p.resolvedAt > 300000) { pending.delete(id); swept++; } continue; }
+    if (p.result !== undefined) {
+      if (p.deliveredAt !== undefined ? now - p.deliveredAt > REDELIVER_MS : now - p.resolvedAt > 300000) { pending.delete(id); swept++; }
+      continue;
+    }
     if (ORPHAN_TTL_MS > 0 && now - p.created > ORPHAN_TTL_MS && !attended(p)) {
       log(`request ${id}: open for ${Math.round((now - p.created) / 3600000)}h with nobody waiting on it — cancelling as orphaned`);
       Promise.resolve(provider.cancelQuestion?.(id, "orphaned")).catch((e) => log("cancelQuestion err", e.message));
@@ -347,7 +365,7 @@ function resolveRequest(request_id, result) {
   if (!p || p.result !== undefined) return;   // unknown, or already answered
   // Keep the entry (do NOT delete here): with bounded long-poll the client may be between polls
   // when the human answers, so the result must survive until a re-poll collects it. The /answer
-  // handler deletes it on delivery; the TTL sweep reaps any that are never collected.
+  // handler deletes it on delivery (a remote one: REDELIVER_MS later); the TTL sweep reaps any that are never collected.
   p.result = result;
   p.resolvedAt = Date.now();
   provider.onResolve?.(request_id, result);   // provider drops its callback tokens for this request
@@ -651,15 +669,27 @@ async function handleAnswer(res, id, scope) {
   const entry = pending.get(id);
   if (!entry || !scope.owns(entry)) { res.writeHead(404); res.end('{"error":"no such request"}'); return; }
   const json = { "content-type": "application/json" };
-  // handed off: the answer (now or later) belongs to whoever reattaches it — never deliver it here
-  const detachedReply = () => JSON.stringify({ kind: "detached", request_id: id, until: new Date(entry.detached.until).toISOString() });
-  if (entry.detached) { res.writeHead(200, json); res.end(detachedReply()); return; }
-  // already answered (human replied while the client was between polls) → deliver and consume.
-  if (entry.result !== undefined) {
-    pending.delete(id); persist();
+  // a remote answer handed out before: the same machine gets it again within REDELIVER_MS of the first
+  // hand-out (that reply may have been lost on the way back); past it the entry is gone — judged here,
+  // not left to the sweep. The local port never sees it again.
+  if (entry.deliveredAt !== undefined) {
+    const expired = Date.now() - entry.deliveredAt > REDELIVER_MS;
+    if (expired) { pending.delete(id); persist(); }
+    if (expired || !scope.remote) { res.writeHead(404); res.end('{"error":"no such request"}'); return; }
     res.writeHead(200, json); res.end(JSON.stringify(entry.result));
     return;
   }
+  // the local port consumes the answer; a remote machine's stays for REDELIVER_MS (deliveredAt: first hand-out only)
+  const deliver = (result) => {
+    if (!scope.remote) { pending.delete(id); persist(); }
+    else if (entry.deliveredAt === undefined) { entry.deliveredAt = Date.now(); persist(); }
+    res.writeHead(200, json); res.end(JSON.stringify(result));
+  };
+  // handed off: the answer (now or later) belongs to whoever reattaches it — never deliver it here
+  const detachedReply = () => JSON.stringify({ kind: "detached", request_id: id, until: new Date(entry.detached.until).toISOString() });
+  if (entry.detached) { res.writeHead(200, json); res.end(detachedReply()); return; }
+  // already answered (human replied while the client was between polls) → deliver
+  if (entry.result !== undefined) return deliver(entry.result);
   if (scope.remote) {
     const held = remotePolls.get(scope.id) || 0;
     if (held >= REMOTE_MAX_POLLS) return send(res, 429, { error: `too many /answer polls held for this machine (${REMOTE_MAX_POLLS})` });
@@ -681,8 +711,7 @@ async function handleAnswer(res, id, scope) {
     res.writeHead(200, json); res.end(JSON.stringify({ kind: "pending" }));
     return;
   }
-  pending.delete(id); persist();          // answered while we held → consume
-  res.writeHead(200, json); res.end(JSON.stringify(result));
+  deliver(result);                         // answered while we held
 }
 
 async function handleSessionClose(req, res, scope, pre) {
@@ -750,11 +779,12 @@ function noteSeen(m, req) {
 // Joining (a machine with no token yet): POST /machines/join {name, os, hostname, code,
 // enroll_secret_hash} → the phone gets "🆕 <name> 要加入，核對碼 <code> [✅ 允許] [❌ 拒絕]"; the
 // joining machine polls GET /machines/join/<enroll_id> with its enroll secret (whose hash it sent) and
-// gets the token once, only after the ✅ tap. Only the provider's button callback approves — the relay
+// gets the token only after the ✅ tap (the same token again for a JOIN_TTL_MS after its first hand-out,
+// in case that reply was lost). Only the provider's button callback approves — the relay
 // never auto-answers, autopilot lives in the MCP client and never sees this question. Join requests
 // live in memory only: a relay restart drops them (the machine asks again).
 const JOIN_ALLOW = "✅ 允許", JOIN_DENY = "❌ 拒絕";
-const joins = new Map();   // enroll_id -> {qid, name, os, hostname, code, secretHash, expires, status, token?, machine?, wake, timer, doneAt?}
+const joins = new Map();   // enroll_id -> {qid, name, os, hostname, code, secretHash, expires, status, token?, machine?, wake, timer, doneAt?, collectedAt?}
 const joinByQ = new Map(); // the join question's request_id -> enroll_id
 let lastJoinAt = 0;
 const shown = (s, n) => oneLine(String(s ?? "").replace(/[\u0000-\u001f\u007f-\u009f​-‏‪-‮⁦-⁩﻿]/g, " "), n) || "?";
@@ -828,6 +858,10 @@ async function joinPoll(req, res, enrollId) {
   const j = joins.get(enrollId);
   // unknown id and wrong secret look the same: 404
   if (!j || !sameHex(sha256hex(String(req.headers[ENROLL_SECRET_HEADER] || "")), j.secretHash)) return send(res, 404, { error: "no such join request" });
+  // an approved token handed out before: the same secret gets it again within JOIN_TTL_MS of the first
+  // hand-out (that reply may have been lost on the way back); past it the record is gone — judged here,
+  // not left to the cleanup (which runs once a minute)
+  if (j.collectedAt !== undefined && Date.now() - j.collectedAt >= JOIN_TTL_MS) { joins.delete(enrollId); return send(res, 404, { error: "no such join request" }); }
   if (j.status === "pending") {
     let timer, wake;
     await new Promise((r) => { timer = setTimeout(r, ANSWER_HOLD_MS); wake = r; j.wake.add(wake); });
@@ -835,15 +869,21 @@ async function joinPoll(req, res, enrollId) {
   }
   if (joins.get(enrollId) !== j) return send(res, 404, { error: "no such join request" }); // another poll collected it meanwhile
   if (j.status === "pending") return send(res, 200, { status: "pending", expires_at: new Date(j.expires).toISOString() });
-  joins.delete(enrollId); // the outcome — and the token — is handed out exactly once
-  if (j.status === "approved") return send(res, 200, { status: "approved", machine_id: j.machine.id, name: j.machine.name, token: j.token, protocol: PROTOCOL });
+  if (j.status === "approved") {
+    j.collectedAt ??= Date.now(); // first hand-out only — asking again never extends it
+    return send(res, 200, { status: "approved", machine_id: j.machine.id, name: j.machine.name, token: j.token, protocol: PROTOCOL });
+  }
+  joins.delete(enrollId); // denied / expired: handed out once (nothing to lose)
   return send(res, 200, { status: j.status, ...(j.reason ? { reason: j.reason } : {}) });
 }
-// finished join requests nobody collected: dropped after a TTL; an approved one's machine is revoked
-// again (its token was never handed out — nobody can use it)
+// finished join requests: one whose token was handed out is dropped a TTL after that (its machine stays);
+// any other is dropped a TTL after it finished, and an approved one's machine is revoked then (its
+// token was never handed out — nobody can use it)
 if (machines) setInterval(() => {
   for (const [eid, j] of joins) {
-    if (j.status === "pending" || Date.now() - j.doneAt < JOIN_TTL_MS) continue;
+    if (j.status === "pending") continue;
+    if (j.collectedAt !== undefined) { if (Date.now() - j.collectedAt >= JOIN_TTL_MS) joins.delete(eid); continue; }
+    if (Date.now() - j.doneAt < JOIN_TTL_MS) continue;
     if (j.status === "approved") {
       try { machines.revoke(j.machine.id); log(`join: ${j.name}'s token was never collected — machine ${j.machine.id} revoked`); }
       catch (e) { log(`join: could not revoke ${j.name}'s uncollected machine ${j.machine.id} (${e.message}) — trying again next time`); continue; }
@@ -1055,7 +1095,7 @@ const server = http.createServer(async (req, res) => {
       const [, op, id] = dm;
       const entry = pending.get(id);
       const reply = (code, o) => { res.writeHead(code, { "content-type": "application/json" }); res.end(JSON.stringify(o)); };
-      if (!entry) return reply(404, { error: "no such request (already answered and collected, cancelled, or expired)" });
+      if (!entry || entry.deliveredAt !== undefined) return reply(404, { error: "no such request (already answered and collected, cancelled, or expired)" });
       if (!sid) return reply(400, { error: "session_id required" });
       const info = { request_id: id, ...(entry.meta || {}), answered: entry.result !== undefined };
       if (op === "detach") {
@@ -1094,6 +1134,7 @@ const server = http.createServer(async (req, res) => {
     const list = [];
     for (const [id, p] of pending) {
       if (sid && p.session_id !== sid) continue;
+      if (p.deliveredAt !== undefined) continue;                           // handed out to its remote machine: over
       if (p.result !== undefined && !p.detached && attended(p)) continue; // answered: on its way to its poller
       list.push({ request_id: id, ...(p.meta || {}), session_id: p.session_id, created: new Date(p.created).toISOString(), answered: p.result !== undefined, detached: !!p.detached, attended: attended(p) });
     }
