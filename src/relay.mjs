@@ -413,6 +413,8 @@ function edgeLink() {
       for (const id of s.abandoned || []) h.abandoned.add(String(id));
       if (Number.isFinite(s.down_since)) h.downSince = s.down_since;
       if (s.recovering) h.everUp = true;
+      // it had been up before this start: if this start first finds the hub away, its return is a recovery
+      if (s.recovering || s.ever_up) h.upBefore = true;
       if (h.forwarded.size || h.abandoned.size) log(`edge: picked up ${h.forwarded.size} question(s) waiting on the hub and ${h.abandoned.size} to cancel there from ${STATE_FILE}`);
     }
   } catch {}
@@ -421,7 +423,7 @@ function edgeLink() {
     if (saveQueued) return; saveQueued = true;
     setImmediate(() => {
       saveQueued = false;
-      try { writePrivate(STATE_FILE, JSON.stringify({ upstream: h.url, forwarded: [...h.forwarded], abandoned: [...h.abandoned], down_since: h.reachable ? null : h.downSince, recovering: h.everUp && !h.active }) + "\n"); }
+      try { writePrivate(STATE_FILE, JSON.stringify({ upstream: h.url, forwarded: [...h.forwarded], abandoned: [...h.abandoned], down_since: h.reachable ? null : h.downSince, recovering: h.everUp && !h.active, ever_up: h.everUp || !!h.upBefore }) + "\n"); }
       catch (e) { log("edge: could not save", STATE_FILE, e.message); }
     });
   };
@@ -429,6 +431,7 @@ function edgeLink() {
     if (h.reachable) { h.downSince = Date.now(); h.save(); log(`hub unreachable: ${reason} — ${ownBot.on ? "new questions go to this machine's own bot" : "local clients fall back to this machine's terminal"} until it is back`); }
     else if (h.reason !== reason) log(`hub still unavailable: ${reason}`);
     Object.assign(h, { reachable: false, active: false, okStreak: 0, reason, since: Date.now() });
+    if (h.upBefore) h.everUp = true; // up before a restart, away now: coming back is a recovery
   };
   h.why = (status, body) => status === 401 ? "machine token refused (revoked or wrong) — run /myna:join again"
     : status === 403 || (status >= 300 && status < 400) ? `access denied before the hub (HTTP ${status} — Cloudflare Access service token missing or wrong?)`
@@ -712,8 +715,13 @@ function machinesRevoked(ids) {
   for (const [id, p] of pending) {
     if (!gone.has(machineOf(p)) || p.result !== undefined) continue;
     log(`request ${id}: machine ${p.machine_id} revoked — cancelling`);
-    Promise.resolve(provider.cancelQuestion?.(id, "revoked")).catch((e) => log("cancelQuestion err", e.message));
-    resolveRequest(id, { kind: "cancelled", reason: "machine revoked" });
+    // a question still being sent is cancelled once its message exists (only a sent message can be retracted)
+    const cancel = () => {
+      if (p.result !== undefined) return;
+      Promise.resolve(provider.cancelQuestion?.(id, "revoked")).catch((e) => log("cancelQuestion err", e.message));
+      resolveRequest(id, { kind: "cancelled", reason: "machine revoked" });
+    };
+    if (p.sending) p.sending.then(cancel); else cancel();
   }
   for (const [rid, a] of approvals) if (gone.has(a.machine_id)) approvals.delete(rid);
   for (const id of ids) log(`machine ${id} revoked — its token no longer works`);

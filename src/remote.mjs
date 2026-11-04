@@ -175,31 +175,38 @@ export function machineStore(file, { onRevoked, onError, onLoad } = {}) {
 }
 
 // Run fn while holding <file>.lock — an exclusive-create lock file shared by every process that writes
-// `file`, holding a random owner token. Synchronous (the callers are), waits up to 10 s. A holder only
-// ever removes a lock that still carries its own token. A lock older than 30 s (held for milliseconds
-// normally) is a holder that died mid-write: it is taken over by renaming it away — atomic, so of two
-// processes that both saw it stale only one gets it — and the renamed file is checked to be that same
-// stale lock (same token); a fresh lock grabbed by mistake is put back, never deleted.
+// `file`, holding "<pid> <random token>". Synchronous (the callers are), waits up to 10 s. A holder only
+// ever removes a lock that still carries its own token. A lock is stale only when the process named in
+// it is gone (a holder that died mid-write; a live holder is never taken over, however long it holds) —
+// or, when no pid can be read from it, once it is older than 30 s. A stale lock is taken over by renaming
+// it away (atomic: of two processes that both saw it stale only one gets it); the renamed file must be
+// the very lock judged stale (same content), else it is someone's fresh lock and is put back — and if
+// that fails it is left in place under its new name, never deleted.
 const LOCK_WAIT_MS = 10000, LOCK_STALE_MS = 30000;
 const sleepSync = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+const pidAlive = (pid) => { try { process.kill(pid, 0); return true; } catch (e) { return e.code === "EPERM"; } };
 export function withFileLock(file, fn) {
   const lock = `${file}.lock`, until = Date.now() + LOCK_WAIT_MS, mine = `${process.pid} ${crypto.randomBytes(12).toString("hex")}\n`;
   const readLock = (f) => { try { return fs.readFileSync(f, "utf8"); } catch { return null; } };
+  const isStale = (content) => {
+    const pid = Number(/^(\d+) /.exec(content || "")?.[1]);
+    if (pid > 0) return !pidAlive(pid);
+    try { return Date.now() - fs.statSync(lock).mtimeMs > LOCK_STALE_MS; } catch { return false; }
+  };
   fs.mkdirSync(path.dirname(file), { recursive: true });
   for (;;) {
     try { fs.writeFileSync(lock, mine, { flag: "wx", mode: 0o600 }); break; }
     catch (e) {
       // EPERM / EACCES: Windows while the previous holder's delete is still pending
       if (!["EEXIST", "EPERM", "EACCES"].includes(e.code)) throw e;
-      let st = null; try { st = fs.statSync(lock); } catch {}
-      const owner = st && Date.now() - st.mtimeMs > LOCK_STALE_MS ? readLock(lock) : null;
-      if (owner) {
+      const owner = readLock(lock);
+      if (owner !== null && isStale(owner)) {
         const away = `${lock}.${crypto.randomBytes(6).toString("hex")}.stale`;
         let moved = false;
         try { fs.renameSync(lock, away); moved = true; } catch {}
         if (moved) {
           if (readLock(away) === owner) fs.rmSync(away, { force: true });
-          else { try { fs.linkSync(away, lock); } catch {} fs.rmSync(away, { force: true }); } // someone's fresh lock: put it back (unless a third took the name)
+          else { try { fs.linkSync(away, lock); fs.rmSync(away, { force: true }); } catch {} } // someone's fresh lock: put it back
           continue;
         }
       }

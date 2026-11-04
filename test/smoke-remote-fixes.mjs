@@ -81,7 +81,7 @@ for (const x of JSON.parse(list)) { if (mode === "add") store.add(x); else store
     const f3 = path.join(dir("store3"), "machines.json");
     const seeded3 = Array.from({ length: 100 }, (_, i) => newMachine(`s${i}`).rec), adds3 = Array.from({ length: 100 }, (_, i) => newMachine(`t${i}`).rec);
     fs.writeFileSync(f3, JSON.stringify({ version: 1, machines: seeded3 }));
-    fs.writeFileSync(`${f3}.lock`, "99999 deadbeef\n");
+    fs.writeFileSync(`${f3}.lock`, "2147483646 deadbeef\n");
     const old = new Date(Date.now() - 120000); fs.utimesSync(`${f3}.lock`, old, old);
     const [x, y] = await Promise.all([
       new Promise((resolve) => { const c = spawn(process.execPath, [worker, "add", f3, JSON.stringify(adds3)], { env: baseEnv, stdio: "ignore" }); c.on("exit", resolve); }),
@@ -111,7 +111,7 @@ for (const x of JSON.parse(list)) { if (mode === "add") store.add(x); else store
 // --- Telegram API stubs ---------------------------------------------------------------------------------
 // hang: getUpdates never answers (a long-poll in flight) — records when the client gives up on it
 async function botStub({ hang = false, sendDelayMs = 0 } = {}) {
-  const s = { sent: [], edits: [], updates: [], polls: 0, n: 1, mid: 100, held: [] };
+  const s = { sent: [], edits: [], updates: [], polls: 0, n: 1, mid: 100, held: [], sendDelayMs };
   const srv = http.createServer((rq, res) => {
     const u = new URL(rq.url, "http://x");
     const json = (o) => { res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify(o)); };
@@ -123,7 +123,7 @@ async function botStub({ hang = false, sendDelayMs = 0 } = {}) {
         if (hang) { const h = { at: Date.now(), closedAt: 0 }; s.held.push(h); res.on("close", () => (h.closedAt = Date.now())); return; }
         const deliver = () => { const out = s.updates; s.updates = []; json({ ok: true, result: out }); }; s.updates.length ? deliver() : setTimeout(deliver, 100); return;
       }
-      if (/\/sendMessage$/.test(u.pathname)) { b.message_id = ++s.mid; s.sent.push(b); setTimeout(() => json({ ok: true, result: { message_id: b.message_id } }), b.reply_markup ? sendDelayMs : 0); return; }
+      if (/\/sendMessage$/.test(u.pathname)) { b.message_id = ++s.mid; s.sent.push(b); setTimeout(() => json({ ok: true, result: { message_id: b.message_id } }), b.reply_markup ? s.sendDelayMs : 0); return; }
       if (/\/createForumTopic$/.test(u.pathname)) { json({ ok: true, result: { message_thread_id: 77 } }); return; }
       if (/\/editMessageReplyMarkup$/.test(u.pathname)) { s.edits.push(b); json({ ok: true, result: true }); return; }
       json({ ok: true, result: true });
@@ -154,7 +154,7 @@ function tunnelTo(port) {
 const H = freePort(), R = freePort();
 const HUB = `http://127.0.0.1:${H}`, REMOTE = `http://127.0.0.1:${R}`;
 const HUB_DIR = dir("hub"), MACHINES = path.join(HUB_DIR, "machines.json");
-const M = Object.fromEntries(["pc1", "pc3", "pc4", "pc5", "gone"].map((n) => [n, newMachine(n)]));
+const M = Object.fromEntries(["pc1", "pc3", "pc4", "pc5", "gone", "gone3"].map((n) => [n, newMachine(n)]));
 fs.writeFileSync(MACHINES, JSON.stringify({ version: 1, machines: Object.values(M).map((m) => m.rec) }, null, 2));
 const hubLog = [];
 let hub;
@@ -216,6 +216,16 @@ if (!(await startHub())) { console.error("❌ hub relay never came up"); console
   const r2 = await until(async () => { const x = await req(`${HUB}/answer/${a2.json?.request_id}`); return x.json?.kind && x.json.kind !== "pending" ? x : null; }, 9000);
   ok(r2?.json?.kind === "cancelled" && r2.json.reason === "machine revoked", `machines.json unreadable when the hub starts: once it reads again, the question of a machine revoked meanwhile is cancelled (${JSON.stringify(r2?.json)})`);
   await until(async () => (await req(`${REMOTE}/health`, { headers: { authorization: `Bearer ${M.pc1.token}` } })).status === 200, 8000);
+  // revoked while its question is still being sent: cancelled once the message exists, buttons retracted
+  hubBot.sendDelayMs = 2500;
+  const pa3 = req(`${REMOTE}/ask`, { method: "POST", headers: { authorization: `Bearer ${M.gone3.token}` }, body: { question: "撤銷時還在送的題", options: ["a", "b"], session_id: "s3" } });
+  const m3 = await hubBot.keyboardWith(/撤銷時還在送的題/, 4000);
+  spawnSync(process.execPath, [src("scripts", "machines.mjs"), "revoke", "gone3"], { env: { ...baseEnv, MYNA_MACHINES_FILE: MACHINES } });
+  await req(`${REMOTE}/health`, { headers: { authorization: `Bearer ${M.pc1.token}` } }); // the hub looks at machines.json on every request
+  const a3 = await pa3; hubBot.sendDelayMs = 0;
+  const r3 = await until(async () => { const x = await req(`${HUB}/answer/${a3.json?.request_id}`); return x.json?.kind && x.json.kind !== "pending" ? x : null; }, 8000);
+  ok(!!m3 && r3?.json?.reason === "machine revoked" && !!(await until(() => hubBot.edits.some((e) => e.message_id === m3.message_id), 4000)),
+    `revoked while its question is still being sent: once sent, it is cancelled and its buttons retracted (${JSON.stringify(r3?.json)})`);
 }
 
 // === 4. join.mjs ==========================================================================================
@@ -324,6 +334,16 @@ const startEdge = (port, env, nodeArgs = []) => {
   const t1 = Date.now(); let reach2 = 0, active2 = 0;
   while (!active2 && Date.now() - t1 < 10000) { const x = await req(`${E}/health`); if (x.json?.upstream?.reachable && !reach2) reach2 = Date.now(); if (x.json?.upstream?.active) active2 = Date.now(); await sleep(30); }
   ok(reach2 > 0 && active2 > 0 && active2 - reach2 >= 500, `restarted mid-recovery: still 4 good checks before the hub gets new questions (${active2 && reach2 ? `${active2 - reach2} ms after reachable` : "never active"})`);
+  // stopped while all was well, the hub went away while it was down: its return is still a recovery
+  await sleep(300);
+  c.kill(); await until(async () => (await req(`${E}/health`)).status === 0, 4000);
+  tun.st.down = true;
+  c = startEdge(P, env);
+  await until(async () => (await req(`${E}/health`)).json?.upstream?.reachable === false, 10000);
+  tun.st.down = false;
+  const t2 = Date.now(); let reach3 = 0, active3 = 0;
+  while (!active3 && Date.now() - t2 < 10000) { const x = await req(`${E}/health`); if (x.json?.upstream?.reachable && !reach3) reach3 = Date.now(); if (x.json?.upstream?.active) active3 = Date.now(); await sleep(30); }
+  ok(reach3 > 0 && active3 > 0 && active3 - reach3 >= 500, `stopped while active, hub away when it started again: still 4 good checks (${active3 && reach3 ? `${active3 - reach3} ms after reachable` : "never active"})`);
   c.kill(); tun.close(); bot3.close();
 }
 {
