@@ -429,14 +429,18 @@ function lossyTunnelTo(port) {
   const bot = await botStub(), H2 = freePort(), R2 = freePort(), HUB2 = `http://127.0.0.1:${H2}`, REMOTE2 = `http://127.0.0.1:${R2}`;
   const d = dir("hub-redeliver"), MF = path.join(d, "machines.json"), X = { a: newMachine("xa"), b: newMachine("xb") };
   fs.writeFileSync(MF, JSON.stringify({ version: 1, machines: [X.a.rec, X.b.rec] }, null, 2));
-  const WINDOW = 4000, TTL = 4000;
-  const h2 = spawn(process.execPath, [src("src", "relay.mjs")], {
-    env: { ...baseEnv, MYNA_ENV: path.join(d, ".env"), MYNA_PROVIDER: "telegram", TELEGRAM_BOT_TOKEN: "222222:HUB2", TELEGRAM_CHAT_ID: "42", TELEGRAM_API_BASE: bot.url,
-      RELAY_PORT: String(H2), MYNA_REMOTE_PORT: String(R2), MYNA_MACHINES_FILE: MF, MYNA_MACHINE_NAME: "hub2", MYNA_ANSWER_HOLD_MS: "3000", TELEGRAM_TOPIC_ROUND_GRACE: "0",
-      MYNA_ANSWER_REDELIVER_MS: String(WINDOW), MYNA_SWEEP_MS: "600000", MYNA_JOIN_TTL_MS: String(TTL), MYNA_JOIN_INTERVAL_MS: "0", MYNA_JOIN_MAX_OPEN: "3", MYNA_REMOTE_ASK_MAX: "100" },
-    stdio: ["ignore", "ignore", "pipe"],
-  });
-  children.push(h2); h2.stderr.on("data", (x) => hubLog.push(`[hub2] ${x}`));
+  const WINDOW = 6000, TTL = 4000;
+  const spawnHub2 = () => {
+    const h = spawn(process.execPath, [src("src", "relay.mjs")], {
+      env: { ...baseEnv, MYNA_ENV: path.join(d, ".env"), MYNA_PROVIDER: "telegram", TELEGRAM_BOT_TOKEN: "222222:HUB2", TELEGRAM_CHAT_ID: "42", TELEGRAM_API_BASE: bot.url,
+        RELAY_PORT: String(H2), MYNA_REMOTE_PORT: String(R2), MYNA_MACHINES_FILE: MF, MYNA_MACHINE_NAME: "hub2", MYNA_ANSWER_HOLD_MS: "3000", TELEGRAM_TOPIC_ROUND_GRACE: "0",
+        MYNA_ANSWER_REDELIVER_MS: String(WINDOW), MYNA_SWEEP_MS: "600000", MYNA_JOIN_TTL_MS: String(TTL), MYNA_JOIN_INTERVAL_MS: "0", MYNA_JOIN_MAX_OPEN: "3", MYNA_REMOTE_ASK_MAX: "100" },
+      stdio: ["ignore", "ignore", "pipe"],
+    });
+    children.push(h); h.stderr.on("data", (x) => hubLog.push(`[hub2] ${x}`));
+    return h;
+  };
+  let h2 = spawnHub2();
   const authA = { authorization: `Bearer ${X.a.token}` }, authB = { authorization: `Bearer ${X.b.token}` };
   ok(!!(await until(async () => (await req(`${REMOTE2}/health`, { headers: authA })).status === 200, 8000)), "hub2 (short re-delivery windows) is up");
   const tun = await lossyTunnelTo(R2), P = freePort(), E = `http://127.0.0.1:${P}`;
@@ -461,6 +465,15 @@ function lossyTunnelTo(port) {
   ok(r.status === 404, `another machine asks for the delivered id → 404 (${r.status})`);
   r = await req(`${REMOTE2}/cancel/${a1.json?.request_id}`, { method: "POST", headers: authA, body: {} });
   ok(r.status === 200 && r.json?.cancelled === false, `/cancel on a delivered id → {cancelled:false} (${r.status} ${r.text})`);
+  // the hub restarts (an upgrade, a crash) within the window: the journal keeps the answer and when it was
+  // first handed out — still there for that machine, and the window is not restarted (checked further down)
+  await sleep(700);
+  h2.kill(); await until(async () => (await req(`${HUB2}/health`)).status === 0, 5000);
+  h2 = spawnHub2();
+  await until(async () => (await req(`${REMOTE2}/health`, { headers: authA })).status === 200, 8000);
+  r = await req(`${REMOTE2}/answer/${a1.json?.request_id}`, { headers: authA });
+  ok(r.status === 200 && r.text === tun.st.dropped[0], `hub restarted within the window: the same machine still gets the same result (${r.status} ${r.text})`);
+  ok(!!(await until(async () => (await req(`${E}/health`)).json?.upstream?.active, 8000)), "xa forwards to the restarted hub again");
 
   // X3 (b): the human answers while the poll is held; that reply is lost once
   const a2 = await req(`${E}/ask`, { method: "POST", body: { question: "回程遺失 B", options: ["甲", "乙"], session_id: "x3" } });
@@ -484,7 +497,7 @@ function lossyTunnelTo(port) {
   // past the window → 404 (the handler judges; the sweep is off here)
   await sleep(Math.max(0, firstAt + WINDOW + 500 - Date.now()));
   r = await req(`${REMOTE2}/answer/${a1.json?.request_id}`, { headers: authA });
-  ok(r.status === 404, `the same machine asks ${WINDOW / 1000}s after the first delivery → 404 (${r.status} ${r.text})`);
+  ok(r.status === 404, `the same machine asks ${WINDOW / 1000}s after the first delivery (a hub restart in between does not restart the window) → 404 (${r.status} ${r.text})`);
 
   // X4: xj1 approved, its reply lost once; xj3 denied; xj2 (asked after xj1 was collected) approved, never collected
   const join = async (name, code) => {
