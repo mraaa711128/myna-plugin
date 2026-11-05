@@ -361,9 +361,9 @@ edge 自己有 bot(主節點不在時的備援),主節點也支援轉送聊天:*
 
 照現在單機的規則:per-session token 只在記憶體,重啟後 edge 的轉送拿到 401 → edge 用同一個 `session_id` 重新註冊(topic、inbox 不變,`src/chat.mjs:14`),重送那一則。
 
-### 給 orchestrator 的擴充(只在 Monday 選「全部交給 Myna」時才做)
+### 給 orchestrator 的擴充(不做)
 
-Monday 設計 §5.13 建議的做法 2 不需要這一段;寫下來給人比較:
+人 2026-11-05 為 Monday 選了 §5.13 的做法 2(混合:Myna 管傳和顯示,Monday hub 管題目的一生),所以這一段**不做**;留著記錄比較過什麼:
 
 - `GET /events?since=<seq>`(主節點本機,relay secret):SSE,事件有 `ask`(題目、session、meta)、`asked`(送到手機)、`answer`(結果)、`reply`(人回覆了哪一則)、`chat-in`(人在某 session 的 topic 打字)、`progress`。`seq` 遞增,重連帶 `since`。
 - `/ask` 多一個 `hold: true`:題目先不送到手機,等 `POST /release/<id> {preamble?}`;主節點重啟時 hold 的題目照 journal 留著。
