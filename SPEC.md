@@ -281,7 +281,7 @@ Remote Control 不合用:它把 session 綁在**當下登入的帳號**,多台�
 
 | # | chat mode | 轉送 | 行為 | 跟現在比 |
 |---|---|---|---|---|
-| 1 | 關 | 開 | 只把題目轉給主節點。聊天的 endpoint 不會被呼叫 | **不變** |
+| 1 | 關 | 開 | 只把題目轉給主節點。聊天的 endpoint 不會被呼叫 | **不變**;只有主節點斷線時改成題目留著、恢復後補送(見「題目在主節點斷線時留著」) |
 | 2 | 開 | 關(單機,自己有 bot) | 在自己的 bot、自己的 topic 顯示所有對話細節 | **不變** |
 | 3 | 開 | 開 | **新功能**:聊天也轉給主節點,由主節點在它的 bot 開 topic、貼每一輪的進度、收人的話送回這台 | 現在:沒有自己的 bot → 501、沒有 topic;有自己的 bot → 聊天開在自己的 bot(見「edge 有自己的 bot」) |
 | 4 | 關 | 關 | 單機的題目 | **不變** |
@@ -308,6 +308,23 @@ Remote Control 不合用:它把 session 綁在**當下登入的帳號**,多台�
 ### edge 有自己的 bot 時(組合 3 的變形)
 
 edge 自己有 bot(主節點不在時的備援),主節點也支援轉送聊天:**聊天一律走主節點**,讓同一支手機的同一支 bot 看到所有 session。主節點連不上時聊天**不**改到自己的 bot(見「主節點斷線」),避免一個 session 的對話拆在兩支 bot 上。設定 `MYNA_CHAT_FORWARD=off` 讓這台的聊天照舊留在自己的 bot(組合 2 的行為)。
+
+人 2026-11-05 選「一律走主節點」(手機,gate「Myna 匯流排」第 2 題),並補充:「同理,chat mode off 的時候,如果主節點斷線,題目也要 hold 住,等到恢復後補上」——見下一節。
+
+### 題目在主節點斷線時留著(需求,人 2026-11-05)
+
+**現在**(§5.1「主節點斷線時」):新題目有自己的 bot 就馬上改發到自己的 bot,沒有就斷開連線(client 退回終端機);已經轉給主節點的題目等 `MYNA_UPSTREAM_GRACE`(預設 120 秒)後放棄,回 `{kind:"unreachable"}`。
+
+**改成**(新版 edge 的預設,跟 chat mode 開或關無關):
+- **新題目**:主節點連不上時,edge 回 `{request_id}`(edge 自己挑的 id,照 `X-Myna-Request-Id` 的格式),題目存進 `edge-state.json` 的「排隊」;**不**改到自己的 bot,**不**斷開連線。client 的 `/answer` 照常 long-poll,拿到 `{kind:"pending"}`。
+- **已經轉出、還沒答的題目**:不再 120 秒後放棄;一直等到主節點恢復,答案照常拿回(主節點那邊的答案本來就留著,§5.1 v0.20.3 的 900 秒重送只算在「交出之後」)。
+- **主節點恢復**(`active` 變回 true):排隊的題目照時間順序送出,`X-Myna-Request-Id` 用原本那個 id(主節點收到同一個 id 是冪等的);preamble 前面加一行「(這題在主節點斷線時排著,<HH:mm> 問的,<HH:mm> 送出)」,時間用 edge 的本地時區。
+- **上限**:`MYNA_UPSTREAM_HOLD_MAX`(預設 86400 秒)。排超過這麼久還沒送出的題目才照舊回 `{kind:"unreachable"}`(client 退回終端機),並在主節點恢復後 `/cancel`(如果其實送出過)。
+- **client 那邊**:`ask_human` 照常阻塞;終端機只在開始排隊時印一行「主節點連不上,這題先排著,恢復後送到手機」(MCP server 從 `/answer` 回的 `{kind:"pending", queued:true}` 知道)。
+- **舊行為**:`MYNA_UPSTREAM_HOLD=off` 恢復現在的做法(新題目改發自己的 bot 或斷開、120 秒後放棄)。
+- **向前相容**:這是 edge 自己的行為,主節點不用改,所以新 edge + 舊主節點也有效;舊 edge 照舊。protocol 不升。
+- **為什麼不改到自己的 bot**:人選的「一律走主節點」;斷的常常只是 tunnel,主節點恢復後所有題目還在同一支 bot、同一個 topic,不會一半在主節點、一半在備援 bot。
+- **權限確認**(`/attest`、PermissionRequest hook 轉來的題):照排隊的規則;排隊中護欄照舊 fail closed(一律 false),終端機的權限確認照常可以按,按了就從排隊中拿掉那題(`/cancel`)。
 
 ### 協定(組合 3)
 
@@ -359,6 +376,9 @@ Monday 設計 §5.13 建議的做法 2 不需要這一段;寫下來給人比較:
 - `src/chat.mjs`:接受遠端 scope(session key 前綴、machine token 代替 relay secret、topic 的機器前綴)、`take` 的 `wait_ms`、`progress` 的速率限制。
 - `src/providers/telegram.mjs`:chat topic 名稱加機器前綴。
 - `hooks/chat-mod.mjs`:註冊回應有 `upstream:"down"` 或主節點不支援時,終端機印一行提示。其他不動。
+- `src/relay.mjs`(排隊):主節點斷線時新題目排進 `edge-state.json`、已轉出的不放棄、恢復後依序補送、`MYNA_UPSTREAM_HOLD`、`MYNA_UPSTREAM_HOLD_MAX`;`/answer` 對排隊的題回 `{kind:"pending", queued:true}`。
+- `src/mcp/ask-human.mjs`:看到 `queued:true` 時在終端機印一行(只印一次);改完 `npm run build` 更新 `dist/ask-human.mjs`。
+- `test/smoke-remote*.mjs`:現有的斷線測試照舊行為,改成帶 `MYNA_UPSTREAM_HOLD=off` 跑;另加排隊的測試(測試計畫第 10 項)。
 - `scripts/machines.mjs`:列出每台的版本、標「不支援轉送聊天」。
 - `SPEC.md`(本節定稿)、`README.md`(繁中:多機一節加「聊天也會轉送」)、版本號。
 
@@ -373,7 +393,8 @@ Monday 設計 §5.13 建議的做法 2 不需要這一段;寫下來給人比較:
 7. 主節點重啟:edge 拿到 401 後重新註冊,同一個 topic,那一則重送成功。
 8. 撤銷:那台的 chat session 全部 🔒,之後 401。
 9. 速率:一秒內送 20 則 progress,主節點收到的不超過限制,最後狀態正確。
-10. 把轉送的程式拿掉,3、6、7 要失敗。
+10. 題目排隊(chat mode 關):主節點停掉後問一題 → client 拿到 `pending`、手機沒收到;主節點恢復 → 題目送出、preamble 有「斷線時排著」那行、答案回到 client;斷線前轉出的題目超過 120 秒照樣等到答案;edge 在排隊中重啟,恢復後照樣送出;超過 `MYNA_UPSTREAM_HOLD_MAX` 才 `unreachable`;`MYNA_UPSTREAM_HOLD=off` 時照舊行為(現有 `test/smoke-remote*.mjs` 在這個設定下全過)。
+11. 把轉送和排隊的程式拿掉,3、6、7、10 要失敗。
 
 ## 6. Telegram UX
 
