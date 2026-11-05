@@ -927,13 +927,16 @@ export function create(cfg, ctx) {
   // Called before the relay resolves it (onResolve then drops the tokens). Best-effort.
   // why = "expired": it was handed off (detached) and no session took it over in time.
   // why = "orphaned": left open long past its asker (the relay's orphan sweep).
-  async function cancelQuestion(request_id, why) {
+  // why = "answered": the asker took the human's answer another way (note: what they wrote), e.g. a reply to the
+  // message it posted before the question.
+  async function cancelQuestion(request_id, why, note = "") {
     const q = questionMsg.get(request_id);
     questionMsg.delete(request_id);
     if (!q) return;
-    closeMsgs(request_id, q, "cancelled");
+    closeMsgs(request_id, q, why === "answered" ? "message" : "cancelled");
     await tg("editMessageReplyMarkup", { chat_id: q.chat ?? CHAT_ID, message_id: q.message_id, reply_markup: { inline_keyboard: [] } });
-    const text = why === "expired" ? "⌛ 這題交出後沒有 session 接手,已取消;手機上的按鈕已失效"
+    const text = why === "answered" ? `✅ 已照你的回覆${note ? `「${oneLine(note, 80)}」` : ""}處理,這題的按鈕已失效`
+      : why === "expired" ? "⌛ 這題交出後沒有 session 接手,已取消;手機上的按鈕已失效"
       : why === "orphaned" ? "⌛ 這題放太久、已經沒有 session 在等答案,已取消;手機上的按鈕已失效"
       : why === "join_expired" ? "⌛ 加入要求逾時沒有回應,已取消;手機上的按鈕已失效"
       : why === "revoked" ? "🚫 發問的機器已被撤銷,這題已取消;手機上的按鈕已失效"

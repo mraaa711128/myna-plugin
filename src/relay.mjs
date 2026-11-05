@@ -652,14 +652,19 @@ async function handleAsk(req, res, scope, pre) {
   send(res, 200, { request_id });
 }
 
-async function handleCancel(res, id, scope) {
+// body (optional JSON) {why: "answered", text}: the asker took the human's answer another way (e.g. a reply to the
+// message it posted before the question) — the phone says so instead of "handled in the terminal"
+async function handleCancel(res, id, scope, body = "") {
+  let why;
+  let note = "";
+  try { const b = JSON.parse(body || "{}"); if (b?.why === "answered") { why = "answered"; note = String(b.text ?? "").slice(0, 200); } } catch {}
   let entry = pending.get(id);
   // another machine's request does not exist for this one (404 — not even its existence leaks)
   if (scope.remote && (!entry || !scope.owns(entry))) return send(res, 404, { error: "no such request" });
   if (scope.remote && entry.sending) { await entry.sending; entry = pending.get(id); if (!entry) return send(res, 200, { cancelled: false }); }
   const open = !!entry && entry.result === undefined;
   if (open) {
-    Promise.resolve(provider.cancelQuestion?.(id)).catch((e) => log("cancelQuestion err", e.message)); // reads its state synchronously, before resolve drops it
+    Promise.resolve(provider.cancelQuestion?.(id, why, note)).catch((e) => log("cancelQuestion err", e.message)); // reads its state synchronously, before resolve drops it
     resolveRequest(id, { kind: "cancelled" });
   }
   send(res, 200, { cancelled: open });
@@ -916,7 +921,7 @@ async function handleRemote(req, res) {
   const am = url.pathname.match(/^\/answer\/([a-f0-9]+)$/);
   if (req.method === "GET" && am) return handleAnswer(res, am[1], scope);
   const cm = url.pathname.match(/^\/cancel\/([a-f0-9]+)$/);
-  if (req.method === "POST" && cm) { await readBody(req, SMALL_BODY_BYTES); return handleCancel(res, cm[1], scope); }
+  if (req.method === "POST" && cm) { const { body } = await readBody(req, SMALL_BODY_BYTES); return handleCancel(res, cm[1], scope, body); }
   if (req.method === "POST" && url.pathname === "/session/close") return handleSessionClose(req, res, scope);
   if (req.method === "POST" && url.pathname === "/session/round-end") return handleRoundEnd(req, res, scope);
   // /pair, /shutdown, /attest, /detach, /reattach, /requests, /chat/* … do not exist here
@@ -1083,7 +1088,7 @@ const server = http.createServer(async (req, res) => {
   }
   if (req.method === "POST" && url.pathname === "/ask") return handleAsk(req, res, LOCAL_SCOPE);
   const cm = url.pathname.match(/^\/cancel\/([a-f0-9]+)$/);
-  if (req.method === "POST" && cm) return handleCancel(res, cm[1], LOCAL_SCOPE);
+  if (req.method === "POST" && cm) { const { body } = await readBody(req, SMALL_BODY_BYTES); return handleCancel(res, cm[1], LOCAL_SCOPE, body); }
   const m = url.pathname.match(/^\/answer\/([a-f0-9]+)$/);
   if (req.method === "GET" && m) return handleAnswer(res, m[1], LOCAL_SCOPE);
   const dm = url.pathname.match(/^\/(detach|reattach)\/([a-f0-9]+)$/);

@@ -375,6 +375,15 @@ const takeSoon = async () => { for (let i = 0; i < 40; i++) { const t = (await a
   ok(aL.kind === "message" && aL.text === "請先說明 L0", `a reply to the ✍️ prompt answers L0/L1 → ${JSON.stringify(aL)}`);
   await fetch(`${RELAY}/cancel/${qN.request_id}`, { method: "POST" });
   await answerOf(qN.request_id);
+  // the asker took the answer another way (the human replied to the message it posted before the question): cancel
+  // with why "answered" → the phone says it was handled as replied, not "handled in the terminal"
+  const qR = await ask({ question: "照上面那則做嗎?(#7)", options: ["好,照做", "不要"], session_id: "s-a", gate: "Monday 指令" });
+  await keyboardFor("照上面那則做嗎");
+  const cr = await (await fetch(`${RELAY}/cancel/${qR.request_id}`, { method: "POST", body: JSON.stringify({ why: "answered", text: "好" }) })).json();
+  const said = await until(() => sentIn(tA).find((s) => /已照你的回覆/.test(s.text || "")));
+  ok(cr.cancelled === true && /「好」/.test(said?.text ?? "") && !sentIn(tA).some((s) => /終端機處理/.test(s.text || "") && s._id > (said?._id ?? 0)),
+    `cancel {why: answered, text} → "${said?.text}"`);
+  await answerOf(qR.request_id);
 }
 
 // 11) 429: the question waits the cooldown out and still arrives; progress holds back
