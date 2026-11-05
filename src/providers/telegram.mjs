@@ -544,7 +544,11 @@ export function create(cfg, ctx) {
     const nick = ctx.chat?.get(sid)?.nick || c?.nick || "session";
     if (!text) { await back(`要對 ${nick} 說什麼?在 @${nick} 後面接著打字。`); return; }
     const from = [msg.from?.first_name, msg.from?.last_name].filter(Boolean).join(" ") || msg.from?.username || "";
-    const r = ctx.chat?.deliver(sid, { text, from, chat, message_id: msg.message_id }) || { closed: true };
+    // a reply to some message (one of the session's own, most often): which one, and its text — the session can
+    // tell what the human answered (e.g. a proposal it posted), not just that they wrote
+    const to = msg.reply_to_message;
+    const reply_to = to?.message_id ? { message_id: to.message_id, text: String(to.text ?? to.caption ?? "").slice(0, 4000) } : undefined;
+    const r = ctx.chat?.deliver(sid, { text, from, chat, message_id: msg.message_id, ...(reply_to ? { reply_to } : {}) }) || { closed: true };
     if (r.closed) await back(`🔒 ${nick} 已經結束,訊息沒有送出。`);
     else if (r.stale) await back(`⚠️ ${nick} 目前沒有回應(可能卡住或已關閉),訊息先排隊,它恢復後會收到。`);
   }

@@ -12,8 +12,9 @@
 //        relay): only a process of this user can register — a web page can't reach these endpoints
 //        (a bearer header forces a CORS preflight the relay never answers). Registering again (resume,
 //        or after a relay restart dropped the tokens → 401) keeps the session's topic and inbox.
-//   POST /chat/take      Authorization: Bearer <token>  {max?}  → {message: {id, text, from, at} | null, messages: [...], queued}
-//                        (up to `max` queued messages, default 1; a slash command "/name args" is always taken alone)
+//   POST /chat/take      Authorization: Bearer <token>  {max?}  → {message: {id, text, from, at, reply_to?} | null, messages: [...], queued}
+//                        (up to `max` queued messages, default 1; a slash command "/name args" is always taken alone;
+//                        reply_to {message_id, text}: the message the human replied to, when they replied to one)
 //   POST /chat/progress  Authorization: Bearer <token>  {event: "start", origin: "phone"|"terminal"|"background", prompt?, label?}
 //        (terminal: the prompt typed there; background: a turn nobody typed, shown as the mod's one-line label)
 //        | {event: "step", text?, tools?: [{name, input}]} | {event: "done", text?, interrupted?}
@@ -44,7 +45,7 @@ export function createChat({ cfg, log, dir }) {
   const MAX_BODY = 256 * 1024;
 
   const secret = loadSecret();
-  // sid -> {nick, label, cwd, registered, closed?, inbox: [{id, text, from, at, chat, message_id}]}
+  // sid -> {nick, label, cwd, registered, closed?, inbox: [{id, text, from, at, chat, message_id, reply_to?}]}
   const sessions = load();
   const tokens = new Map();   // token -> sid (runtime only: after a relay restart the session registers again)
   const lastSeen = new Map(); // sid -> last take/progress (runtime)
@@ -175,7 +176,7 @@ export function createChat({ cfg, log, dir }) {
       }
       if (out.length) save();
       for (const m of out) Promise.resolve(provider.chatTaken?.(sid, m)).catch((e) => log("chatTaken err", e.message));
-      const view = (m) => ({ id: m.id, text: m.text, from: m.from, at: m.at });
+      const view = (m) => ({ id: m.id, text: m.text, from: m.from, at: m.at, ...(m.reply_to ? { reply_to: m.reply_to } : {}) });
       reply(200, { message: out[0] ? view(out[0]) : null, messages: out.map(view), queued: s.inbox.length });
       return true;
     }

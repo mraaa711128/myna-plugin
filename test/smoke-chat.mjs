@@ -88,7 +88,7 @@ const api = async (p, body, auth) => {
   return { status: r.status, ...(await r.json().catch(() => ({}))) };
 };
 const push = (u) => updates.push({ update_id: nextUpdateId++, ...u });
-const say = (text, { thread, replyTo } = {}) => { const id = ++mid; push({ message: { message_id: id, chat: { id: 42, type: "private" }, from: { id: 7, first_name: "Alice" }, text, ...(thread ? { message_thread_id: thread } : {}), ...(replyTo ? { reply_to_message: { message_id: replyTo } } : {}) } }); return id; };
+const say = (text, { thread, replyTo, replyText } = {}) => { const id = ++mid; push({ message: { message_id: id, chat: { id: 42, type: "private" }, from: { id: 7, first_name: "Alice" }, text, ...(thread ? { message_thread_id: thread } : {}), ...(replyTo ? { reply_to_message: { message_id: replyTo, ...(replyText !== undefined ? { text: replyText } : {}) } } : {}) } }); return id; };
 const tap = (kb, row, idx) => push({ callback_query: { id: `cq${nextUpdateId}`, data: kb.reply_markup.inline_keyboard[row][idx].callback_data, message: { chat: { id: 42 } } } });
 const keyboardFor = (text) => until(() => [...of("sendMessage")].reverse().find((s) => s.reply_markup?.inline_keyboard && (s.text || "").includes(text)));
 const answerOf = async (id) => { for (;;) { const j = await (await fetch(`${RELAY}/answer/${id}`)).json(); if (j.kind !== "pending") return j; } };
@@ -130,6 +130,7 @@ ok(B.nick === "egret2", `a second live session asking for "egret" gets "${B.nick
   const takeB = await api("/chat/take", {}, B.token);
   const takeA = await api("/chat/take", {}, A.token);
   ok(takeB.message === null && takeA.message?.text === "幫我跑測試" && takeA.message?.from === "Alice", `text in A's topic → only A's inbox → ${JSON.stringify(takeA.message)}`);
+  ok(!("reply_to" in takeA.message), "…a message that replies to nothing carries no reply_to");
   const eyes = await until(() => of("setMessageReaction").find((r) => r.message_id === m1));
   ok(eyes?.reaction?.[0]?.emoji === "👀", "…taking it puts 👀 on the human's message");
   say("@egret2 看一下 log");
@@ -140,6 +141,14 @@ ok(B.nick === "egret2", `a second live session asking for "egret" gets "${B.nick
   await sleep(400);
   const tr = await api("/chat/take", {}, A.token);
   ok(tr.message?.text === "那個也順便", "a reply (in the main chat) to one of A's messages → A");
+  ok(tr.message?.reply_to?.message_id === intro._id && tr.message.reply_to.text === "", `…and take says which message it replied to → ${JSON.stringify(tr.message?.reply_to)}`);
+  // in the session's own topic, replying to a message it posted (say, a list of what it will do): the session gets
+  // that message's id and text, so it can tell which of its messages the human answered
+  say("好", { thread: tA, replyTo: intro._id, replyText: "我要做:① 開工 MT-1 (#12)" });
+  await sleep(400);
+  const tp = await api("/chat/take", {}, A.token);
+  ok(tp.message?.text === "好" && tp.message?.reply_to?.message_id === intro._id && tp.message.reply_to.text === "我要做:① 開工 MT-1 (#12)",
+    `a reply in A's topic to A's message → reply_to {message_id, text} → ${JSON.stringify(tp.message?.reply_to)}`);
   say("@nobody 哈囉");
   await sleep(300);
   ok((await api("/chat/take", {}, A.token)).message === null && (await api("/chat/take", {}, B.token)).message === null, "an unknown @nick reaches no one");
