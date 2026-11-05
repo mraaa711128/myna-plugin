@@ -265,6 +265,116 @@ Remote Control 不合用:它把 session 綁在**當下登入的帳號**,多台�
 - **後續修訂(2026-11,多機功能的 bug,v0.20.2,issue #5):** 協定(endpoint、標頭、狀態碼)不變,protocol 仍是 1;下面是實作和本機檔案的修正。(a) `machines.json` 有兩個寫入者在兩個程序(主節點核准加入、`machines.mjs revoke`):每次讀改寫都持有 `machines.json.lock`(獨佔建立、內容是持有者的 pid 和隨機 token,等最多 10 秒;只刪自己的鎖;鎖裡的 pid 已經不在才算持有者已死(讀不到 pid 時看是否超過 30 秒),活著的持有者不會被接管;接管用 rename,兩個程序同時接管只有一個成功,接管到的不是那個舊鎖就放回去、放不回去也不刪),不會用舊快照蓋掉對方的改動(加入的機器不見、撤銷的機器復活)。讀不懂的 `machines.json`(寫到一半、手改壞了)不再當成「沒有機器」:主節點沿用上一次讀到的清單並記 log,寫入一律拒絕,不覆寫。(b) 主節點啟動、拿到本機 port 之後,journal 接回的題目裡屬於 `machines.json` 已標 `revoked_at` 的機器的,照撤銷的規則取消(收回按鈕、`{kind:"cancelled", reason:"machine revoked"}`;撤銷時還在送往手機的題目等送完再收回,執行中撤銷也一樣)——停機期間 `machines.mjs revoke` 的機器不再要等孤兒 TTL。啟動時 `machines.json` 讀不懂的話,改在第一次讀成功時做。(c) body 超過上限(`/ask`、`/machines/join`)時**立刻**回 413 並關閉連線,不等 body 結束;遠端 listener 的請求要在 30 秒內收完(標頭 15 秒),慢速或不結束的 body 不能一直佔住連線(回應時間,例如 `/answer` 的 long-poll,不算)。(d) edge 的 `upstream.json`、`edge-state.json` 多記 `upstream`(寫入時的主節點網址),跟現在的 `MYNA_UPSTREAM` 不同就不用;沒有這個欄位的舊檔照舊使用。`edge-state.json` 多記 `recovering`(連上過、但新題目還沒回到主節點)和 `ever_up`(連上過):在斷線中或恢復中重啟的 edge,或重啟前連得上、重啟後第一次就連不上的 edge,主節點回來時算「恢復」,照樣要連續 `MYNA_UPSTREAM_RECOVER` 次檢查正常才把新題目送回主節點(以前重啟後第一次檢查成功就送回);啟動時第一次檢查還沒決定要不要用自己的 bot,會用的話照「有自己的 bot」算。(e) edge 的 `.env` 寫了 `MYNA_PROVIDER=<名稱>` 但沒有那個 provider 的 key:記一行 log、當成沒有自己的 bot、只轉送,不再結束 relay(主節點照舊結束)。(f) edge 發現自己的 bot 就是主節點那支而停掉它時,已經發在那支 bot 上、還沒答的題目收回按鈕(手機上註明改回終端機處理)並以 `{kind:"unreachable"}` 結束(還在送出的題目等送完再收回),client 退回終端機——那些按鈕只有被停掉的 provider 認得,主節點收到點擊也解析不了。(g) Telegram 的 `stop()` 在沒有 `AbortSignal.any` 的 Node(18.17 / 20.3 以前)也會立刻中斷進行中的 `getUpdates`。(h) `join.mjs`:這台是開著遠端 listener 的主節點(`MYNA_REMOTE_PORT` 有值、不是 edge)時擋下,請先 `/myna:hub off`(`/myna:hub on` 擋 edge 的反方向);核准後先把 token 存進 `join-pending.json`(0600)再寫 `machine-token` 和 `.env`,寫檔失敗時保留它,`join.mjs --wait` 不再問主節點就能完成;完成時刪掉前一個主節點留下的 `upstream.json`、`edge-state.json`;沒有 `--no-start` 時,`ensure-relay` 失敗、或 20 秒內 port 上不是這個主節點的 edge,就說明原因並 exit 1(token 和 `.env` 已存好,修好後 `/myna:relay restart`)。**刻意不做:** edge 停掉自己的 bot 之後主節點又換成另一支 bot 時重新啟用(重啟 relay 就會依 `upstream.json` 重新判斷)。`/answer` 與加入結果在回程遺失(issue #5 的另外兩條)會改變 endpoint 的語意,另案設計。測試:`test/smoke-remote-fixes.mjs`(在 0.20.1 上 16 項失敗;另有 Codex review 補的 stale lock、啟動時檔案讀不懂、恢復中重啟、送出中發現同一支 bot)。
 - **後續修訂(2026-11,回程遺失時答案和 token 不會跟著消失,v0.20.3,issue #5):** 主節點把結果寫進回應之前就刪掉了那一筆:遠端 `GET /answer/<id>` 先 `pending.delete` 再回答案,`GET /machines/join/<enroll_id>` 先刪加入記錄再回 token。回應在 tunnel 回程斷掉時,edge(或 `join.mjs`)會在連線錯誤後重問同一個網址,拿到的卻是 404:人在手機上給的答案沒了(client 退回終端機再問一次);加入那邊,主節點已經把機器登記成 active,加入記錄刪了也不會「沒取走就撤銷」,同名再加入 409,只能到主節點手動撤銷。**決定:** 只改主節點,edge 和 `join.mjs` 不用改(它們本來就會重試)。(a) 遠端題目的答案第一次交出時不刪,記下交出的時間(只記第一次、重問不延長);`MYNA_ANSWER_REDELIVER_MS`(預設 900 秒)內同一台機器再問同一個 id 拿到同一個結果,過了就刪掉、回 404——由 `/answer` 當下判斷,300 秒未取走的清理改成對交出過的照這個期限回收。別台機器照舊 404。交出過的題目算已結束:`/cancel` 回 `{cancelled:false}`,本機的 `/requests`、`/detach`、`/reattach` 看不到它。本機 port 不改(交出就刪,本機沒有 tunnel)。(b) 加入:**只有 approved 會重送**。第一次交出 token 時記下時間(只記第一次),`MYNA_JOIN_TTL_MS` 內同一個 enroll secret 再問拿到同一個 token,過了就刪掉這筆、回 404——由 `GET /machines/join/<enroll_id>` 當下判斷,每分鐘的清理只回收、**不撤銷**交出過的機器;從沒被取走的 approved 照舊在 TTL 後撤銷。denied / expired 照舊交出後就刪。(c) **為什麼是 900 秒:** 要涵蓋 edge 的 `MYNA_UPSTREAM_GRACE`(預設 120 秒;edge 斷線超過 grace 就放棄這題、改送 `/cancel`,之後不再問)加上檢查間隔與恢復的餘裕。**已知極限:** `MYNA_UPSTREAM_GRACE` 設得比 900 秒長、而且斷線超過 900 秒才恢復時,回程遺失的答案仍可能拿不回來(grace 不設上限)。(d) **protocol 不升:** 兩個方向都相容——新主節點 + 舊 edge / 舊 `join.mjs`:拿到結果就不再問,看不到差別,回程斷掉時的重試現在會成功;舊主節點 + 新 edge:edge 沒有改。(e) 風險:答案在主節點多留最多 900 秒(就在 journal 裡,跟「答了還沒取走」一樣),只給同一台機器(token 驗證過);token 在記憶體多留最多一個 TTL,只給持有同一個 enroll secret 的人。edge 拿到非 pending 的結果就刪掉轉送記錄,一題只回給 client 一次。測試:`test/smoke-remote-fixes.mjs` 的「a reply lost on the way back」(答好再問、long-poll 等待中才答兩種時序,回程各掉一次都拿到完全相同的結果;別台機器、本機 port、過期都是 404;加入的 token 回程掉一次後拿到同一個 token、錯的 secret 404、denied 交出後 404、交出過的過期後 404 且機器沒被撤銷、沒取走的照舊撤銷),在 0.20.2 上 7 項失敗;`test/smoke-remote.mjs` 的「second poll → 404」改成「拿到同一個 token」。
 
+## 5.2 子節點轉送聊天(設計草案,2026-11-05,未實作)
+
+> **狀態:** 設計,等人看過才實作。protocol 仍是 1(只新增 endpoint 和回應欄位,見 §5.1「版本相容」)。建在 PR #9(0.20.4:`/chat/take` 帶 `reply_to`、`/cancel` 帶 `why`)之上,預定版本 0.21.0。
+
+### 起因
+
+§5.1 的 edge 只轉送題目(`/ask`、`/answer`、`/cancel`、`/session/*`);`/chat/*` 在遠端 listener 不存在,edge 沒有自己的 bot 時回 501(`src/relay.mjs:970-974`)。所以子節點那台的 Claude Code session 開了 chat mode 也沒有 topic:題目到得了手機,「這一輪做了什麼」和人在手機打的字都到不了。
+
+人(2026-11-05,Telegram):「我預期的是『子節點轉送聊天』應該就是 myna chat mode + 轉送功能的結合才對(應該也要能向前相容)」。向前相容的定義(人的原話):「沒開 chat mode → 只轉送問題到主節點;開 chat mode 沒開轉送 → 在自己的 myna topic 一樣顯示所有對話細節」。
+
+### 四種組合(需求)
+
+「轉送」= 這台加入了主節點(`MYNA_ROLE=edge`)。「chat mode」= 這個 session 的 chat mod 開著(`MYNA_CHAT`、`/myna:chat`)。
+
+| # | chat mode | 轉送 | 行為 | 跟現在比 |
+|---|---|---|---|---|
+| 1 | 關 | 開 | 只把題目轉給主節點。聊天的 endpoint 不會被呼叫 | **不變** |
+| 2 | 開 | 關(單機,自己有 bot) | 在自己的 bot、自己的 topic 顯示所有對話細節 | **不變** |
+| 3 | 開 | 開 | **新功能**:聊天也轉給主節點,由主節點在它的 bot 開 topic、貼每一輪的進度、收人的話送回這台 | 現在:沒有自己的 bot → 501、沒有 topic;有自己的 bot → 聊天開在自己的 bot(見「edge 有自己的 bot」) |
+| 4 | 關 | 關 | 單機的題目 | **不變** |
+
+現有使用者升級後不會變:組合 1、2、4 的程式路徑不動;組合 3 只在**兩邊都是新版**、主節點宣告支援時才啟用(見「能力宣告」)。
+
+### 能力宣告
+
+- 主節點的遠端 `GET /health` 多一個欄位 `features: ["chat"]`。新增欄位,protocol 不升(舊 edge 忽略不認得的欄位)。
+- edge 每次健康檢查記下 `upstream.features`,寫進 `upstream.json`(重啟後主節點連不上時沿用上次的值判斷)。
+- edge 的本機 `/health` 多 `upstream.chat`:`"forwarded"`(組合 3 生效)/ `"own-bot"`(主節點不支援,用自己的 bot)/ `"unsupported"`(主節點不支援、自己也沒有 bot)/ `"down"`(主節點連不上)。
+
+### 新舊版本混用
+
+| edge | 主節點 | chat mode 開的 session 會怎樣 | 人看到的提示 |
+|---|---|---|---|
+| 新 | 新 | 組合 3:聊天在主節點的 bot | — |
+| 新 | 舊(`/health` 沒有 `features` 或不含 `chat`) | 有自己的 bot → 退回組合 2(聊天在自己的 bot、自己的 topic);沒有 → 不開聊天,題目照舊轉送(等於組合 1) | 終端機一行(chat mod 註冊時):「主節點的 Myna 版本不支援轉送聊天(要 0.21.0 以上),聊天{改用這台自己的 bot / 沒有開}」;`/myna:relay status` 寫同一句。手機上不另發訊息(舊主節點沒有可以貼的地方) |
+| 舊 | 新 | 跟現在一樣(舊 edge 不轉送 `/chat/*`):有自己的 bot 就在自己的 bot,沒有就 501 | 主節點 `/myna:machines` 列出每台的版本,舊的標「不支援轉送聊天」 |
+| 舊 | 舊 | 跟現在一樣 | — |
+
+升版順序照 §5.1:先升主節點,再升 edge。
+
+### edge 有自己的 bot 時(組合 3 的變形)
+
+edge 自己有 bot(主節點不在時的備援),主節點也支援轉送聊天:**聊天一律走主節點**,讓同一支手機的同一支 bot 看到所有 session。主節點連不上時聊天**不**改到自己的 bot(見「主節點斷線」),避免一個 session 的對話拆在兩支 bot 上。設定 `MYNA_CHAT_FORWARD=off` 讓這台的聊天照舊留在自己的 bot(組合 2 的行為)。
+
+### 協定(組合 3)
+
+**edge 本機(`:7800`)**:chat mod 照舊打本機的 `/chat/register|take|progress|nick|close`、`GET /chat/session`,**chat mod 不用改**(除了上面那一行提示)。edge 判斷 `upstream.chat === "forwarded"` 時轉送,否則照現在的規則(自己的 bot 或 501)。
+
+**主節點的遠端 listener 新增**(都要 machine token,§5.1 的驗證順序照舊):
+
+| endpoint | body / 回應 | 說明 |
+|---|---|---|
+| `POST /chat/register` | `{session_id, nick, label?, cwd?}` → `{token, nick, topic, queued}` | 不用 relay secret(machine token 代替);主節點的 session key 是 `m:<machine_id>:<session_id>`,跟 `/ask` 一樣;`cwd` 只用來顯示,主節點不讀那個路徑 |
+| `POST /chat/take` | `{max?, wait_ms?}` → 同本機(含 PR #9 的 `reply_to`) | `wait_ms`(新,最多 25000):沒有訊息時 hold 到有訊息或逾時,省掉 edge 每 2 秒一次的轉送。本機 port 也接受(舊 mod 不帶,照舊立刻回) |
+| `POST /chat/progress` | 同本機 | 速率限制:每個 session 每秒最多 5 則,超過回 429,edge 合併後再送(見下) |
+| `POST /chat/nick`、`POST /chat/close` | 同本機 | 只動得到自己這台的 session |
+
+**token**:edge 對本機 mod 發自己的 per-session token,另外持有主節點發給它的那個 token;兩個不一樣,本機 mod 看不到主節點的 token。
+
+**nick**:在主節點全部 session 之間唯一(現在的 `uniqueNick`),兩台都有 `egret` 時第二台的變 `egret2`;回給 mod 的是主節點定的 nick。
+
+**topic 名稱**:`<機器> · 💬 <nick> · <label>`,機器前綴照 `MYNA_TOPIC_MACHINE`(`auto` = 有遠端機器登記時才加,跟題目的 topic 一致)。主節點自己的 chat session 在 `auto` 下也加上自己的名稱,一眼分得出是哪台。
+
+**人的話往回送**:人在那個 topic 打字(或 `@nick …`、reply 它的訊息)→ 主節點的 inbox(照舊存 `chat-sessions.json`)→ edge 的 `/chat/take` long-poll 拿走 → edge 的本機 inbox → mod。`!指令` 照舊一則一則。
+
+**撤銷**:機器被撤銷時,主節點把那台的 chat session 全部關掉(topic 改 🔒,跟 `/chat/close` 一樣),inbox 清掉。
+
+### 主節點斷線
+
+- **新的 register**:回本機 mod `{token, nick, topic:null, queued:0, upstream:"down"}`,mod 照常跑;edge 記下這個 session,主節點回來後替它註冊(同一個 `session_id` → 同一個 topic)。
+- **progress**:edge 每個 session 只留「這一輪的最新狀態」(start 的 prompt、最後一個 step、done),因為主節點那邊本來就是一則原地更新的訊息;最多留 50 個 session、每個最多 32 KB,超過丟最舊的並在 log 記一行。主節點回來後補送:沒結束的那一輪送 start + 最後一個 step;已經結束的送 start + done。
+- **take**:回 `{message:null, messages:[], queued:0, upstream:"down"}`;人在斷線期間打的字留在主節點的 inbox,恢復後照常拿到。
+- **不改到自己的 bot**:理由同 §5.1「超過 grace」——斷的可能只是 tunnel,主節點的 topic 還在,改發一份會讓人在兩個地方各說一半。
+- **edge 重啟**:轉送中的 session 清單和還沒補送的進度寫進 `edge-state.json`(0600),重啟後照樣補送。
+
+### 主節點重啟
+
+照現在單機的規則:per-session token 只在記憶體,重啟後 edge 的轉送拿到 401 → edge 用同一個 `session_id` 重新註冊(topic、inbox 不變,`src/chat.mjs:14`),重送那一則。
+
+### 給 orchestrator 的擴充(只在 Monday 選「全部交給 Myna」時才做)
+
+Monday 設計 §5.13 建議的做法 2 不需要這一段;寫下來給人比較:
+
+- `GET /events?since=<seq>`(主節點本機,relay secret):SSE,事件有 `ask`(題目、session、meta)、`asked`(送到手機)、`answer`(結果)、`reply`(人回覆了哪一則)、`chat-in`(人在某 session 的 topic 打字)、`progress`。`seq` 遞增,重連帶 `since`。
+- `/ask` 多一個 `hold: true`:題目先不送到手機,等 `POST /release/<id> {preamble?}`;主節點重啟時 hold 的題目照 journal 留著。
+- `/ask` 多一個 `answer_via: "<orchestrator>"`:答案先給 orchestrator(`/events` 的 `answer`),由它 `POST /deliver/<id> {result}` 交給發問的 session;語意改變,**要升 protocol 2**。
+- `/cancel/<id>` 允許帶 relay secret 的本機 orchestrator 收任何 session 的題(現在只有發問的 session 能收)。
+
+### 要改的檔案
+
+- `src/relay.mjs`:edge 的 `/chat/*` 路由(轉送或照舊)、`upstream.features` 和 `upstream.chat`、斷線時的 session 清單與進度緩衝、`edge-state.json` 多兩個欄位;主節點遠端 listener 加 `/chat/*` 四個 endpoint、`/health` 的 `features`、撤銷時關 session。
+- `src/chat.mjs`:接受遠端 scope(session key 前綴、machine token 代替 relay secret、topic 的機器前綴)、`take` 的 `wait_ms`、`progress` 的速率限制。
+- `src/providers/telegram.mjs`:chat topic 名稱加機器前綴。
+- `hooks/chat-mod.mjs`:註冊回應有 `upstream:"down"` 或主節點不支援時,終端機印一行提示。其他不動。
+- `scripts/machines.mjs`:列出每台的版本、標「不支援轉送聊天」。
+- `SPEC.md`(本節定稿)、`README.md`(繁中:多機一節加「聊天也會轉送」)、版本號。
+
+### 測試計畫(`test/smoke-edge-chat.mjs`,暫存 HOME、假 bot、主節點和 edge 兩個 relay)
+
+1. 組合 1:edge 上 chat mode 關的 session 問題照舊轉送,主節點沒有 chat session。
+2. 組合 2:單機 chat mode 照舊(現有 `test/smoke-chat.mjs` 全過,一行不改)。
+3. 組合 3:edge 上註冊 → 主節點有 `m:<id>:<sid>`、topic 名稱有機器前綴;progress start / step / done 到主節點的同一則訊息;人在 topic 打字 → edge 的 `/chat/take` 拿到(含 `reply_to`);`!指令` 單獨一則;nick 撞名變 `egret2`。
+4. 新 edge + 舊主節點(假主節點的 `/health` 沒有 `features`):有自己的 bot → 聊天在自己的 bot;沒有 → 本機 `/chat/register` 回明確的錯誤、chat mod 印一行提示,題目照舊轉送。
+5. 舊 edge 不受新主節點影響(用 0.20.3 的 edge 跑一次:`/chat/*` 照舊 501 或自己的 bot)。
+6. 主節點斷線:register 回 `upstream:"down"`;斷線中的 progress 只留最新狀態,恢復後補送一次;人在斷線期間打的字恢復後拿到;edge 在斷線中重啟,恢復後照樣補送。
+7. 主節點重啟:edge 拿到 401 後重新註冊,同一個 topic,那一則重送成功。
+8. 撤銷:那台的 chat session 全部 🔒,之後 401。
+9. 速率:一秒內送 20 則 progress,主節點收到的不超過限制,最後狀態正確。
+10. 把轉送的程式拿掉,3、6、7 要失敗。
+
 ## 6. Telegram UX
 
 - **訊息格式:** `[機器A · PROJ-123 · gate② space-time]` +(有 `preamble` 時先顯示 preamble)+ question +**完整選項以編號列於內文**(`1. …` `2. …`)。
