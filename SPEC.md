@@ -41,27 +41,34 @@ Remote Control 不合用:它把 session 綁在**當下登入的帳號**,多台�
 
 ## 3. 架構
 
-```
-機器 A (帳號1) ─ ask_human MCP server ─┐
-機器 B (帳號2) ─ ask_human MCP server ─┼→  Relay(自架常駐,獨佔 bot 連線)  ←→  Telegram bot  ←→  手機
-機器 C (帳號1) ─ ask_human MCP server ─┘   依 request_id / thread_id / token 路由     (編號內文 + 精簡按鈕 + ✍️)
+**每台機器一個 relay(實作至今都是這樣):** relay 只聽本機的 `127.0.0.1:7800`(`src/relay.mjs:97`、`:1152`),同一台的 `ask_human` MCP server、hooks、護欄、chat mod 都只跟自己這台的 relay 說話;每個 relay 擁有自己的 bot 連線(`src/providers/telegram.mjs:2`,getUpdates long-poll),綁一個配對過的聊天室(`:57`、`:68`)。一支 bot 同時只能由一個 relay poll。
+
+```mermaid
+flowchart LR
+  subgraph M[一台機器]
+    C[ask_human MCP server、hooks、chat mod] --> R[relay<br/>127.0.0.1:7800]
+  end
+  R <--> B[這台的 bot]
+  B <--> P[手機]
 ```
 
-**後續修訂(2026-11,多機共用 relay,v0.20.0):** 上圖的「多台機器 → 單一 relay」實作成「主節點 + 轉送模式」,client 端一行都不用改:
+多台機器在 0.20 以前,就是每台各跑一個 relay、各用自己的一支 bot,手機上收到好幾支 bot 的訊息。v3 的構想(多台機器的 MCP server 都連到同一個 relay)沒有照字面實作:relay 只聽本機,別台連不到。
 
+**後續修訂(2026-11,多機共用 relay,v0.20.0):** 多台共用一支 bot 實作成「主節點 + 轉送模式」,client 端一行都不用改:
+
+```mermaid
+flowchart TD
+  P[手機] <--> BOT[共用的 bot<br/>只有主節點 poll]
+  BOT <--> RH[主節點 relay<br/>本機 7800、遠端 7801]
+  CF[cloudflared<br/>Cloudflare Access] --> RH
+  RE[子節點 relay<br/>127.0.0.1:7800] -->|HTTPS + machine token<br/>只轉送題目| CF
+  CE[子節點的 ask_human、hooks、護欄] --> RE
+  RE -.->|主節點不在時| OB[子節點自己的 bot<br/>可有可無,不能是同一支]
+  OB -.-> P
 ```
-                         手機(一支 bot)
-                              │ 只有主節點 poll
-  主節點 hub(MYNA_ROLE 沒設或 =hub)
-    relay ── 127.0.0.1:7800  本機 listener(同 0.19,不需要 credential;擋瀏覽器與非 loopback Host,多機時再擋代理標頭)
-          └─ 127.0.0.1:7801  遠端 listener(MYNA_REMOTE_PORT;每個請求都要 machine token)
-    cloudflared:https://<主節點網址> → 127.0.0.1:7801(前面加 Cloudflare Access)
-                              │ HTTPS + CF-Access-Client-Id/Secret + Authorization: Bearer <machine token>
-  遠端 edge(MYNA_ROLE=edge;可以有自己的 bot,但不能是主節點那支)
-    relay(同一個 src/relay.mjs)── 127.0.0.1:7800
-      主節點正常 → 轉送到主節點;主節點不在 → 新題目改發自己的 bot(沒有就退回終端機)
-    ask_human、hooks、護欄照樣打 127.0.0.1:7800
-```
+
+- 主節點(`MYNA_ROLE` 沒設或 `hub`):本機 listener `127.0.0.1:7800`(同 0.19,不需要 credential;擋瀏覽器與非 loopback Host,多機時再擋代理標頭);遠端 listener `127.0.0.1:7801`(`MYNA_REMOTE_PORT`,每個請求都要 machine token,`src/relay.mjs:1170`),前面接 cloudflared 和 Cloudflare Access。
+- 子節點(`MYNA_ROLE=edge`,同一個 `src/relay.mjs`):主節點正常 → 轉送到主節點;主節點不在 → 新題目改發自己的 bot(沒有就退回終端機)。自己的 bot 跟主節點那支相同時不用,只轉送(`src/relay.mjs:509-515`)。`ask_human`、hooks、護欄照樣打 `127.0.0.1:7800`。
 
 協定、驗證與相容規則見 §5.1。
 
