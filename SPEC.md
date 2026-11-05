@@ -319,12 +319,37 @@ edge 自己有 bot(主節點不在時的備援),主節點也支援轉送聊天:*
 - **新題目**:主節點連不上時,edge 回 `{request_id}`(edge 自己挑的 id,照 `X-Myna-Request-Id` 的格式),題目存進 `edge-state.json` 的「排隊」;**不**改到自己的 bot,**不**斷開連線。client 的 `/answer` 照常 long-poll,拿到 `{kind:"pending"}`。
 - **已經轉出、還沒答的題目**:不再 120 秒後放棄;一直等到主節點恢復,答案照常拿回(主節點那邊的答案本來就留著,§5.1 v0.20.3 的 900 秒重送只算在「交出之後」)。
 - **主節點恢復**(`active` 變回 true):排隊的題目照時間順序送出,`X-Myna-Request-Id` 用原本那個 id(主節點收到同一個 id 是冪等的);preamble 前面加一行「(這題在主節點斷線時排著,<HH:mm> 問的,<HH:mm> 送出)」,時間用 edge 的本地時區。
-- **上限**:`MYNA_UPSTREAM_HOLD_MAX`(預設 86400 秒)。排超過這麼久還沒送出的題目才照舊回 `{kind:"unreachable"}`(client 退回終端機),並在主節點恢復後 `/cancel`(如果其實送出過)。
+- **上限**:預設 1 天(`/myna:hold max`,或環境變數 `MYNA_UPSTREAM_HOLD_MAX` 秒數,見下面 `/myna:hold`)。排超過這麼久還沒送出的題目才照舊回 `{kind:"unreachable"}`(client 退回終端機),並在主節點恢復後 `/cancel`(如果其實送出過)。
 - **client 那邊**:`ask_human` 照常阻塞;終端機只在開始排隊時印一行「主節點連不上,這題先排著,恢復後送到手機」(MCP server 從 `/answer` 回的 `{kind:"pending", queued:true}` 知道)。
-- **舊行為**:`MYNA_UPSTREAM_HOLD=off` 恢復現在的做法(新題目改發自己的 bot 或斷開、120 秒後放棄)。
+- **舊行為**:`/myna:hold off`(或環境變數 `MYNA_UPSTREAM_HOLD=off`)恢復現在的做法(新題目改發自己的 bot 或斷開、120 秒後放棄)。
 - **向前相容**:這是 edge 自己的行為,主節點不用改,所以新 edge + 舊主節點也有效;舊 edge 照舊。protocol 不升。
 - **為什麼不改到自己的 bot**:人選的「一律走主節點」;斷的常常只是 tunnel,主節點恢復後所有題目還在同一支 bot、同一個 topic,不會一半在主節點、一半在備援 bot。
 - **權限確認**(`/attest`、PermissionRequest hook 轉來的題):照排隊的規則;排隊中護欄照舊 fail closed(一律 false),終端機的權限確認照常可以按,按了就從排隊中拿掉那題(`/cancel`)。
+
+### `/myna:hold`:設定斷線時要不要排隊(人 2026-11-05:「MYNA_UPSTREAM_HOLD 參數,是不是應該做一個 slash command 來讓使用者設定?」)
+
+照 `/myna:murmur`、`/myna:stopcatch`、`/myna:perm` 的慣例:一個全域旗標檔,**預設開**,檔案只記明確的「關」和上限;relay 每次要用時才讀,不用重啟。
+
+- **指令**:`/myna:hold [status | on | off | max <時間>]`,沒有參數是 `status`。`commands/hold.md` 執行 `node "${CLAUDE_PLUGIN_ROOT}/scripts/hold.mjs" $ARGUMENTS`,跟其他開關指令一樣,執行完用繁體中文一行回報。
+  - `on`:恢復預設(排隊)。拿掉檔案裡的 `off`;有設 `max` 就保留那一行。
+  - `off`:斷線時照 0.20.3 的做法(新題目改發自己的 bot,沒有就斷開;已轉出的 `MYNA_UPSTREAM_GRACE` 秒後放棄)。
+  - `max <時間>`:排隊的上限,接受 `30m`、`6h`、`1d` 或秒數;範圍 10 分鐘到 7 天,超出就擋下並說明。`max default` 拿掉這一行,回到預設 1 天。
+- **存在哪**:`~/.myna/upstream-hold`(`MYNA_UPSTREAM_HOLD_FILE` 可改路徑,測試用)。格式:第一行 `on` 或 `off`,下一行可選 `max=<秒數>`,最後一行是改的時間。沒有檔案 = 開、上限 1 天。讀不懂的檔案當成預設,relay log 記一行,`status` 也會說。
+- **哪台設**:**子節點那台**(會排隊的是子節點的 relay)。在主節點或單機執行時照樣寫入,並說明「這台不是子節點,斷線排隊只在加入主節點後才有作用」,`status` 也這樣寫。
+- **何時生效**:不用重啟。relay 在三個時間點讀檔:主節點斷線時、收到新題目時、每次健康檢查。
+  - 改成 `off`:之後的新題目照舊做法;**已經在排隊的題目留在隊裡**,恢復後照樣補送(不丟掉人可能正在等的題)。要放棄它們,在終端機回答,或 `/myna:relay restart` 後重問。
+  - 改 `max`:每次健康檢查都用新的上限重算,已經排隊的也套用;改短後馬上超過的,照「超過上限」處理(`unreachable`,恢復後 `/cancel`)。
+- **`status` 顯示什麼**(讀旗標檔,再打本機 relay 的 `/health`):
+  - 設定:開或關、上限,以及設定來自哪裡(預設、`/myna:hold`、環境變數)。
+  - 這台的角色:edge 或不是。
+  - 主節點現在連不連得上、從幾點斷的(`upstream.since`)。
+  - **排著幾題、最早的是幾點**:edge 的 `/health` 多 `upstream.hold: {on, max_s, source, queued, oldest_at, waiting}`。`queued` 是還沒送出的題目數,`oldest_at` 是最早那題排進來的時間,`waiting` 是已經轉出、還在等答案的題目數。用本地時間顯示,例如「排著 2 題,最早 14:32 問的;另有 1 題已送出、在等你回答」。
+  - relay 沒在跑:只顯示設定,並說「relay 沒在跑,看不到排隊的題目」。
+- **跟環境變數同時存在**:Myna 的規則是環境變數優先於檔案(`src/relay.mjs:96`),這裡一樣:`MYNA_UPSTREAM_HOLD`(`on`/`off`)、`MYNA_UPSTREAM_HOLD_MAX`(秒數)有設的話,不論在程序環境變數還是 `~/.myna/.env`,都蓋過 `/myna:hold` 的檔案。這時 `/myna:hold on|off|max` **照樣寫檔**,但說明「環境變數 X 有設,現在用的是它的值;要讓這個設定生效,先拿掉那個環境變數」;`status` 的 source 寫 `env`。(`/myna:hub off` 碰到環境變數是擋下不寫;這裡照樣寫,因為旗標檔在環境變數拿掉後就該生效,不會留下矛盾的狀態。)
+- **向前相容**:
+  - 0.20.3 以前的 relay 不讀這個檔:新版指令碰到舊 relay 時(`/health` 的 edge 欄位沒有 `upstream.hold`),`status` 說「這台的 relay 是 <版本>,不支援斷線排隊(要 0.21.0 以上),目前是舊做法」;`on`/`off`/`max` 照樣寫檔,升版後生效。
+  - 舊版沒有這個指令,不會碰到這個檔。主節點不用改,也不讀這個檔。
+- **測試**:`test/smoke-hold.mjs`(暫存 HOME、`MYNA_UPSTREAM_HOLD_FILE`,照 `scripts/murmur.mjs` 的測法):四個子指令寫出的檔案內容、`max` 的範圍檢查、沒有參數時不寫任何檔案、環境變數有設時的說明。排隊行為的測試加進 `test/smoke-edge-chat.mjs` 第 10 項:沒有檔案時排隊、上限 1 天;`off` 之後新題目照舊做法、已排隊的留著;`max 30m` 之後排了 31 分鐘的題目變 `unreachable`;環境變數 `MYNA_UPSTREAM_HOLD=off` 蓋過檔案的 `on`;讀不懂的檔案當預設;`status` 的「排著幾題、最早幾點」跟實際一致;假的舊 relay(`/health` 沒有 `upstream.hold`)時 `status` 的說明。
 
 ### 協定(組合 3)
 
@@ -378,6 +403,7 @@ edge 自己有 bot(主節點不在時的備援),主節點也支援轉送聊天:*
 - `hooks/chat-mod.mjs`:註冊回應有 `upstream:"down"` 或主節點不支援時,終端機印一行提示。其他不動。
 - `src/relay.mjs`(排隊):主節點斷線時新題目排進 `edge-state.json`、已轉出的不放棄、恢復後依序補送、`MYNA_UPSTREAM_HOLD`、`MYNA_UPSTREAM_HOLD_MAX`;`/answer` 對排隊的題回 `{kind:"pending", queued:true}`。
 - `src/mcp/ask-human.mjs`:看到 `queued:true` 時在終端機印一行(只印一次);改完 `npm run build` 更新 `dist/ask-human.mjs`。
+- `commands/hold.md`、`scripts/hold.mjs`(新):`/myna:hold`;`src/relay.mjs` 讀 `~/.myna/upstream-hold`、`/health` 的 `upstream.hold`;`README.md` 多機一節加 `/myna:hold`。
 - `test/smoke-remote*.mjs`:現有的斷線測試照舊行為,改成帶 `MYNA_UPSTREAM_HOLD=off` 跑;另加排隊的測試(測試計畫第 10 項)。
 - `scripts/machines.mjs`:列出每台的版本、標「不支援轉送聊天」。
 - `SPEC.md`(本節定稿)、`README.md`(繁中:多機一節加「聊天也會轉送」)、版本號。
