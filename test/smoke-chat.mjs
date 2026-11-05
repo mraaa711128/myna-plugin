@@ -275,6 +275,8 @@ ok(B.nick === "egret2", `a second live session asking for "egret" gets "${B.nick
   for (let i = 0; i < 20; i++) await api("/chat/progress", { event: "step", text: `第 ${i} 句 ${"話".repeat(380)}`, tools: [{ name: "Bash", input: { command: `echo ${i}` } }] }, A.token);
   await api("/chat/progress", { event: "done", text: "長回合結束" }, A.token);
   await until(() => sentIn(tA).some((s) => s.text === "長回合結束"));
+  // the progress message's last edit (its ✅ line) may land just after the answer: wait for it too (CI flake, 2026-11-05)
+  await until(() => calls.some((c) => c.method === "editMessageText" && /✅ 完成\(20 個工具\)$/.test(c.b.text || "")));
   const all = calls.filter((c) => c.method === "editMessageText" || (c.method === "sendMessage" && c.b.message_thread_id === tA && c.b.text !== "長回合結束")).map((c) => c.b); // in order
   const lastView = all.at(-1)?.text || "";
   ok(all.every((e) => e.text.length <= 3800) && sentIn(tA).filter((s) => s.text !== "長回合結束").length === 1 && /^…\(前面 \d+ 句省略\)\n💭 第 \d+ 句/.test(lastView) && /💭 第 19 句/.test(lastView) && /✅ 完成\(20 個工具\)$/.test(lastView),
