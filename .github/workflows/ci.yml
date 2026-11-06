@@ -92,6 +92,12 @@ jobs:
       - name: Smoke — /myna:hub on / off / status (temp HOME, fake bot, never :7800)
         run: node test/smoke-hub.mjs
 
+      - name: Smoke — chat through the hub + questions held while it is away (hub + edges, stubbed Telegram + tunnel)
+        run: node test/smoke-edge-chat.mjs
+
+      - name: Smoke — /myna:hold on / off / max / status (temp HOME, fake relay)
+        run: node test/smoke-hold.mjs
+
       - name: Smoke — relay daemon lifecycle (fake .env — no real bot)
         run: |
           printf 'TELEGRAM_BOT_TOKEN=fake\nTELEGRAM_CHAT_ID=1\nTELEGRAM_API_BASE=http://127.0.0.1:9\n' > "$RUNNER_TEMP/myna.env"

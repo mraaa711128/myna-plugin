@@ -132,6 +132,7 @@ export const register = (on) => {
   let timer = null;
   let ticking = false, retryAt = 0, failures = 0;
   let unavailable = "";   // why chat is not running right now (relay down / not Telegram / …)
+  let note = "";          // a line the relay sent with the registration (an edge: the hub is away, or too old to forward chat)
   let queued = 0;
   let inTurn = false;     // a main-loop turn is running
   let sent = [];          // texts we submitted (or a command's <command-name> mark) that have not started a turn yet
@@ -191,7 +192,7 @@ export const register = (on) => {
     if (!io) return;
     if (!enabled) return io.status(undefined);
     if (!token) return io.status(unavailable ? `💬 聊天未連線(${unavailable})` : undefined);
-    io.status(`💬 ${nick}${queued ? ` · ${queued} 則待處理` : ""}`);
+    io.status(`💬 ${nick}${queued ? ` · ${queued} 則待處理` : ""}${note ? ` · ${note}` : ""}`);
   }
   function backoff(why, ms) {
     unavailable = why; failures++;
@@ -214,9 +215,12 @@ export const register = (on) => {
     } catch { return backoff("relay 沒有回應"), false; }
     // an old relay (< 0.12) — SessionStart's ensure-relay is likely swapping it right now: normal retry pace
     if (r.status === 404) return backoff("relay 版本太舊"), false;
-    if (r.status === 501) return backoff("目前的 IM 不支援聊天", 300000), false;
+    // an edge without a bot of its own whose hub does not forward chat says why (r.hint)
+    if (r.status === 501) return backoff(r.hint || "目前的 IM 不支援聊天", 300000), false;
     if (r.status !== 200 || !r.token) return backoff(r.status === 401 ? "relay 密鑰不符" : `relay ${r.status}`), false;
     sid = id; token = r.token; nick = r.nick; topic = r.topic ?? null; queued = r.queued || 0;
+    // an edge: the hub is away (the topic comes once it is back), or too old to forward chat (r.note)
+    note = r.note || (r.upstream === "down" ? "主節點連不上,恢復後補上" : "");
     unavailable = ""; failures = 0; retryAt = 0;
     await remember(id, { nick });
     status();
@@ -251,6 +255,8 @@ export const register = (on) => {
       if (r.status === 401) { token = null; return; } // the relay restarted: register again next tick
       if (r.status !== 200) return backoff(`relay ${r.status}`);
       queued = r.queued || 0;
+      if (r.upstream === "down") note = "主節點連不上,恢復後補上";
+      else if (note === "主節點連不上,恢復後補上") note = "";
       // everything that piled up comes at once (an older relay hands over one); a command comes alone
       const msgs = (Array.isArray(r.messages) ? r.messages : r.message ? [r.message] : []).filter((m) => m?.text);
       if (msgs.length === 1 && PHONE_COMMAND.test(msgs[0].text.trim())) runCommand(msgs[0]).catch(() => {});

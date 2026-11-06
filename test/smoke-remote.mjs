@@ -298,7 +298,8 @@ await all401("not a machine token", "Bearer hunter2");
 const authA = { authorization: `Bearer ${aToken}` }, authB = { authorization: `Bearer ${bToken}` };
 r = await req(`${REMOTE}/health`, { headers: authA });
 ok(r.status === 200 && r.json?.protocol === 1 && r.json?.machine?.name === "mbp" && r.json.root === undefined && r.json.journal === undefined, `remote /health with mbp's token → protocol 1, machine mbp, no local paths`);
-for (const [m, p] of [["POST", "/pair/start"], ["GET", "/pair/status"], ["POST", "/shutdown"], ["POST", "/attest"], ["GET", "/requests"], ["POST", "/detach/abcdef0123"], ["POST", "/chat/register"]]) {
+// POST /chat/register|take|progress|nick|close exist there since 0.21.0 (chat through the hub, test/smoke-edge-chat.mjs); GET /chat/session does not
+for (const [m, p] of [["POST", "/pair/start"], ["GET", "/pair/status"], ["POST", "/shutdown"], ["POST", "/attest"], ["GET", "/requests"], ["POST", "/detach/abcdef0123"], ["GET", "/chat/session"]]) {
   r = await req(`${REMOTE}${p}`, { method: m, headers: authA, ...(m === "POST" ? { body: {} } : {}) });
   ok(r.status === 404, `remote ${m} ${p} with a valid token → 404 (does not exist there) (${r.status})`);
 }
@@ -329,7 +330,9 @@ ok(r.json?.cancelled === true && !!(await until(() => markupEdits.some((e) => e.
 
 // === 4. edge relays ===================================================================================
 const edgeLogs = [];
-const EDGE_TIMING = { MYNA_UPSTREAM_CHECK_MS: "300", MYNA_UPSTREAM_GRACE: "3", MYNA_UPSTREAM_RECOVER: "3", MYNA_ANSWER_HOLD_MS: "1500" };
+// MYNA_UPSTREAM_HOLD=off: these checks are 0.20.x's outage rules (the own bot / the terminal takes new questions,
+// forwarded ones are given up after the grace); 0.21.0's default — hold them for the hub — is test/smoke-edge-chat.mjs
+const EDGE_TIMING = { MYNA_UPSTREAM_CHECK_MS: "300", MYNA_UPSTREAM_GRACE: "3", MYNA_UPSTREAM_RECOVER: "3", MYNA_ANSWER_HOLD_MS: "1500", MYNA_UPSTREAM_HOLD: "off" };
 const startEdge = (port, env) => {
   const c = spawn(process.execPath, [src("src", "relay.mjs")], { env: { ...baseEnv, RELAY_PORT: String(port), ...EDGE_TIMING, ...env }, stdio: ["ignore", "ignore", "pipe"] });
   children.push(c); const out = []; edgeLogs.push([port, out]); c.stderr.on("data", (d) => out.push(String(d)));

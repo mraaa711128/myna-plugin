@@ -332,7 +332,8 @@ export function create(cfg, ctx) {
     if (!(tails.get(k) >= id)) tails.set(k, id);
   }
   const remember = (map, k, v, cap = 2000) => { map.set(k, v); if (map.size > cap) map.delete(map.keys().next().value); };
-  const chatName = (c, mark = "💬") => topicName(`${mark} ${[c.nick, c.label].filter(Boolean).join(" · ")}`);
+  // "<machine> · 💬 <nick> · <label>": the machine prefix once several machines share this bot (relay MYNA_TOPIC_MACHINE)
+  const chatName = (c, mark = "💬") => topicName(`${c.machine ? `${c.machine} · ` : ""}${mark} ${[c.nick, c.label].filter(Boolean).join(" · ")}`);
   // the session's chat place in the CURRENT chat (a re-pair leaves the old one behind)
   const chatOf = (sid) => { const c = chatTopics.get(sid); return c && c.chat === CHAT_ID && ctx.chat?.isLive(sid) ? c : null; };
   const said = (c, text) => (c.thread ? text : `[${c.nick}] ${text}`);
@@ -348,12 +349,13 @@ export function create(cfg, ctx) {
     ? `💬 ${c.nick} 已連線。在這個 topic 打字,訊息就會交給這個 session。`
     : `💬 ${c.nick}${c.label ? `(${c.label})` : ""} 已連線。訊息用 @${c.nick} 開頭,或直接回覆它的訊息,就會交給這個 session。`);
 
-  async function chatOpen(sid, { nick, label, reopened } = {}) {
+  async function chatOpen(sid, { nick, label, machine, reopened } = {}) {
     if (!CHAT_ID) return null;
     let c = chatTopics.get(sid);
     if (c && c.chat === CHAT_ID) {
       const wasClosed = c.closed;
       Object.assign(c, { nick, label }); delete c.closed;
+      if (machine) c.machine = machine; else delete c.machine;
       const name = chatName(c);
       if (c.thread && c.name !== name) {
         const res = await tg("editForumTopic", { chat_id: CHAT_ID, message_thread_id: c.thread, name });
@@ -379,7 +381,7 @@ export function create(cfg, ctx) {
         return c.thread;
       }
     }
-    c = { chat: CHAT_ID, thread: null, nick, label, created: new Date().toISOString() };
+    c = { chat: CHAT_ID, thread: null, nick, label, ...(machine ? { machine } : {}), created: new Date().toISOString() };
     c.name = chatName(c);
     if (TOPICS) c.thread = await newChatTopic(c);
     chatTopics.set(sid, c); saveChatTopics();
@@ -396,7 +398,7 @@ export function create(cfg, ctx) {
     if (c.thread && isThreadGone(res) && recreate) {
       log(`chat: topic ${c.thread} of ${c.nick} is gone — recreating`);
       chatTopics.delete(sid);
-      await chatOpen(sid, { nick: c.nick, label: c.label });
+      await chatOpen(sid, { nick: c.nick, label: c.label, machine: c.machine });
       c = chatTopics.get(sid);
       res = await tg("sendMessage", payload(), 2, { low });
     }
@@ -566,7 +568,7 @@ export function create(cfg, ctx) {
       // a chat session's topic: recreate the chat topic (never a gate topic for it)
       log(`chat topic ${s.topic} of session ${s.session_id} is gone — recreating`);
       const c = chatTopics.get(s.chatSid); chatTopics.delete(s.chatSid);
-      s.topic = (await chatOpen(s.chatSid, { nick: c?.nick, label: c?.label })) ?? undefined;
+      s.topic = (await chatOpen(s.chatSid, { nick: c?.nick, label: c?.label, machine: c?.machine })) ?? undefined;
       res = await tg("sendMessage", inTopic(s.topic, p));
       if (s.topic && isThreadGone(res)) { s.topic = undefined; res = await tg("sendMessage", p); }
     } else if (s.topic && isThreadGone(res)) {

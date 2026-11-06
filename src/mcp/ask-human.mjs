@@ -166,10 +166,13 @@ async function waitForAnswer(request_id, extra, progressToken) {
   // short-lived socket until a terminal kind. This is what makes a slow human (>5 min) safe —
   // no single socket ever approaches undici's 300s headersTimeout (the old fetch-failed cause).
   try {
+    let heldSaid = false;
     for (;;) {
       if (signal?.aborted) return { kind: "cancelled" };
       const { status, json } = await fetchRelayJson(`${RELAY}/answer/${request_id}`, { signal: AbortSignal.timeout(ANSWER_POLL_MS) }, ANSWER_POLL_TRIES, 1000);
       if (status === 404) return { kind: "unreachable", error: "relay lost the request (restarted without its journal?)" };
+      // an edge holding the question while its hub is away (SPEC §5.2): said once, then wait as usual
+      if (json?.kind === "pending" && json.queued && !heldSaid) { heldSaid = true; log(`${request_id}: 主節點連不上，這題先排著，恢復後送到手機`); }
       if (json?.kind === "pending") continue;
       return json;
     }

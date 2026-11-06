@@ -71,11 +71,12 @@ import * as discord from "./providers/discord.mjs";
 import * as slack from "./providers/slack.mjs";
 import { validateAskArgs, normalizeCommand, isApproveOption, approveOptionOf, oneLine } from "./providers/util.mjs";
 import { createChat } from "./chat.mjs";
+import { createEdgeChat } from "./edge-chat.mjs";
 import { applyNetAttemptTimeout } from "./net.mjs";
 import {
-  PROTOCOL, PROTOCOL_HEADER, ENROLL_SECRET_HEADER, REQUEST_ID_HEADER, LOCAL_ID, NAME_RE, CODE_RE, ASK_MAX_BYTES_DEFAULT,
+  PROTOCOL, PROTOCOL_HEADER, ENROLL_SECRET_HEADER, REQUEST_ID_HEADER, VERSION_HEADER, FEATURES, LOCAL_ID, NAME_RE, CODE_RE, ASK_MAX_BYTES_DEFAULT,
   roleOf, machinesFile, seenFile, machineStore, newMachineId, newMachineToken, sha256hex, sameHex, bearerOf,
-  readBody, refuseTooLarge, localRefusal, writePrivate, upstreamUrl, cfHeaders, tokenFile, botIdentity,
+  readBody, refuseTooLarge, localRefusal, writePrivate, upstreamUrl, cfHeaders, tokenFile, botIdentity, holdSettings,
 } from "./remote.mjs";
 
 const PROVIDERS = [telegram, discord, slack]; // auto-pick order when MYNA_PROVIDER is unset
@@ -106,6 +107,10 @@ const log = (...a) => console.error(`[relay ${new Date().toISOString()}]`, ...a)
 const ROLE = roleOf(cfg);
 if (ROLE !== "hub" && ROLE !== "edge") { log(`unknown MYNA_ROLE "${ROLE}" — use hub (default) | edge`); process.exit(1); }
 const EDGE = ROLE === "edge";
+// an edge holding questions while the hub is away (SPEC §5.2): /myna:hold's file, or MYNA_UPSTREAM_HOLD(_MAX)
+const hold = () => holdSettings(cfg);
+// MYNA_CHAT_FORWARD=off: this edge's chat stays on its own bot even when the hub forwards chat
+const CHAT_FORWARD = String(cfg.MYNA_CHAT_FORWARD ?? "").trim().toLowerCase() !== "off";
 const intCfg = (k, dflt, min = 0) => {
   const v = String(cfg[k] ?? "").trim(), n = Number(v);
   if (v === "") return dflt;
@@ -408,15 +413,19 @@ function edgeLink() {
     active: false,         // new questions go to the hub (after MYNA_UPSTREAM_RECOVER good checks in a row once it was away)
     everUp: false, okStreak: 0, reason: "not checked yet", since: Date.now(), downSince: Date.now(),
     version: null, protocol: null, machine: null,
-    bot: (() => { try { const s = JSON.parse(fs.readFileSync(BOT_FILE, "utf8")); return forThisHub(s) ? s.bot_id || null : null; } catch { return null; } })(),
+    bot: null,             // the hub's bot id (upstream.json; refreshed by every check)
+    features: null,        // the hub's remote features (its /health `features`): null = never heard from it
     forwarded: new Map(),  // request_id -> {at}: forwarded to the hub, answer not collected yet
     abandoned: new Set(),  // given up while the hub was away → cancelled at the hub once it is back
+    queued: new Map(),     // request_id -> {body, at, session_id, tried?}: asked while the hub was away, held for it (SPEC §5.2)
+    results: new Map(),    // request_id -> a held question's end (over the cap, refused by the hub): its client's next /answer
     CHECK_MS: intCfg("MYNA_UPSTREAM_CHECK_MS", 10000, 50),
     GRACE_MS: intCfg("MYNA_UPSTREAM_GRACE", 120, 0) * 1000,
     RECOVER: intCfg("MYNA_UPSTREAM_RECOVER", 3, 1),
-    headers: (extra = {}) => ({ authorization: `Bearer ${token()}`, [PROTOCOL_HEADER]: String(PROTOCOL), ...CF, ...extra }),
+    headers: (extra = {}) => ({ authorization: `Bearer ${token()}`, [PROTOCOL_HEADER]: String(PROTOCOL), [VERSION_HEADER]: VERSION, ...CF, ...extra }),
     onBot: null,           // set below: called when the hub's bot id is learned / changes
   };
+  try { const s = JSON.parse(fs.readFileSync(BOT_FILE, "utf8")); if (forThisHub(s)) { h.bot = s.bot_id || null; if (Array.isArray(s.features)) h.features = s.features.map(String); } } catch {}
   // forwarded / abandoned / the outage start survive a restart (an upgrade mid-outage must neither
   // cut a question's grace short nor forget to retract the buttons of one given up): edge-state.json.
   // recovering too (it had been up, and new questions do not go to it yet): a restart mid-outage or
@@ -429,11 +438,14 @@ function edgeLink() {
     else {
       for (const [id, v] of s.forwarded || []) h.forwarded.set(String(id), v);
       for (const id of s.abandoned || []) h.abandoned.add(String(id));
+      for (const [id, v] of s.queued || []) if (v && typeof v.body === "string") h.queued.set(String(id), v);
+      for (const [id, v] of s.results || []) h.results.set(String(id), v);
+      h.chatState = s.chat || [];
       if (Number.isFinite(s.down_since)) h.downSince = s.down_since;
       if (s.recovering) h.everUp = true;
       // it had been up before this start: if this start first finds the hub away, its return is a recovery
       if (s.recovering || s.ever_up) h.upBefore = true;
-      if (h.forwarded.size || h.abandoned.size) log(`edge: picked up ${h.forwarded.size} question(s) waiting on the hub and ${h.abandoned.size} to cancel there from ${STATE_FILE}`);
+      if (h.forwarded.size || h.abandoned.size || h.queued.size) log(`edge: picked up ${h.forwarded.size} question(s) waiting on the hub, ${h.queued.size} held for it and ${h.abandoned.size} to cancel there from ${STATE_FILE}`);
     }
   } catch {}
   let saveQueued = false;
@@ -441,12 +453,12 @@ function edgeLink() {
     if (saveQueued) return; saveQueued = true;
     setImmediate(() => {
       saveQueued = false;
-      try { writePrivate(STATE_FILE, JSON.stringify({ upstream: h.url, forwarded: [...h.forwarded], abandoned: [...h.abandoned], down_since: h.reachable ? null : h.downSince, recovering: h.everUp && !h.active, ever_up: h.everUp || !!h.upBefore }) + "\n"); }
+      try { writePrivate(STATE_FILE, JSON.stringify({ upstream: h.url, forwarded: [...h.forwarded], abandoned: [...h.abandoned], queued: [...h.queued], results: [...h.results], chat: h.exportChat?.() ?? h.chatState ?? [], down_since: h.reachable ? null : h.downSince, recovering: h.everUp && !h.active, ever_up: h.everUp || !!h.upBefore }) + "\n"); }
       catch (e) { log("edge: could not save", STATE_FILE, e.message); }
     });
   };
   h.markDown = (reason) => {
-    if (h.reachable) { h.downSince = Date.now(); h.save(); log(`hub unreachable: ${reason} — ${ownBot.on ? "new questions go to this machine's own bot" : "local clients fall back to this machine's terminal"} until it is back`); }
+    if (h.reachable) { h.downSince = Date.now(); h.save(); log(`hub unreachable: ${reason} — ${hold().on ? "new questions are held for it (/myna:hold)" : ownBot.on ? "new questions go to this machine's own bot" : "local clients fall back to this machine's terminal"} until it is back`); }
     else if (h.reason !== reason) log(`hub still unavailable: ${reason}`);
     Object.assign(h, { reachable: false, active: false, okStreak: 0, reason, since: Date.now() });
     if (h.upBefore) h.everUp = true; // up before a restart, away now: coming back is a recovery
@@ -467,16 +479,19 @@ function edgeLink() {
     const was = h.reachable;
     Object.assign(h, { reachable: true, reason: "", since: was ? h.since : Date.now(), version: j.version, protocol: j.protocol, machine: j.machine?.name || null });
     h.okStreak++;
-    if ((j.bot_id || null) !== h.bot) {
-      h.bot = j.bot_id || null;
-      try { writePrivate(BOT_FILE, JSON.stringify({ upstream: h.url, bot_id: h.bot, seen_at: new Date().toISOString() }) + "\n"); } catch {}
+    // features: what this hub takes beyond protocol 1 (0.21.0: "chat"); a hub without the field takes none
+    const feats = Array.isArray(j.features) ? j.features.map(String) : [];
+    if ((j.bot_id || null) !== h.bot || JSON.stringify(feats) !== JSON.stringify(h.features)) {
+      h.bot = j.bot_id || null; h.features = feats;
+      try { writePrivate(BOT_FILE, JSON.stringify({ upstream: h.url, bot_id: h.bot, features: h.features, seen_at: new Date().toISOString() }) + "\n"); } catch {}
     }
     h.onBot?.(h.bot);
     // back after an outage: new questions return to the hub only after RECOVER good checks in a row
     // (a flapping link must not bounce questions between two bots). Without a bot of its own there
     // is nothing to bounce to — forward again at once. The very first check runs before the own bot is
     // decided: count the bot as on when it will be (configured, not the hub's).
-    const fallback = ownBot.decided ? ownBot.on : !!mod && !(h.bot && ownBot.id && h.bot === ownBot.id);
+    // Holding questions (/myna:hold, the default) means no fallback for them: the hub takes them at once.
+    const fallback = !hold().on && (ownBot.decided ? ownBot.on : !!mod && !(h.bot && ownBot.id && h.bot === ownBot.id));
     if (!h.active && (!h.everUp || !fallback || h.okStreak >= h.RECOVER)) {
       h.active = true;
       log(`hub ${h.url} ${h.everUp ? "back" : "reachable"} — v${j.version}, protocol ${j.protocol}, this machine = ${h.machine}; new questions go to the hub`);
@@ -485,6 +500,8 @@ function edgeLink() {
     }
     if (!was) h.save();
     h.flush();
+    if (h.active) h.sendHeld?.();
+    h.onUp?.();
   };
   // cancel at the hub what was given up — retried on every good check until the hub confirms it: 200
   // (cancelled, or already over) or 404 (it never got the question). Anything else (401, 403, 3xx, 5xx,
@@ -502,7 +519,10 @@ function edgeLink() {
       }
     } finally { flushing = false; }
   };
-  h.inGrace = (id) => h.forwarded.has(id) && Date.now() - h.downSince < h.GRACE_MS;
+  // how long a forwarded question waits for the hub once it is away: holding (the default) → up to the
+  // hold cap; /myna:hold off → MYNA_UPSTREAM_GRACE (0.20.3's rule)
+  h.waitMs = () => { const s = hold(); return s.on ? s.max_s * 1000 : h.GRACE_MS; };
+  h.inGrace = (id) => h.forwarded.has(id) && Date.now() - h.downSince < h.waitMs();
   return h;
 }
 // this machine's own bot: on = its provider runs (questions go to it only while the hub is away)
@@ -518,7 +538,24 @@ if (EDGE) {
   if (!ownBot.on) log(`edge: ${ownBot.reason}`);
   ownBot.decided = true;
 }
-const chat = createChat({ cfg, log, dir: path.dirname(ENV_PATH) });
+// a chat session's topic carries the machine name like its questions' (MYNA_TOPIC_MACHINE); a remote session's is its machine's
+const chat = createChat({
+  cfg, log, dir: path.dirname(ENV_PATH), topicMachine: (scope) => topicMachine(scope || LOCAL_SCOPE),
+  // an edge chatting on its own bot because its hub is older than 0.21.0: the mod says so
+  registerNote: () => (EDGE && CHAT_FORWARD && hub.features && !hub.features.includes("chat") ? `${OLD_HUB_CHAT}，聊天改用這台自己的 bot` : ""),
+});
+// an edge whose hub forwards chat relays /chat/* there (src/edge-chat.mjs); its state rides in edge-state.json
+const edgeChat = EDGE ? createEdgeChat({ hub, log, secretOk: chat.secretOk, save: () => hub.save() }) : null;
+if (edgeChat) {
+  const n = edgeChat.importState(hub.chatState);
+  if (n) log(`edge: picked up ${n} chat session(s) forwarded to the hub from the last run`);
+  hub.exportChat = edgeChat.exportState;
+  hub.onUp = () => { edgeChat.onUp().catch((e) => log("edge chat: catching up failed:", e.message)); };
+}
+// where this edge's chat goes: "forwarded" (the hub's bot), "down" (the hub's, but it is away — held),
+// "own-bot" (the hub does not forward chat, or MYNA_CHAT_FORWARD=off), "unsupported" (neither)
+const chatMode = () => (CHAT_FORWARD && hub.features?.includes("chat") ? (hub.reachable ? "forwarded" : "down") : ownBot.on ? "own-bot" : "unsupported");
+const OLD_HUB_CHAT = "主節點的 Myna 版本不支援轉送聊天（要 0.21.0 以上）";
 let provider;
 if (!EDGE || ownBot.on) {
   try { provider = mod.create(cfg, { resolve: resolveFromIM, log, persist, chat: chat.ctx }); }
@@ -562,11 +599,58 @@ if (EDGE) {
 // re-sent on this machine's bot: the hub may still be up behind a broken link and take a tap on its
 // own buttons — a second copy here could be answered twice.
 function edgeGraceCheck() {
-  if (hub.reachable || !hub.forwarded.size || Date.now() - hub.downSince < hub.GRACE_MS) return;
-  log(`hub away for over ${hub.GRACE_MS / 1000}s — giving up ${hub.forwarded.size} question(s) waiting on it; they are cancelled at the hub once it is back`);
+  expireHeld();
+  if (hub.reachable || !hub.forwarded.size || Date.now() - hub.downSince < hub.waitMs()) return;
+  log(`hub away for over ${hub.waitMs() / 1000}s — giving up ${hub.forwarded.size} question(s) waiting on it; they are cancelled at the hub once it is back`);
   for (const id of hub.forwarded.keys()) hub.abandoned.add(id);
   hub.forwarded.clear(); hub.save();
 }
+// Questions held while the hub is away (SPEC §5.2; /myna:hold on, the default): the client got a request id
+// and polls it ({kind:"pending", queued:true}); nothing goes to this machine's own bot, the connection is
+// not dropped. Once the hub takes new questions again they go out oldest first, under the same request id
+// (X-Myna-Request-Id — the hub answers the same id twice with the same request), with a line saying they
+// were held. Held longer than the cap (/myna:hold max, default 1 day) → {kind:"unreachable"}; if a send
+// may have reached the hub, it is cancelled there once it is back.
+const hhmm = (t) => { const d = new Date(t); return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`; };
+function expireHeld() {
+  if (!EDGE || !hub.queued.size) return;
+  const capMs = hold().max_s * 1000;
+  for (const [id, q] of hub.queued) {
+    if (Date.now() - q.at <= capMs) continue;
+    hub.queued.delete(id);
+    hub.results.set(id, { kind: "unreachable", error: `the hub was away for over ${capMs / 1000}s — this question was held that long and given up (/myna:hold max)` });
+    if (q.tried) hub.abandoned.add(id); // a send may have reached the hub: cancel it there once it is back
+    log(`edge: question ${id} held for over ${capMs / 1000}s — given up`);
+    hub.save();
+  }
+}
+let sendingHeld = false;
+if (EDGE) hub.sendHeld = async () => {
+  if (sendingHeld || !hub.queued.size) return;
+  sendingHeld = true;
+  try {
+    expireHeld();
+    for (const [id, q] of [...hub.queued].sort((a, b) => a[1].at - b[1].at)) {
+      if (!hub.active || !hub.queued.has(id)) break;
+      let args; try { args = JSON.parse(q.body); } catch { args = null; }
+      if (!args || typeof args !== "object") { hub.queued.delete(id); hub.results.set(id, { kind: "unreachable", error: "the held question could not be read back" }); hub.save(); continue; }
+      const line = `（這題在主節點斷線時排著，${hhmm(q.at)} 問的，${hhmm(Date.now())} 送出）`;
+      args.preamble = args.preamble ? `${line}\n\n${args.preamble}` : line;
+      q.tried = true; hub.save();
+      let r;
+      try {
+        r = await fetch(`${hub.url}/ask`, { method: "POST", headers: hub.headers({ "content-type": "application/json", [REQUEST_ID_HEADER]: id }), body: JSON.stringify(args), redirect: "manual", signal: AbortSignal.timeout(30000) });
+      } catch (e) { hub.markDown(`cannot connect (${e.name === "TimeoutError" ? "timeout" : e.cause?.code || e.message})`); break; }
+      let j = null; try { j = await r.json(); } catch {}
+      if (hub.failStatus(r.status)) { hub.markDown(hub.why(r.status, j)); break; }
+      if (r.status === 429) break; // the hub's rate limit: the rest goes out with the next good check
+      hub.queued.delete(id);
+      if (r.status === 200 && j?.request_id === id) { hub.forwarded.set(id, { at: Date.now() }); log(`edge: question ${id} held since ${hhmm(q.at)} — sent to the hub`); }
+      else { hub.results.set(id, { kind: "unreachable", error: `the hub refused the held question (HTTP ${r.status}${j?.error ? `: ${j.error}` : ""})` }); log(`edge: question ${id}: the hub refused it (HTTP ${r.status})`); }
+      hub.save();
+    }
+  } finally { sendingHeld = false; }
+};
 const adopted = adopt();
 
 // --- request handlers shared by the local and the remote listener ------------------------------
@@ -758,6 +842,8 @@ function machinesRevoked(ids) {
     if (p.sending) p.sending.then(cancel); else cancel();
   }
   for (const [rid, a] of approvals) if (gone.has(a.machine_id)) approvals.delete(rid);
+  // its chat sessions end too: topics 🔒, inboxes cleared
+  for (const id of ids) chat.closeMachine(id).catch((e) => log("chat: closing a revoked machine's sessions failed:", e.message));
   for (const id of ids) log(`machine ${id} revoked — its token no longer works`);
 }
 if (machines) setInterval(() => machines.refresh(), 5000).unref();
@@ -775,7 +861,9 @@ const seen = !machines ? {} : (() => { try { return JSON.parse(fs.readFileSync(s
 let seenSavedAt = 0;
 function noteSeen(m, req) {
   const h = req.headers;
-  seen[m.id] = { last_seen_at: new Date().toISOString(), last_addr: String(h["cf-connecting-ip"] || String(h["x-forwarded-for"] || "").split(",")[0].trim() || req.socket.remoteAddress || "") };
+  // version: the edge's plugin version (0.21.0+ send it; /myna:machines marks the older ones)
+  const v = String(h[VERSION_HEADER] || "").trim().slice(0, 32);
+  seen[m.id] = { last_seen_at: new Date().toISOString(), last_addr: String(h["cf-connecting-ip"] || String(h["x-forwarded-for"] || "").split(",")[0].trim() || req.socket.remoteAddress || ""), ...(/^[0-9][\w.+-]*$/.test(v) ? { version: v } : {}) };
   if (Date.now() - seenSavedAt < 60000) return;
   seenSavedAt = Date.now();
   try { writePrivate(seenFile(cfg), JSON.stringify(seen, null, 2) + "\n"); } catch (e) { log("machines: could not save", seenFile(cfg), e.message); }
@@ -915,8 +1003,11 @@ async function handleRemote(req, res) {
     // no local paths, pids or counts of other machines here
     // bot_id: which bot this hub polls (Telegram: getMe's numeric id, the part of the token before ":")
     // — an edge with the same bot must not poll it too
-    return send(res, 200, { ok: true, name: "myna-relay", version: VERSION, protocol: PROTOCOL, role: "hub", machine: { id: m.id, name: m.name }, bot_id: botIdentity(provider.name, cfg) });
+    // features (0.21.0): what this hub takes beyond protocol 1 — "chat" when its provider has chat topics
+    return send(res, 200, { ok: true, name: "myna-relay", version: VERSION, protocol: PROTOCOL, role: "hub", machine: { id: m.id, name: m.name }, bot_id: botIdentity(provider.name, cfg), features: FEATURES.filter((f) => f !== "chat" || !!provider.chatOpen) });
   }
+  // chat through the hub (SPEC §5.2): an edge relays its sessions' /chat/* — scoped to its machine
+  if (req.method === "POST" && /^\/chat\/(register|take|progress|nick|close)$/.test(url.pathname)) { await chat.handle(req, res, url, scope); return; }
   if (req.method === "POST" && url.pathname === "/ask") return handleAsk(req, res, scope);
   const am = url.pathname.match(/^\/answer\/([a-f0-9]+)$/);
   if (req.method === "GET" && am) return handleAnswer(res, am[1], scope);
@@ -924,7 +1015,7 @@ async function handleRemote(req, res) {
   if (req.method === "POST" && cm) { const { body } = await readBody(req, SMALL_BODY_BYTES); return handleCancel(res, cm[1], scope, body); }
   if (req.method === "POST" && url.pathname === "/session/close") return handleSessionClose(req, res, scope);
   if (req.method === "POST" && url.pathname === "/session/round-end") return handleRoundEnd(req, res, scope);
-  // /pair, /shutdown, /attest, /detach, /reattach, /requests, /chat/* … do not exist here
+  // /pair, /shutdown, /attest, /detach, /reattach, /requests, GET /chat/session … do not exist here
   send(res, 404, { error: `not available on the remote port (protocol ${PROTOCOL}): ${req.method} ${url.pathname}` });
 }
 
@@ -972,19 +1063,50 @@ async function edgeAnswer(req, res, id) {
 async function edgeRoute(req, res, url) {
   const p = url.pathname, M = req.method;
   if ((M === "GET" && p === "/health") || (M === "POST" && p === "/shutdown") || p === "/attest") return false;
-  if (p.startsWith("/pair/") || p.startsWith("/chat/") || /^\/(detach|reattach)\//.test(p) || p === "/requests") {
-    if (ownBot.on) return false;   // pairing / chat / handoff of this machine's own bot
-    if (p.startsWith("/pair/")) { send(res, 400, { error: `this machine is an edge (MYNA_ROLE=edge) without a bot of its own — pairing is done on the hub` }); return true; }
+  // chat: through the hub when it forwards chat (SPEC §5.2), else this machine's own bot, else none
+  if (p.startsWith("/chat/")) {
+    const mode = chatMode();
+    if (mode === "forwarded" || mode === "down") { await edgeChat.handle(req, res, url); return true; }
+    if (mode === "own-bot") return false;
     if (M === "GET" && p === "/chat/session") { send(res, 200, { chat: false }); return true; }
+    const hint = hub.features ? `${OLD_HUB_CHAT}，聊天沒有開` : "主節點還沒連上過、這台也沒有自己的 bot，聊天沒有開";
+    send(res, 501, { error: `${p}: the hub does not forward chat (${hub.features ? `its Myna is older than 0.21.0` : "never reached"}) and this edge has no bot of its own`, hint }); return true;
+  }
+  if (p.startsWith("/pair/") || /^\/(detach|reattach)\//.test(p) || p === "/requests") {
+    if (ownBot.on) return false;   // pairing / handoff of this machine's own bot
+    if (p.startsWith("/pair/")) { send(res, 400, { error: `this machine is an edge (MYNA_ROLE=edge) without a bot of its own — pairing is done on the hub` }); return true; }
     send(res, 501, { error: `${p} is not available on an edge without a bot of its own (remote protocol ${PROTOCOL})` }); return true;
   }
   await hub.first;
   const am = p.match(/^\/answer\/([a-f0-9]+)$/), cm = p.match(/^\/cancel\/([a-f0-9]+)$/);
-  if (M === "GET" && am) { if (pending.has(am[1])) return false; await edgeAnswer(req, res, am[1]); return true; }
+  if (M === "GET" && am) {
+    const id = am[1];
+    if (pending.has(id)) return false;
+    // a held question: still waiting for the hub (pending, queued) — or how it ended
+    if (hub.results.has(id)) { const r = hub.results.get(id); hub.results.delete(id); hub.save(); send(res, 200, r); return true; }
+    if (hub.queued.has(id)) {
+      const until = Date.now() + Math.min(ANSWER_HOLD_MS, 5000);
+      while (Date.now() < until && hub.queued.has(id)) await sleepMs(250);
+      if (hub.queued.has(id)) expireHeld();
+      // it ended while we waited (over the cap, refused) — or went out to the hub: ask there
+      if (hub.results.has(id)) { const r = hub.results.get(id); hub.results.delete(id); hub.save(); send(res, 200, r); return true; }
+      if (!hub.queued.has(id)) { await edgeAnswer(req, res, id); return true; }
+      send(res, 200, { kind: "pending", queued: true }); return true;
+    }
+    await edgeAnswer(req, res, id); return true;
+  }
   if (M === "POST" && cm) {
     const id = cm[1];
     if (pending.has(id)) return false;
     await readBody(req, SMALL_BODY_BYTES);
+    // a held question the client gave up on (answered in the terminal): it never goes out — and if a send
+    // may have reached the hub, it is cancelled there once it is back
+    if (hub.queued.has(id) || hub.results.has(id)) {
+      const q = hub.queued.get(id);
+      hub.queued.delete(id); hub.results.delete(id);
+      if (q?.tried) hub.abandoned.add(id);
+      hub.save(); send(res, 200, { cancelled: !!q }); return true;
+    }
     if (hub.reachable) { const r = await edgeForward(req, `/cancel/${id}`, "{}", 10000); if (r.ok) { hub.forwarded.delete(id); hub.save(); return relayBack(res, r), true; } }
     if (hub.forwarded.has(id)) { hub.forwarded.delete(id); hub.abandoned.add(id); hub.save(); send(res, 200, { cancelled: true, queued: true }); return true; }
     dropConn(req); return true;
@@ -999,8 +1121,12 @@ async function edgeRoute(req, res, url) {
       const rid = crypto.randomBytes(5).toString("hex");
       const r = await edgeForward(req, "/ask", pre.body, 30000, { [REQUEST_ID_HEADER]: rid });
       if (r.ok) { if (r.status === 200 && r.json?.request_id) { hub.forwarded.set(String(r.json.request_id), { at: Date.now() }); hub.save(); } relayBack(res, r); return true; }
+      // the send may have reached the hub: held, it goes out again under the same id (the hub answers it
+      // with the same request); not held, it is given up and cancelled there once the hub is back
+      if (hold().on) { holdAsk(res, rid, pre.body, true); return true; }
       hub.abandoned.add(rid); hub.save();
     }
+    if (hold().on) { holdAsk(res, crypto.randomBytes(5).toString("hex"), pre.body, false); return true; }
     if (ownBot.on) { log(`hub away (${hub.reason}) — asking on this machine's own bot`); await handleAsk(req, res, LOCAL_SCOPE, pre); return true; }
     dropConn(req); return true;
   }
@@ -1015,8 +1141,24 @@ async function edgeRoute(req, res, url) {
   if (!hub.reachable && !ownBot.on) { dropConn(req); return true; } // GET / and the like: "is a relay there?"
   return false;
 }
+// a question asked while the hub is away, held for it: the client gets its id and polls it
+function holdAsk(res, id, body, tried) {
+  const { v: args, err } = jsonOf(body);
+  if (err) return send(res, 400, { error: `bad JSON: ${err.message}` });
+  const problems = validateAskArgs(args);
+  if (problems.length) { log("rejecting /ask (400):", problems.join("; ")); return send(res, 400, { error: problems.join("; ") }); }
+  hub.queued.set(id, { body, at: Date.now(), ...(args.session_id ? { session_id: String(args.session_id) } : {}), ...(tried ? { tried: true } : {}) });
+  hub.save();
+  log(`hub away (${hub.reason}) — question ${id} held for it (${hub.queued.size} held)`);
+  send(res, 200, { request_id: id, queued: true });
+}
+const holdHealth = () => {
+  const s = hold(), oldest = Math.min(...[...hub.queued.values()].map((q) => q.at));
+  return { on: s.on, max_s: s.max_s, source: s.source, ...(s.bad ? { bad: s.bad } : {}), queued: hub.queued.size, oldest_at: hub.queued.size ? new Date(oldest).toISOString() : null, waiting: hub.forwarded.size };
+};
 const edgeHealth = () => ({
-  upstream: { url: hub.url, reachable: hub.reachable, active: hub.active, reason: hub.reason || undefined, since: new Date(hub.since).toISOString(), version: hub.version, protocol: hub.protocol, machine: hub.machine, bot_id: hub.bot, cf_access: hub.cf, forwarded: hub.forwarded.size, abandoned: hub.abandoned.size },
+  upstream: { url: hub.url, reachable: hub.reachable, active: hub.active, reason: hub.reason || undefined, since: new Date(hub.since).toISOString(), version: hub.version, protocol: hub.protocol, machine: hub.machine, bot_id: hub.bot, cf_access: hub.cf, forwarded: hub.forwarded.size, abandoned: hub.abandoned.size,
+    features: hub.features, chat: chatMode(), ...(CHAT_FORWARD ? {} : { chat_forward: "off" }), ...(edgeChat ? { chat_sessions: edgeChat.count(), chat_held: edgeChat.held() } : {}), hold: holdHealth() },
   own_bot: { on: ownBot.on, id: ownBot.id, ...(ownBot.reason ? { reason: ownBot.reason } : {}) },
 });
 
@@ -1036,7 +1178,7 @@ const server = http.createServer(async (req, res) => {
     // identity + liveness for ensure-relay / `/myna:relay status`. `pending` = gates still waiting
     // for a human answer (ensure-relay will not replace a stale relay while one is open).
     let open = 0; for (const p of pending.values()) if (p.result === undefined) open++;
-    if (EDGE) open += hub.forwarded.size; // questions waiting on the hub count too
+    if (EDGE) open += hub.forwarded.size + hub.queued.size; // questions waiting on (or held for) the hub count too
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({ ok: true, name: "myna-relay", version: VERSION, provider: provider.name, pid: process.pid, root: ROOT, started_at: STARTED_AT, pending: open, detached: [...pending.values()].filter((p) => p.detached).length, handoff: true, attest: true, approval_ttl_ms: APPROVAL_TTL_MS, journal: PENDING_FILE, chat: !!provider.chatOpen, chat_sessions: chat.count(), net_attempt_ms: NET_ATTEMPT_MS,
       role: ROLE, protocol: PROTOCOL, machine: MACHINE_NAME, ...(EDGE ? edgeHealth() : {}), remote: REMOTE_PORT ? { port: REMOTE_PORT, listening: remoteListening, machines: machines.active().length, joining: [...joins.values()].filter((j) => j.status === "pending").length } : null }));

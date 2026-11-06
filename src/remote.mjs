@@ -19,6 +19,10 @@ export const PROTOCOL = 1;
 export const PROTOCOL_HEADER = "x-myna-protocol";
 export const ENROLL_SECRET_HEADER = "x-myna-enroll-secret";
 export const REQUEST_ID_HEADER = "x-myna-request-id";
+// the plugin version of the edge sending a request (0.21.0+; informational — /myna:machines lists it)
+export const VERSION_HEADER = "x-myna-version";
+// the hub's remote features (its remote /health `features`); "chat": an edge may forward /chat/* (SPEC §5.2)
+export const FEATURES = ["chat"];
 export const CF_ID_HEADER = "CF-Access-Client-Id";
 export const CF_SECRET_HEADER = "CF-Access-Client-Secret";
 
@@ -71,6 +75,43 @@ export const roleOf = (cfg) => String(cfg.MYNA_ROLE || "hub").trim().toLowerCase
 export const machinesFile = (cfg) => cfg.MYNA_MACHINES_FILE || path.join(mynaDir(cfg), "machines.json");
 export const seenFile = (cfg) => path.join(path.dirname(machinesFile(cfg)), "machines-seen.json");
 export const tokenFile = (cfg) => cfg.MYNA_MACHINE_TOKEN_FILE || path.join(mynaDir(cfg), "machine-token");
+
+// --- holding questions while the hub is away (an edge; SPEC §5.2, /myna:hold) ------------------------
+// ~/.myna/upstream-hold: line 1 "on" | "off", then optionally "max=<seconds>", last line when it was
+// changed. No file = on, max 1 day. MYNA_UPSTREAM_HOLD (on|off) and MYNA_UPSTREAM_HOLD_MAX (seconds),
+// from the environment or ~/.myna/.env, win over the file. Read whenever it is needed — no restart.
+export const HOLD_MAX_DEFAULT_S = 86400;
+export const HOLD_MAX_MIN_S = 600, HOLD_MAX_MAX_S = 7 * 86400; // what /myna:hold max accepts
+export const holdFile = (cfg) => cfg.MYNA_UPSTREAM_HOLD_FILE || path.join(mynaDir(cfg), "upstream-hold");
+// → {on?, max_s?, bad?} (bad: why the file could not be read; it then counts as the default)
+export function readHoldFile(file) {
+  let text;
+  try { text = fs.readFileSync(file, "utf8"); } catch (e) { return e.code === "ENOENT" ? {} : { bad: e.message }; }
+  const lines = text.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  const first = (lines[0] || "").toLowerCase();
+  if (first !== "on" && first !== "off") return { bad: `first line is "${lines[0] ?? ""}", not on / off` };
+  const out = { on: first === "on" };
+  for (const l of lines.slice(1)) {
+    const m = /^max=(\d+)$/.exec(l);
+    if (!m) continue;
+    const n = Number(m[1]);
+    if (n >= 60) out.max_s = n; else return { bad: `max=${m[1]} is under 60 seconds` };
+  }
+  return out;
+}
+// the setting in force → {on, max_s, source: "default" | "file" | "env", bad?, env: {hold?, max?}}
+export function holdSettings(cfg, { file = holdFile(cfg) } = {}) {
+  const f = readHoldFile(file);
+  const envHold = String(cfg.MYNA_UPSTREAM_HOLD ?? "").trim().toLowerCase();
+  const envMax = String(cfg.MYNA_UPSTREAM_HOLD_MAX ?? "").trim();
+  const env = {};
+  if (envHold === "on" || envHold === "off") env.hold = envHold;
+  if (/^\d+$/.test(envMax) && Number(envMax) >= 60) env.max = Number(envMax);
+  const on = env.hold ? env.hold === "on" : f.bad ? true : f.on ?? true;
+  const max_s = env.max ?? (f.bad ? undefined : f.max_s) ?? HOLD_MAX_DEFAULT_S;
+  const source = env.hold || env.max ? "env" : !f.bad && (f.on !== undefined || f.max_s !== undefined) ? "file" : "default";
+  return { on, max_s, source, ...(f.bad ? { bad: f.bad } : {}), env };
+}
 // Which bot a relay polls, without revealing its token: Telegram "telegram:<getMe id>" (the token's
 // part before ":"), Discord "discord:<bot user id>" (the token's first segment, base64), Slack
 // "slack:<first 16 hex of the bot token's SHA-256>" (Slack tokens carry no id). An edge compares the
