@@ -88,7 +88,7 @@ const api = async (p, body, auth) => {
   return { status: r.status, ...(await r.json().catch(() => ({}))) };
 };
 const push = (u) => updates.push({ update_id: nextUpdateId++, ...u });
-const say = (text, { thread, replyTo } = {}) => { const id = ++mid; push({ message: { message_id: id, chat: { id: 42, type: "private" }, from: { id: 7, first_name: "Alice" }, text, ...(thread ? { message_thread_id: thread } : {}), ...(replyTo ? { reply_to_message: { message_id: replyTo } } : {}) } }); return id; };
+const say = (text, { thread, replyTo, replyText } = {}) => { const id = ++mid; push({ message: { message_id: id, chat: { id: 42, type: "private" }, from: { id: 7, first_name: "Alice" }, text, ...(thread ? { message_thread_id: thread } : {}), ...(replyTo ? { reply_to_message: { message_id: replyTo, ...(replyText !== undefined ? { text: replyText } : {}) } } : {}) } }); return id; };
 const tap = (kb, row, idx) => push({ callback_query: { id: `cq${nextUpdateId}`, data: kb.reply_markup.inline_keyboard[row][idx].callback_data, message: { chat: { id: 42 } } } });
 const keyboardFor = (text) => until(() => [...of("sendMessage")].reverse().find((s) => s.reply_markup?.inline_keyboard && (s.text || "").includes(text)));
 const answerOf = async (id) => { for (;;) { const j = await (await fetch(`${RELAY}/answer/${id}`)).json(); if (j.kind !== "pending") return j; } };
@@ -130,6 +130,7 @@ ok(B.nick === "egret2", `a second live session asking for "egret" gets "${B.nick
   const takeB = await api("/chat/take", {}, B.token);
   const takeA = await api("/chat/take", {}, A.token);
   ok(takeB.message === null && takeA.message?.text === "幫我跑測試" && takeA.message?.from === "Alice", `text in A's topic → only A's inbox → ${JSON.stringify(takeA.message)}`);
+  ok(!("reply_to" in takeA.message), "…a message that replies to nothing carries no reply_to");
   const eyes = await until(() => of("setMessageReaction").find((r) => r.message_id === m1));
   ok(eyes?.reaction?.[0]?.emoji === "👀", "…taking it puts 👀 on the human's message");
   say("@egret2 看一下 log");
@@ -140,6 +141,14 @@ ok(B.nick === "egret2", `a second live session asking for "egret" gets "${B.nick
   await sleep(400);
   const tr = await api("/chat/take", {}, A.token);
   ok(tr.message?.text === "那個也順便", "a reply (in the main chat) to one of A's messages → A");
+  ok(tr.message?.reply_to?.message_id === intro._id && tr.message.reply_to.text === "", `…and take says which message it replied to → ${JSON.stringify(tr.message?.reply_to)}`);
+  // in the session's own topic, replying to a message it posted (say, a list of what it will do): the session gets
+  // that message's id and text, so it can tell which of its messages the human answered
+  say("好", { thread: tA, replyTo: intro._id, replyText: "我要做:① 開工 MT-1 (#12)" });
+  await sleep(400);
+  const tp = await api("/chat/take", {}, A.token);
+  ok(tp.message?.text === "好" && tp.message?.reply_to?.message_id === intro._id && tp.message.reply_to.text === "我要做:① 開工 MT-1 (#12)",
+    `a reply in A's topic to A's message → reply_to {message_id, text} → ${JSON.stringify(tp.message?.reply_to)}`);
   say("@nobody 哈囉");
   await sleep(300);
   ok((await api("/chat/take", {}, A.token)).message === null && (await api("/chat/take", {}, B.token)).message === null, "an unknown @nick reaches no one");
@@ -266,6 +275,8 @@ ok(B.nick === "egret2", `a second live session asking for "egret" gets "${B.nick
   for (let i = 0; i < 20; i++) await api("/chat/progress", { event: "step", text: `第 ${i} 句 ${"話".repeat(380)}`, tools: [{ name: "Bash", input: { command: `echo ${i}` } }] }, A.token);
   await api("/chat/progress", { event: "done", text: "長回合結束" }, A.token);
   await until(() => sentIn(tA).some((s) => s.text === "長回合結束"));
+  // the progress message's last edit (its ✅ line) may land just after the answer: wait for it too (CI flake, 2026-11-05)
+  await until(() => calls.some((c) => c.method === "editMessageText" && /✅ 完成\(20 個工具\)$/.test(c.b.text || "")));
   const all = calls.filter((c) => c.method === "editMessageText" || (c.method === "sendMessage" && c.b.message_thread_id === tA && c.b.text !== "長回合結束")).map((c) => c.b); // in order
   const lastView = all.at(-1)?.text || "";
   ok(all.every((e) => e.text.length <= 3800) && sentIn(tA).filter((s) => s.text !== "長回合結束").length === 1 && /^…\(前面 \d+ 句省略\)\n💭 第 \d+ 句/.test(lastView) && /💭 第 19 句/.test(lastView) && /✅ 完成\(20 個工具\)$/.test(lastView),
@@ -366,6 +377,15 @@ const takeSoon = async () => { for (let i = 0; i < 40; i++) { const t = (await a
   ok(aL.kind === "message" && aL.text === "請先說明 L0", `a reply to the ✍️ prompt answers L0/L1 → ${JSON.stringify(aL)}`);
   await fetch(`${RELAY}/cancel/${qN.request_id}`, { method: "POST" });
   await answerOf(qN.request_id);
+  // the asker took the answer another way (the human replied to the message it posted before the question): cancel
+  // with why "answered" → the phone says it was handled as replied, not "handled in the terminal"
+  const qR = await ask({ question: "照上面那則做嗎?(#7)", options: ["好,照做", "不要"], session_id: "s-a", gate: "Monday 指令" });
+  await keyboardFor("照上面那則做嗎");
+  const cr = await (await fetch(`${RELAY}/cancel/${qR.request_id}`, { method: "POST", body: JSON.stringify({ why: "answered", text: "好" }) })).json();
+  const said = await until(() => sentIn(tA).find((s) => /已照你的回覆/.test(s.text || "")));
+  ok(cr.cancelled === true && /「好」/.test(said?.text ?? "") && !sentIn(tA).some((s) => /終端機處理/.test(s.text || "") && s._id > (said?._id ?? 0)),
+    `cancel {why: answered, text} → "${said?.text}"`);
+  await answerOf(qR.request_id);
 }
 
 // 11) 429: the question waits the cooldown out and still arrives; progress holds back

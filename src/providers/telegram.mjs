@@ -544,7 +544,11 @@ export function create(cfg, ctx) {
     const nick = ctx.chat?.get(sid)?.nick || c?.nick || "session";
     if (!text) { await back(`要對 ${nick} 說什麼?在 @${nick} 後面接著打字。`); return; }
     const from = [msg.from?.first_name, msg.from?.last_name].filter(Boolean).join(" ") || msg.from?.username || "";
-    const r = ctx.chat?.deliver(sid, { text, from, chat, message_id: msg.message_id }) || { closed: true };
+    // a reply to some message (one of the session's own, most often): which one, and its text — the session can
+    // tell what the human answered (e.g. a proposal it posted), not just that they wrote
+    const to = msg.reply_to_message;
+    const reply_to = to?.message_id ? { message_id: to.message_id, text: String(to.text ?? to.caption ?? "").slice(0, 4000) } : undefined;
+    const r = ctx.chat?.deliver(sid, { text, from, chat, message_id: msg.message_id, ...(reply_to ? { reply_to } : {}) }) || { closed: true };
     if (r.closed) await back(`🔒 ${nick} 已經結束,訊息沒有送出。`);
     else if (r.stale) await back(`⚠️ ${nick} 目前沒有回應(可能卡住或已關閉),訊息先排隊,它恢復後會收到。`);
   }
@@ -923,13 +927,16 @@ export function create(cfg, ctx) {
   // Called before the relay resolves it (onResolve then drops the tokens). Best-effort.
   // why = "expired": it was handed off (detached) and no session took it over in time.
   // why = "orphaned": left open long past its asker (the relay's orphan sweep).
-  async function cancelQuestion(request_id, why) {
+  // why = "answered": the asker took the human's answer another way (note: what they wrote), e.g. a reply to the
+  // message it posted before the question.
+  async function cancelQuestion(request_id, why, note = "") {
     const q = questionMsg.get(request_id);
     questionMsg.delete(request_id);
     if (!q) return;
-    closeMsgs(request_id, q, "cancelled");
+    closeMsgs(request_id, q, why === "answered" ? "message" : "cancelled");
     await tg("editMessageReplyMarkup", { chat_id: q.chat ?? CHAT_ID, message_id: q.message_id, reply_markup: { inline_keyboard: [] } });
-    const text = why === "expired" ? "⌛ 這題交出後沒有 session 接手,已取消;手機上的按鈕已失效"
+    const text = why === "answered" ? `✅ 已照你的回覆${note ? `「${oneLine(note, 80)}」` : ""}處理,這題的按鈕已失效`
+      : why === "expired" ? "⌛ 這題交出後沒有 session 接手,已取消;手機上的按鈕已失效"
       : why === "orphaned" ? "⌛ 這題放太久、已經沒有 session 在等答案,已取消;手機上的按鈕已失效"
       : why === "join_expired" ? "⌛ 加入要求逾時沒有回應,已取消;手機上的按鈕已失效"
       : why === "revoked" ? "🚫 發問的機器已被撤銷,這題已取消;手機上的按鈕已失效"
