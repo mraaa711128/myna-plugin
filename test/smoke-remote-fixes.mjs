@@ -293,7 +293,8 @@ const runJoin = (args, env) => new Promise((resolve) => {
 }
 
 // === 5. edges ==============================================================================================
-const EDGE_TIMING = { MYNA_UPSTREAM_CHECK_MS: "250", MYNA_UPSTREAM_GRACE: "30", MYNA_ANSWER_HOLD_MS: "1500" };
+// MYNA_UPSTREAM_HOLD=off: 0.20.x's outage rules (0.21.0's holding is test/smoke-edge-chat.mjs)
+const EDGE_TIMING = { MYNA_UPSTREAM_CHECK_MS: "250", MYNA_UPSTREAM_GRACE: "30", MYNA_ANSWER_HOLD_MS: "1500", MYNA_UPSTREAM_HOLD: "off" };
 const edgeLogs = [];
 const startEdge = (port, env, nodeArgs = []) => {
   const c = spawn(process.execPath, [...nodeArgs, src("src", "relay.mjs")], { env: { ...baseEnv, RELAY_PORT: String(port), MYNA_ROLE: "edge", ...EDGE_TIMING, ...env }, stdio: ["ignore", "ignore", "pipe"] });

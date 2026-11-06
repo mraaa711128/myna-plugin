@@ -15650,10 +15650,15 @@ async function waitForAnswer(request_id, extra, progressToken) {
   if (signal?.aborted) onCancel();
   else signal?.addEventListener("abort", onCancel, { once: true });
   try {
+    let heldSaid = false;
     for (; ; ) {
       if (signal?.aborted) return { kind: "cancelled" };
       const { status, json } = await fetchRelayJson(`${RELAY}/answer/${request_id}`, { signal: AbortSignal.timeout(ANSWER_POLL_MS) }, ANSWER_POLL_TRIES, 1e3);
       if (status === 404) return { kind: "unreachable", error: "relay lost the request (restarted without its journal?)" };
+      if (json?.kind === "pending" && json.queued && !heldSaid) {
+        heldSaid = true;
+        log(`${request_id}: \u4E3B\u7BC0\u9EDE\u9023\u4E0D\u4E0A\uFF0C\u9019\u984C\u5148\u6392\u8457\uFF0C\u6062\u5FA9\u5F8C\u9001\u5230\u624B\u6A5F`);
+      }
       if (json?.kind === "pending") continue;
       return json;
     }

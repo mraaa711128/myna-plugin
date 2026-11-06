@@ -641,17 +641,29 @@ MYNA_MACHINE_NAME=win        # 選填,topic 前面的短名稱(預設 hostname)
 
 - 遠端的題目送到主節點那支 bot,topic 名稱前面加機器名:`mbp · friday-ai`(`MYNA_TOPIC_MACHINE`:`auto` 預設,有任何遠端機器登記才加;`on` 一律加;`off` 不加)。
 - 每台機器只看得到自己的題目;兩台用同一個 session id 也不會混在一起。
-- **主節點連不上時(failover)**:
-  - 遠端有自己的 bot → **新題目馬上改發到自己的 bot**。沒有 → 直接斷開連線,`ask_human` 回 `unreachable`、改在終端機問,護欄改跳權限確認。不排隊。
+- **主節點連不上時:題目先排著(v0.21.0 預設,`/myna:hold`)**:
+  - 新題目拿到 request id 後**先排著**,`ask_human` 照常等;手機和這台自己的 bot 都不會收到。主節點恢復後依序送出,題目上面多一行「(這題在主節點斷線時排著,14:32 問的,14:40 送出)」,答案照常回到終端機的 session。MCP server 的 log 會寫一行「主節點連不上,這題先排著」。
+  - 已經送到主節點、在等答案的題目**繼續等**,不再 2 分鐘就放棄;主節點那邊的答案本來就留著,恢復後照常拿回。
+  - 上限預設 1 天(`/myna:hold max 6h` 之類可以改,10 分鐘到 7 天):排超過上限還沒送出的題目才退回終端機;已送出的超過上限就放棄,主節點回來後收回手機上的按鈕。
+  - edge 在排隊中重啟(例如升版)也記得排著的題目(`~/.myna/edge-state.json`)。
+  - `/myna:hold`(不帶參數)看設定、主節點連不連得上、排著幾題、最早幾點問的。
+  - 為什麼不改到自己的 bot:斷的常常只是 tunnel,主節點恢復後所有題目還在同一支 bot、同一個 topic,不會一半在主節點、一半在備援 bot。
+- **`/myna:hold off`:0.20.x 的做法**(環境變數 `MYNA_UPSTREAM_HOLD=off` 也可以,環境變數優先於 `/myna:hold`):
+  - 遠端有自己的 bot → **新題目馬上改發到自己的 bot**。沒有 → 直接斷開連線,`ask_human` 回 `unreachable`、改在終端機問,護欄改跳權限確認。
   - 已經送到主節點、在等答案的題目撐 2 分鐘(`MYNA_UPSTREAM_GRACE`,Wi-Fi 切換之類的短暫斷線)。超過就放棄(`ask_human` 退回本機),**不會**改到自己的 bot 重發,免得同一題在兩支 bot 上都被按;主節點回來後收回它手機上的按鈕。
   - 主節點恢復後,要連續 3 次檢查都正常(`MYNA_UPSTREAM_RECOVER`,每 10 秒一次),新題目才回到主節點,避免來回跳。還在自己 bot 上等的題目留在原地答完。
   - 自己的 bot 一直在 poll(不是斷線才開始),所以斷線時馬上接得住,備援題目的答案也收得到。
-  - 主節點收到題目、回應卻在半路掉了時,題目改發自己的 bot,主節點回來後那一份會被收回(edge 自己挑 request id,知道要收哪一題),不會兩份都留著可以按。
+  - 主節點收到題目、回應卻在半路掉了時,題目改發自己的 bot,主節點回來後那一份會被收回(edge 自己挑 request id,知道要收哪一題),不會兩份都留著可以按。(排隊開著時,這種題目改用同一個 id 排著,恢復後補送,主節點認得是同一題。)
+  - 改成 `off` 時已經排著的題目留在隊裡,恢復後照樣補送。
   - 主節點把**答案**交給 edge 的回應在半路掉了時,edge 重問會拿到同一個答案(主節點交出後還留 15 分鐘,只給同一台機器;v0.20.3)。`MYNA_UPSTREAM_GRACE` 設超過 15 分鐘、而且斷線超過 15 分鐘的話,這個保證不成立。加入時帶 token 的回應掉了也一樣,重問拿到同一個 token。
   - edge 在斷線中重啟(例如升版)也記得哪些題目在等主節點、哪些要收回(`~/.myna/edge-state.json`)。
 - **核准作證(`/attest`)**:核准存在「題目被答的那個 relay」。遠端用自己的 bot 答的 ✅,在遠端本機 `/attest` 照樣有效(只算人按的、只能用一次、指令一字不差)。主節點上答的 ✅ 這一版還不會轉回遠端,所以遠端的護欄會改跳權限確認(下一版才做)。
-- 遠端自己的 bot 照舊可以聊天、配對、交接(都是它自己那支 bot 的)。透過主節點聊天是之後的版本。
-- **撤銷**:在主節點 `/myna:machines revoke mbp`,那台的 token 馬上失效,它還開著的題目會被取消(手機按鈕收回)。`/myna:machines` 列出所有機器、最後連線時間和來源。
+- **聊天也會轉送(v0.21.0)**:遠端的 session 開了聊天(`/myna:chat`)時,聊天也走主節點那支 bot——topic 開在主節點的 bot 上,名稱前面加機器名(`mbp · 💬 egret · friday-ai`),每一輪的進度、人在 topic 打的字(含回覆的是哪一則)都跟單機一樣。暱稱在所有機器之間不重複(撞名的變 `egret2`)。遠端**有自己的 bot 時也一樣走主節點**,同一支手機、同一支 bot 看得到所有 session;想讓這台的聊天留在自己的 bot,設 `MYNA_CHAT_FORWARD=off`。
+  - 主節點連不上時:聊天照常跑,topic 等恢復後才開;這段時間的進度只留每一輪最新的狀態,恢復後補上;人在斷線期間打的字留在主節點,恢復後照常拿到。chat mod 的狀態列寫「💬 <暱稱> · 主節點連不上,恢復後補上」。聊天**不會**改到自己的 bot。
+  - 主節點重啟:遠端自動重新註冊,同一個 topic。
+  - 兩邊都要 0.21.0 以上:主節點比較舊時,遠端有自己的 bot 就照舊在自己的 bot 聊天(狀態列寫「主節點的 Myna 版本不支援轉送聊天(要 0.21.0 以上),聊天改用這台自己的 bot」),沒有就不開聊天,題目照舊轉送。遠端比較舊時跟以前一樣。升版順序:先升主節點,再升遠端。
+  - 遠端自己的 bot 照舊可以配對、交接(都是它自己那支 bot 的)。
+- **撤銷**:在主節點 `/myna:machines revoke mbp`,那台的 token 馬上失效,它還開著的題目會被取消(手機按鈕收回),它的聊天 topic 改成 🔒。`/myna:machines` 列出所有機器、最後連線時間和來源,以及每台的 Myna 版本(0.21.0 以前的標「不支援轉送聊天」)。
 - 主節點每台機器每 10 分鐘最多 30 題(`MYNA_REMOTE_ASK_MAX` / `MYNA_REMOTE_ASK_WINDOW_MS`);加入要求同時最多 3 筆、每分鐘 1 筆。
 
 **本機 port 的防呆(v0.20.0)**:`127.0.0.1:7800` 不需要 credential,所以 relay 拒絕(403)不像本機程式的請求:
@@ -684,7 +696,8 @@ MYNA_MACHINE_NAME=win        # 選填,topic 前面的短名稱(預設 hostname)
 | `/myna:review` | 發一頁決策 Artifact digest |
 | `/myna:hub [status\|on [--name <名稱>]\|off]` | (主節點)`on` = 開遠端 listener(`.env` 沒有 `MYNA_REMOTE_PORT` 時寫入 7801)並重啟 relay;`off` = 關掉並重啟(`machines.json` 保留);`status`(預設)= 看 `role`、`remote`、已加入幾台機器(v0.20.1) |
 | `/myna:join <主節點網址> [--name <名稱>]` | (遠端)加入主節點:終端機顯示核對碼,手機按 ✅ 允許後這台改成 edge,題目轉到主節點(v0.20.0)。開著遠端 listener 的主節點會擋下,先 `/myna:hub off`(v0.20.2) |
-| `/myna:machines [list\|revoke <名稱>]` | (主節點)列出加入的機器 / 撤銷一台(token 馬上失效、它的題目收回)(v0.20.0) |
+| `/myna:machines [list\|revoke <名稱>]` | (主節點)列出加入的機器(含每台的 Myna 版本)/ 撤銷一台(token 馬上失效、它的題目收回、聊天 topic 改 🔒)(v0.20.0) |
+| `/myna:hold [status\|on\|off\|max <30m\|6h\|1d>]` | (遠端)主節點連不上時題目要不要先排著、恢復後送到手機(**預設開**,上限預設 1 天);不帶參數 = 看設定和排著幾題(v0.21.0) |
 
 ---
 
@@ -712,11 +725,12 @@ MYNA_MACHINE_NAME=win        # 選填,topic 前面的短名稱(預設 hostname)
 | `~/.myna/machines-seen.json` | (主節點)每台機器最後連線時間與來源(relay 自己寫,最多一分鐘一次) |
 | `~/.myna/machine-token` | (遠端)這台的 machine token(權限 0600;`/myna:join` 寫入;不放 `.env`、不寫進 log) |
 | `~/.myna/join-pending.json` | (遠端)`/myna:join` 進行中的加入要求(權限 0600;完成或失敗就刪掉。已核准但寫檔失敗時暫存 token,`join.mjs --wait` 用它完成,v0.20.2) |
-| `~/.myna/upstream.json` | (遠端)上次看到的主節點 bot id(不是 token);啟動時主節點連不上,用它判斷自己的 bot 是不是同一支 |
-| `~/.myna/edge-state.json` | (遠端)轉給主節點還沒答的題目、要在主節點取消的題目、斷線開始時間(權限 0600;relay 重啟後接著用) |
+| `~/.myna/upstream.json` | (遠端)上次看到的主節點 bot id(不是 token)和它支援的功能(`features`,v0.21.0);啟動時主節點連不上,用它判斷自己的 bot 是不是同一支、聊天要不要轉送 |
+| `~/.myna/edge-state.json` | (遠端)轉給主節點還沒答的題目、要在主節點取消的題目、斷線時排著的題目、轉送中的聊天 session(還沒給 session 的訊息、還沒送的進度)、斷線開始時間(權限 0600;relay 重啟後接著用) |
+| `~/.myna/upstream-hold` | (遠端)`/myna:hold` 的設定:第一行 `on`/`off`,可選 `max=<秒數>`;**無檔=排隊開、上限 1 天(預設)**(v0.21.0) |
 | `http://127.0.0.1:7801` | (主節點,設了 `MYNA_REMOTE_PORT` 才有)給其他機器的遠端 listener,每個請求都要 machine token,只有 SPEC §5.1 列的 endpoint |
 
-環境變數覆寫(選配):`MYNA_ENV`(改 .env 位置)、`MYNA_PROVIDER`、`MYNA_RELAY_URL`、`RELAY_PORT`、`MYNA_AUTOPILOT_FILE`、`MYNA_INTERCEPT_FILE`、`MYNA_STOPCATCH_FILE`、`MYNA_BRIEF_FILE`、`MYNA_HEARTBEAT_MS`、`MYNA_LOG_DIR`、`MYNA_ANSWER_POLL_TRIES`(relay 中斷時 `/answer` 輪詢重試次數,每秒一次,預設 8)、`MYNA_PENDING_FILE`(gate journal 位置)、`MYNA_NET_ATTEMPT_MS`(relay 連 Telegram / Discord / Slack 時每個位址的連線嘗試時間,毫秒,預設 2000;見[疑難排解](#疑難排解));交接相關(relay 端):`MYNA_DETACH_TTL`(交出後等多少秒沒人接回就取消,預設 1800)、`MYNA_ATTENDED_GRACE_MS`(最後一次輪詢後多久才算沒有程序在等,預設 15000)、`MYNA_ORPHAN_TTL`(沒人在等的未答題目放多久就當孤兒取消,秒,預設 86400 = 1 天,`0` = 不清);核准作證(relay 端):`MYNA_APPROVAL_TTL_MS`(✅ 核准多久內可以 `/attest`,毫秒,預設 900000 = 15 分鐘);topic 相關:`TELEGRAM_TOPICS`(`auto`|`off`)、`TELEGRAM_TOPIC_SCOPE`(`gate` 預設|`session`)、`TELEGRAM_TOPIC_ROUND_GRACE`(回應結束後幾秒才收 topic,預設 600)、`TELEGRAM_TOPIC_ON_END`(`delete`|`close`|`keep`)、`MYNA_TOPICS_FILE`、`MYNA_SESSION_NAME`(topic 名稱的目錄名部分)、`MYNA_TICKET`(topic 名稱的票號);聊天相關:`MYNA_CHAT`(`on`|`off`,改變 session 預設是否聊天)、`MYNA_CHAT_NICK`(指定暱稱)、`MYNA_CHAT_PROGRESS_MS`(進度訊息最快多久編輯一次,預設 3000)、`MYNA_PROGRESS_FILE`(`/myna:murmur` 的設定檔位置)、`MYNA_CHAT_STALE_MS`(session 多久沒來取訊息就提醒發訊者,預設 90000)、`MYNA_RELAY_SECRET_FILE`、`MYNA_CHAT_FILE`、`MYNA_CHAT_TOPICS_FILE`;多台機器(v0.20.0,見[多台機器共用一支 bot](#多台機器共用一支-botv0200)和 SPEC §5.1):`MYNA_ROLE`(`hub` 預設|`edge`)、`MYNA_REMOTE_PORT`、`MYNA_MACHINE_NAME`、`MYNA_TOPIC_MACHINE`(`auto`|`on`|`off`)、`MYNA_UPSTREAM`、`MYNA_MACHINE_TOKEN_FILE` / `MYNA_MACHINE_TOKEN`、`MYNA_CF_ACCESS_CLIENT_ID` / `MYNA_CF_ACCESS_CLIENT_SECRET`、`MYNA_UPSTREAM_CHECK_MS`(預設 10000)、`MYNA_UPSTREAM_GRACE`(秒,預設 120)、`MYNA_UPSTREAM_RECOVER`(主節點恢復後連續幾次檢查正常才把新題目送回去,預設 3)、`MYNA_ASK_MAX_BYTES`(預設 262144)、`MYNA_REMOTE_ASK_MAX` / `MYNA_REMOTE_ASK_WINDOW_MS`(預設 30 / 600000)、`MYNA_REMOTE_MAX_POLLS`(預設 50)、`MYNA_JOIN_TTL_MS` / `MYNA_JOIN_INTERVAL_MS` / `MYNA_JOIN_MAX_OPEN`(預設 600000 / 60000 / 3)、`MYNA_MACHINES_FILE`、`MYNA_ANSWER_REDELIVER_MS`(遠端答案交出後同一台機器還能再拿的時間,預設 900000,測試用;v0.20.3)。
+環境變數覆寫(選配):`MYNA_ENV`(改 .env 位置)、`MYNA_PROVIDER`、`MYNA_RELAY_URL`、`RELAY_PORT`、`MYNA_AUTOPILOT_FILE`、`MYNA_INTERCEPT_FILE`、`MYNA_STOPCATCH_FILE`、`MYNA_BRIEF_FILE`、`MYNA_HEARTBEAT_MS`、`MYNA_LOG_DIR`、`MYNA_ANSWER_POLL_TRIES`(relay 中斷時 `/answer` 輪詢重試次數,每秒一次,預設 8)、`MYNA_PENDING_FILE`(gate journal 位置)、`MYNA_NET_ATTEMPT_MS`(relay 連 Telegram / Discord / Slack 時每個位址的連線嘗試時間,毫秒,預設 2000;見[疑難排解](#疑難排解));交接相關(relay 端):`MYNA_DETACH_TTL`(交出後等多少秒沒人接回就取消,預設 1800)、`MYNA_ATTENDED_GRACE_MS`(最後一次輪詢後多久才算沒有程序在等,預設 15000)、`MYNA_ORPHAN_TTL`(沒人在等的未答題目放多久就當孤兒取消,秒,預設 86400 = 1 天,`0` = 不清);核准作證(relay 端):`MYNA_APPROVAL_TTL_MS`(✅ 核准多久內可以 `/attest`,毫秒,預設 900000 = 15 分鐘);topic 相關:`TELEGRAM_TOPICS`(`auto`|`off`)、`TELEGRAM_TOPIC_SCOPE`(`gate` 預設|`session`)、`TELEGRAM_TOPIC_ROUND_GRACE`(回應結束後幾秒才收 topic,預設 600)、`TELEGRAM_TOPIC_ON_END`(`delete`|`close`|`keep`)、`MYNA_TOPICS_FILE`、`MYNA_SESSION_NAME`(topic 名稱的目錄名部分)、`MYNA_TICKET`(topic 名稱的票號);聊天相關:`MYNA_CHAT`(`on`|`off`,改變 session 預設是否聊天)、`MYNA_CHAT_NICK`(指定暱稱)、`MYNA_CHAT_PROGRESS_MS`(進度訊息最快多久編輯一次,預設 3000)、`MYNA_PROGRESS_FILE`(`/myna:murmur` 的設定檔位置)、`MYNA_CHAT_STALE_MS`(session 多久沒來取訊息就提醒發訊者,預設 90000)、`MYNA_RELAY_SECRET_FILE`、`MYNA_CHAT_FILE`、`MYNA_CHAT_TOPICS_FILE`;多台機器(v0.20.0,見[多台機器共用一支 bot](#多台機器共用一支-botv0200)和 SPEC §5.1):`MYNA_ROLE`(`hub` 預設|`edge`)、`MYNA_REMOTE_PORT`、`MYNA_MACHINE_NAME`、`MYNA_TOPIC_MACHINE`(`auto`|`on`|`off`)、`MYNA_UPSTREAM`、`MYNA_MACHINE_TOKEN_FILE` / `MYNA_MACHINE_TOKEN`、`MYNA_CF_ACCESS_CLIENT_ID` / `MYNA_CF_ACCESS_CLIENT_SECRET`、`MYNA_UPSTREAM_CHECK_MS`(預設 10000)、`MYNA_UPSTREAM_GRACE`(秒,預設 120)、`MYNA_UPSTREAM_RECOVER`(主節點恢復後連續幾次檢查正常才把新題目送回去,預設 3)、`MYNA_ASK_MAX_BYTES`(預設 262144)、`MYNA_REMOTE_ASK_MAX` / `MYNA_REMOTE_ASK_WINDOW_MS`(預設 30 / 600000)、`MYNA_REMOTE_MAX_POLLS`(預設 50)、`MYNA_JOIN_TTL_MS` / `MYNA_JOIN_INTERVAL_MS` / `MYNA_JOIN_MAX_OPEN`(預設 600000 / 60000 / 3)、`MYNA_MACHINES_FILE`、`MYNA_ANSWER_REDELIVER_MS`(遠端答案交出後同一台機器還能再拿的時間,預設 900000,測試用;v0.20.3);斷線排隊和聊天轉送(v0.21.0,遠端;SPEC §5.2):`MYNA_UPSTREAM_HOLD`(`on`|`off`,優先於 `/myna:hold`)、`MYNA_UPSTREAM_HOLD_MAX`(秒,60 以上,優先於 `/myna:hold max`)、`MYNA_UPSTREAM_HOLD_FILE`(`/myna:hold` 設定檔位置)、`MYNA_CHAT_FORWARD`(`off` = 這台的聊天留在自己的 bot)。
 
 ---
 
