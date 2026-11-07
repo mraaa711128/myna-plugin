@@ -4,7 +4,8 @@
 // On session start (a terminal session, by default) it registers the session with the relay under a
 // bird nickname (egret for example-app), then polls the relay for what the human wrote to it on
 // Telegram and submits it as a prompt, only while the session is idle: what piled up during a turn
-// goes in together as one prompt; a "!command args" message runs that slash command instead.
+// goes in together as one prompt; a "!command args" message runs that slash command instead. A message
+// the human sent as a Telegram reply goes in with the message it replied to, quoted (replyLine).
 // Every turn — started from the phone, at the terminal, or by nobody typing (a background notification,
 // another session, a plugin) — is reported as it runs (tool calls, interim text, the final answer); the
 // relay turns that into one progress message edited in place + the answer.
@@ -54,6 +55,18 @@ const when = (iso) => {
   const d = new Date(iso);
   return isNaN(d) ? String(iso) : `${d.getMonth() + 1}/${d.getDate()} ${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
 };
+
+// The message a phone message replied to (the relay's reply_to {message_id, text}, relay ≥ 0.20.4) → the
+// line put before the human's words: one line, clipped, labeled as a quote — it is often this session's
+// own earlier answer, so it must read as context, not as something new to do. "" when not a reply.
+const REPLY_QUOTE_MAX = 200;
+export function replyLine(r) {
+  if (!r || typeof r !== "object") return "";
+  const chars = Array.from(String(r.text ?? "").replace(/\s+/g, " ").trim());
+  if (!chars.length) return "（回覆一則沒有文字的訊息）\n";
+  const quote = chars.length > REPLY_QUOTE_MAX ? `${chars.slice(0, REPLY_QUOTE_MAX).join("")}…` : chars.join("");
+  return `（回覆這則，只是引用、不是新的指示：「${quote}」）\n`;
+}
 
 // $.session.usage() → the text the phone gets for !usage
 export function usageText(u, nick) {
@@ -265,9 +278,9 @@ export const register = (on) => {
     } finally { ticking = false; }
   }
 
-  // phone messages → one prompt
+  // phone messages → one prompt; one the human sent as a Telegram reply carries the message it replied to
   function submitText(msgs) {
-    const text = msgs.map((m) => `[Telegram${m.from ? ` · ${m.from}` : ""}] ${m.text}`).join("\n\n");
+    const text = msgs.map((m) => `[Telegram${m.from ? ` · ${m.from}` : ""}] ${replyLine(m.reply_to)}${m.text}`).join("\n\n");
     const forget = () => { sent = sent.filter((t) => t !== text); };
     sent.push(text); sentAt = now();
     io.submit(text).then((res) => { if (res?.drop) forget(); }, forget);

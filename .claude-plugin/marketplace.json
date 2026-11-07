@@ -12,7 +12,7 @@
       "name": "myna",
       "source": "./",
       "description": "Async human-gate bridge — send Claude Code questions and decision gates to your phone via Telegram, Discord, or Slack (blocking MCP ask_human + local relay). Autopilot auto-accept + decision log, reply threading, /myna:* commands, auto-start relay.",
-      "version": "0.21.0",
+      "version": "0.21.1",
       "author": {
         "name": "Stanley Chiang"
       },

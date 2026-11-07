@@ -21,7 +21,7 @@ import { fileURLToPath } from "node:url";
 import path from "node:path";
 import os from "node:os";
 import fs from "node:fs";
-import { register, birdFor, slimInput, turnSource } from "../hooks/chat-mod.mjs";
+import { register, birdFor, slimInput, turnSource, replyLine } from "../hooks/chat-mod.mjs";
 
 const relayPath = fileURLToPath(new URL("../src/relay.mjs", import.meta.url));
 let failed = 0;
@@ -51,7 +51,8 @@ const stub = http.createServer((req, res) => {
 await new Promise((r) => stub.listen(0, "127.0.0.1", r));
 const of = (method) => calls.filter((c) => c.method === method).map((c) => c.b);
 const sentIn = (thread) => of("sendMessage").filter((b) => b.message_thread_id === thread);
-const say = (text, thread) => { const id = ++mid; updates.push({ update_id: nextUpdateId++, message: { message_id: id, chat: { id: 42, type: "private" }, from: { id: 7, first_name: "Alice" }, text, ...(thread ? { message_thread_id: thread } : {}) } }); return id; };
+// replyTo: the message the human replies to ({message_id, text?, caption?}), as Telegram nests it
+const say = (text, thread, replyTo) => { const id = ++mid; updates.push({ update_id: nextUpdateId++, message: { message_id: id, chat: { id: 42, type: "private" }, from: { id: 7, first_name: "Alice" }, text, ...(thread ? { message_thread_id: thread } : {}), ...(replyTo ? { reply_to_message: { chat: { id: 42, type: "private" }, ...replyTo } } : {}) } }); return id; };
 
 // --- real relay ----------------------------------------------------------------------------------
 const PORT = 20000 + Math.floor(Math.random() * 20000);
@@ -159,6 +160,17 @@ ok(turnSource("x", [{ kind: "scheduled-trigger" }]) === "⏰ 排程" && turnSour
   "turnSource: schedule / channel / SendMessage → their labels");
 ok(turnSource("  <\\task-notification> x") === "⚙ 背景通知" && turnSource("<teammate-message>") === "🔗 其他 session 的訊息" && turnSource("x", [{ kind: "some-new-kind" }]) === null,
   "turnSource: framing marks (also the rewritten \"<\\tag\"); an unknown kind with plain text stays typed");
+
+ok(replyLine(undefined) === "" && replyLine(null) === "", "replyLine: not a reply → nothing");
+ok(replyLine({ message_id: 1, text: "要開工 MT-1 嗎？\n\n① 好\n② 不要" }) === "（回覆這則，只是引用、不是新的指示：「要開工 MT-1 嗎？ ① 好 ② 不要」）\n",
+  "replyLine: the replied message on one line, labeled as a quote");
+ok(replyLine({ message_id: 1, text: "" }) === "（回覆一則沒有文字的訊息）\n" && replyLine({ message_id: 1 }) === "（回覆一則沒有文字的訊息）\n", "replyLine: a reply to a message with no text says so");
+{
+  const long = replyLine({ message_id: 1, text: "字".repeat(500) });
+  ok(long.includes(`「${"字".repeat(200)}…」`) && !long.includes("字".repeat(201)), "replyLine: a long message is clipped to 200 characters");
+  const emoji = replyLine({ message_id: 1, text: "😀".repeat(300) });
+  ok(!/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/.test(emoji), "replyLine: clipping never splits a character");
+}
 
 // 1) who chats by default
 {
@@ -277,11 +289,34 @@ ok(await until(() => /🔧 Bash: npm test/.test(latest(tprog) || "")) && await u
   ok(await until(() => ids.every((id) => of("setMessageReaction").some((r) => r.message_id === id))), "…each marked 👀");
   await (await runTurn(A.framed(A.S.submits.at(-1)))).done();
 
+  // a message sent as a Telegram reply: the replied message goes in first, quoted; in a batch only the
+  // replies get it; a reply to a message with no text (a photo) says so
+  const QUOTE = "（回覆這則，只是引用、不是新的指示：「我要做：① 開工 MT-1 ② 合併 #9 要照做嗎？」）\n";
+  say("好", topicA, { message_id: 555, text: "我要做：① 開工 MT-1\n② 合併 #9\n要照做嗎？" });
+  await until(() => A.S.submits.at(-1)?.endsWith("好"));
+  ok(A.S.submits.at(-1) === `[Telegram · Alice] ${QUOTE}好`, `a reply → the replied message quoted before the words: ${JSON.stringify(A.S.submits.at(-1))}`);
+  const t0 = await runTurn(A.framed(A.S.submits.at(-1)));
+  const m = A.S.submits.length;
+  say("先別做 ②", topicA, { message_id: 555, text: "我要做：① 開工 MT-1\n② 合併 #9\n要照做嗎？" });
+  say("另外一件事", topicA);
+  say("這張圖", topicA, { message_id: 556, caption: "" });
+  await sleep(600);
+  await t0.done();
+  await until(() => A.S.submits.length === m + 1);
+  ok(A.S.submits.at(-1) === `[Telegram · Alice] ${QUOTE}先別做 ②\n\n[Telegram · Alice] 另外一件事\n\n[Telegram · Alice] （回覆一則沒有文字的訊息）\n這張圖`,
+    `batched: only the replies carry a quote: ${JSON.stringify(A.S.submits.at(-1))}`);
+  await (await runTurn(A.framed(A.S.submits.at(-1)))).done();
+  // a "!command" sent as a reply still runs as the command; its args are not touched
+  const before = A.S.submits.length;
+  say("!model sonnet", topicA, { message_id: 555, text: "我要做：① 開工 MT-1" });
+  ok(await until(() => A.S.runs.at(-1) === "model sonnet") && A.S.submits.length === before, "a !command sent as a reply → runs as the command, no prompt");
+
   // a local command: runs, its output is the answer (pushed), no prompt
   calls.length = 0;
+  const submitsAt = A.S.submits.length;
   say("!compact", topicA);
   const costAns = await until(() => sentIn(topicA).find((s) => s.text === "Compacted."));
-  ok(A.S.runs.at(-1) === "compact" && costAns && !costAns.disable_notification && A.S.submits.length === n + 1, `"!compact" from the phone → ran /compact, its output back as the answer`);
+  ok(A.S.runs.at(-1) === "compact" && costAns && !costAns.disable_notification && A.S.submits.length === submitsAt, `"!compact" from the phone → ran /compact, its output back as the answer`);
 
   // !usage (and full-width ！cost): answered by the mod from $.session.usage(), the built-in never run
   const runsAt = A.S.runs.length;
