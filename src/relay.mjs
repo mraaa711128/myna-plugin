@@ -73,6 +73,7 @@ import { validateAskArgs, normalizeCommand, isApproveOption, approveOptionOf, on
 import { createChat } from "./chat.mjs";
 import { createEdgeChat } from "./edge-chat.mjs";
 import { applyNetAttemptTimeout } from "./net.mjs";
+import { LOCAL_SECRET_HEADER, localAuthOn, localExempt } from "./local-auth.mjs";
 import {
   PROTOCOL, PROTOCOL_HEADER, ENROLL_SECRET_HEADER, REQUEST_ID_HEADER, VERSION_HEADER, FEATURES, LOCAL_ID, NAME_RE, CODE_RE, ASK_MAX_BYTES_DEFAULT,
   roleOf, machinesFile, seenFile, machineStore, newMachineId, newMachineToken, sha256hex, sameHex, bearerOf,
@@ -107,6 +108,8 @@ const log = (...a) => console.error(`[relay ${new Date().toISOString()}]`, ...a)
 const ROLE = roleOf(cfg);
 if (ROLE !== "hub" && ROLE !== "edge") { log(`unknown MYNA_ROLE "${ROLE}" — use hub (default) | edge`); process.exit(1); }
 const EDGE = ROLE === "edge";
+// MYNA_LOCAL_AUTH=1: the local listener wants the relay secret (src/local-auth.mjs); off by default
+const LOCAL_AUTH = localAuthOn(cfg);
 // an edge holding questions while the hub is away (SPEC §5.2): /myna:hold's file, or MYNA_UPSTREAM_HOLD(_MAX)
 const hold = () => holdSettings(cfg);
 // MYNA_CHAT_FORWARD=off: this edge's chat stays on its own bot even when the hub forwards chat
@@ -1172,6 +1175,13 @@ const server = http.createServer(async (req, res) => {
   //     there does a tunnel run next to the relay.
   const refused = localRefusal(req, { checkOrigin: !url.pathname.startsWith("/chat/"), checkProxy: MULTI });
   if (refused) { log(`local: 403 ${req.method} ${url.pathname} — ${refused}`); return send(res, 403, { error: refused }); }
+  // MYNA_LOCAL_AUTH=1: everything but GET /health and /chat/* (their own secrets) carries the relay secret — on an
+  // edge too, before anything is forwarded to its hub
+  if (LOCAL_AUTH && !localExempt(req.method, url.pathname) && !chat.secretOk(req.headers[LOCAL_SECRET_HEADER])) {
+    log(`local: 401 ${req.method} ${url.pathname} — no relay secret (MYNA_LOCAL_AUTH is on)`);
+    req.resume();
+    return send(res, 401, { error: `local auth is on (MYNA_LOCAL_AUTH): send the relay secret (${path.join(path.dirname(ENV_PATH), "relay-secret")}) in X-Myna-Local-Secret` });
+  }
   if (EDGE && await edgeRoute(req, res, url)) return;
   if (await chat.handle(req, res, url)) return;
   if (req.method === "GET" && url.pathname === "/health") {
@@ -1181,7 +1191,7 @@ const server = http.createServer(async (req, res) => {
     if (EDGE) open += hub.forwarded.size + hub.queued.size; // questions waiting on (or held for) the hub count too
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({ ok: true, name: "myna-relay", version: VERSION, provider: provider.name, pid: process.pid, root: ROOT, started_at: STARTED_AT, pending: open, detached: [...pending.values()].filter((p) => p.detached).length, handoff: true, attest: true, approval_ttl_ms: APPROVAL_TTL_MS, journal: PENDING_FILE, chat: !!provider.chatOpen, chat_sessions: chat.count(), net_attempt_ms: NET_ATTEMPT_MS,
-      role: ROLE, protocol: PROTOCOL, machine: MACHINE_NAME, ...(EDGE ? edgeHealth() : {}), remote: REMOTE_PORT ? { port: REMOTE_PORT, listening: remoteListening, machines: machines.active().length, joining: [...joins.values()].filter((j) => j.status === "pending").length } : null }));
+      role: ROLE, protocol: PROTOCOL, machine: MACHINE_NAME, local_auth: LOCAL_AUTH, ...(EDGE ? edgeHealth() : {}), remote: REMOTE_PORT ? { port: REMOTE_PORT, listening: remoteListening, machines: machines.active().length, joining: [...joins.values()].filter((j) => j.status === "pending").length } : null }));
     return;
   }
   // pairing (Telegram): /myna:pair asks for a one-time code; the human sends `/pair <code>` from the
@@ -1297,7 +1307,7 @@ server.on("error", (e) => {
   log("server error:", e.message); process.exit(1);
 });
 server.listen(PORT, "127.0.0.1", () => {
-  log(`relay v${VERSION} http on http://127.0.0.1:${PORT}  provider=${provider.name}  root=${ROOT}  net_attempt_ms=${NET_ATTEMPT_MS ?? "(Node default)"}`);
+  log(`relay v${VERSION} http on http://127.0.0.1:${PORT}  provider=${provider.name}  root=${ROOT}  net_attempt_ms=${NET_ATTEMPT_MS ?? "(Node default)"}  local_auth=${LOCAL_AUTH ? "on" : "off"}`);
   if (adopted && (adopted.open || adopted.answered)) log(`adopted ${adopted.open} open gate(s) + ${adopted.answered} answered-uncollected (${adopted.detached} detached) from the previous relay (v${adopted.from || "?"}, journal ${adopted.saved_at}) — buttons already on the phone stay valid`);
   if (EDGE) log(`edge → hub ${hub.url} (${hub.reachable ? "reachable" : `not reachable: ${hub.reason}`}; CF Access headers ${hub.cf ? "on" : "off"}); own bot: ${ownBot.on ? `${ownBot.id || provider.name} — fallback while the hub is away` : ownBot.reason}`);
   provider.start();

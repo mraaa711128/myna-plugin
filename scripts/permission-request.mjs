@@ -18,6 +18,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { localHeaders } from "../src/local-auth.mjs"; // the relay secret on every call (MYNA_LOCAL_AUTH)
 
 // settings: process env first, then ~/.myna/.env (same precedence as the relay)
 const fileEnv = (() => {
@@ -48,7 +49,7 @@ const input = await (async () => {
 })();
 if (!input.tool_name) abstain();
 
-const post = (p, body, ms = 3000) => fetch(`${RELAY}${p}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body ?? {}), signal: AbortSignal.timeout(ms) });
+const post = (p, body, ms = 3000) => fetch(`${RELAY}${p}`, { method: "POST", headers: localHeaders({ "content-type": "application/json" }), body: JSON.stringify(body ?? {}), signal: AbortSignal.timeout(ms) });
 
 // --- stop / retract ---------------------------------------------------------------------------------
 let requestId = null, done = false;
@@ -140,7 +141,7 @@ const decide = (decision) => {
 for (;;) {
   let a;
   try {
-    const r = await fetch(`${RELAY}/answer/${requestId}`, { signal: AbortSignal.timeout(ANSWER_POLL_MS) });
+    const r = await fetch(`${RELAY}/answer/${requestId}`, { headers: localHeaders(), signal: AbortSignal.timeout(ANSWER_POLL_MS) });
     a = await r.json();
   } catch { await sleep(1000); continue; } // relay restarting: its journal keeps the question — poll again
   if (done) break;

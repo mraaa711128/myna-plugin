@@ -264,6 +264,7 @@ flowchart TD
 1. (只在多機)帶代理標頭的請求回 403:`Forwarded`、`X-Forwarded-For`、`X-Forwarded-Host`、`X-Real-Ip`、`Cf-Connecting-Ip`、`Cf-Ray`、`Tailscale-User-Login`。擋「tunnel 不小心指到 7800」。
 2. `Host` 的主機名必須是 `127.0.0.1`、`localhost` 或 `[::1]`(沒有 `Host` 的請求照舊放行),擋 DNS rebinding。
 3. 帶 `Origin` 的請求(瀏覽器)回 403;`/chat/*` 例外,因為它本來就要 relay 密鑰或 per-session token,而且 chat mod 的 `$.http.fetch` 會不會帶 `Origin` 沒有實測。
+4. (選配,`MYNA_LOCAL_AUTH=1`,預設關)上面三條之後:除了 `GET /health` 和 `/chat/*`,本機 port 的每個請求都要在 `X-Myna-Local-Secret` 帶 relay 密鑰(`~/.myna/relay-secret`,`MYNA_RELAY_SECRET_FILE`;比對用固定時間),沒帶或不對回 401,什麼都不做(`/shutdown`、`/attest`、`/pair/*` 也一樣)。edge 的本機 port 同樣先檢查再轉送。Myna 自己的 client(`ask_human` MCP、權限確認和 stop-catch hook、`stop-relay`、`ensure-relay` 換版時的 `/shutdown`、`/myna:pair`)讀得到密鑰就一律帶上(`src/local-auth.mjs` `localHeaders`),所以 relay 沒開時帶了也無妨,開了也不用改 client。`/health` 多了 `local_auth`。擋的是同一台上別的 OS 帳號、或讀不到 `~/.myna` 的沙盒／容器裡的程式;跟 AI 同一個 OS 帳號的程式照樣讀得到密鑰(下一段的極限不變)。
 
 **威脅模型重點:** 被偷的 machine token(在 Access 後面還要再偷 service token)最多能:對手機發問、讀和取消**自己那台**的題目、關掉自己那台的 session。改綁 bot、停掉 relay、管理機器、別台的題目和核准都碰不到。edge 跟 AI 用同一個 OS 帳號,AI 讀得到 machine token、換得掉 edge relay;這跟 0.19 的極限一樣,護欄仍然只是防意外的保險絲。
 

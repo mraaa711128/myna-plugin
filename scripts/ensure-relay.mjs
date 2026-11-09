@@ -28,6 +28,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { setTimeout as sleep } from "node:timers/promises";
+import { localHeaders } from "../src/local-auth.mjs"; // the relay secret (MYNA_LOCAL_AUTH)
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const envPath = process.env.MYNA_ENV || path.join(os.homedir(), ".myna", ".env");
@@ -112,7 +113,7 @@ if (running) {
   }
   const carry = running.pending > 0 && running.handoff ? ` (carrying over ${running.pending} open gate(s) via its journal)` : "";
   console.log(`myna: relay on :${port} is ${label} — replacing it with v${ourVersion}${carry}`);
-  try { await fetch(`${base}/shutdown`, { method: "POST", signal: AbortSignal.timeout(1500) }); } catch {}
+  try { await fetch(`${base}/shutdown`, { method: "POST", headers: localHeaders({}, { ...process.env, MYNA_ENV: envPath }), signal: AbortSignal.timeout(1500) }); } catch {}
   if (!(await waitDown())) {
     console.log(`myna: the old relay did not release :${port} in time — leaving it. Stop it manually (/myna:relay stop, or kill the process) and run /myna:relay start.`);
     process.exit(0);

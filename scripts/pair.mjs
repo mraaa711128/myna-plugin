@@ -4,6 +4,7 @@
 //                     `!pair <code>` from the chat to bind (private chat or group)
 //   pair.mjs status   which chat is bound now
 // The relay takes the pairing itself (it owns the bot's getUpdates), so it must be running.
+import { localHeaders } from "../src/local-auth.mjs"; // the relay secret (MYNA_LOCAL_AUTH)
 const PORT = Number(process.env.RELAY_PORT || 7800);
 const RELAY = process.env.MYNA_RELAY_URL || `http://127.0.0.1:${PORT}`;
 const status = (process.argv[2] || "").toLowerCase() === "status";
@@ -13,7 +14,7 @@ const describe = (c) => !c ? "no chat bound yet"
   : `chat ${c.id} — ${c.type === "private" ? "private chat" : c.type || "chat"}${c.title ? ` "${c.title}"` : ""}, paired ${c.paired_at}`;
 
 let res;
-try { res = await fetch(`${RELAY}${status ? "/pair/status" : "/pair/start"}`, { method: status ? "GET" : "POST", signal: AbortSignal.timeout(3000) }); }
+try { res = await fetch(`${RELAY}${status ? "/pair/status" : "/pair/start"}`, { method: status ? "GET" : "POST", headers: localHeaders(), signal: AbortSignal.timeout(3000) }); }
 catch { console.error(`relay not reachable at ${RELAY} — start it first (/myna:relay start), then run /myna:pair again`); process.exit(1); }
 const j = await res.json().catch(() => ({}));
 if (!res.ok) { console.error(j.error || `relay answered HTTP ${res.status}`); process.exit(1); }

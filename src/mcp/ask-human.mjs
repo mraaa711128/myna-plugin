@@ -18,6 +18,7 @@ import os from "node:os";
 import path from "node:path";
 import crypto from "node:crypto";
 import { validateAskArgs } from "../providers/util.mjs";
+import { localHeaders } from "../local-auth.mjs"; // the relay secret on every call (MYNA_LOCAL_AUTH)
 
 const RELAY = process.env.MYNA_RELAY_URL || "http://127.0.0.1:7800";
 const AUTOPILOT_FILE = process.env.MYNA_AUTOPILOT_FILE || path.join(os.homedir(), ".myna", "autopilot");
@@ -83,9 +84,9 @@ const askedSessions = new Set();
 // request out of this set: it is handed off, and this process's exit must not cancel it.
 const inflight = new Set();
 const requestSession = new Map(); // request_id → the session it was asked (or reattached) under
-const cancelAtRelay = (request_id) => fetch(`${RELAY}/cancel/${request_id}`, { method: "POST", signal: AbortSignal.timeout(1500) }).catch(() => {});
+const cancelAtRelay = (request_id) => fetch(`${RELAY}/cancel/${request_id}`, { method: "POST", headers: localHeaders(), signal: AbortSignal.timeout(1500) }).catch(() => {});
 const closeAtRelay = (session_id) => fetch(`${RELAY}/session/close`, {
-  method: "POST", headers: { "content-type": "application/json" },
+  method: "POST", headers: localHeaders({ "content-type": "application/json" }),
   body: JSON.stringify({ session_id }), signal: AbortSignal.timeout(1500),
 }).catch(() => {});
 // the session switched away: wrap up the old one's topics now (as its process exit would have),
@@ -105,7 +106,7 @@ async function fetchRelayJson(url, opts, tries = 2, delayMs = 0) {
   let lastErr;
   for (let i = 0; i < tries; i++) {
     try {
-      const r = await fetch(url, opts);
+      const r = await fetch(url, { ...opts, headers: localHeaders(opts?.headers ?? {}) });
       return { status: r.status, json: await r.json().catch(() => ({})) };
     } catch (e) { lastErr = e; if (delayMs && i < tries - 1) await new Promise((r) => setTimeout(r, delayMs)); }
   }
