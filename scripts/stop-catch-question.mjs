@@ -26,6 +26,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { localHeaders } from "../src/local-auth.mjs"; // the relay secret (MYNA_LOCAL_AUTH)
 
 const FLAG = process.env.MYNA_STOPCATCH_FILE || path.join(os.homedir(), ".myna", "stopcatch");
 const PORT = Number(process.env.RELAY_PORT || 7800);
@@ -85,7 +86,7 @@ const allow = async () => {
   if (input.session_id && !(input.transcript_path && backgroundPending(input.transcript_path))) {
     try {
       await fetch(`${RELAY}/session/round-end`, {
-        method: "POST", headers: { "content-type": "application/json" },
+        method: "POST", headers: localHeaders({ "content-type": "application/json" }),
         body: JSON.stringify({ session_id: input.session_id }), signal: AbortSignal.timeout(1500),
       });
     } catch {}

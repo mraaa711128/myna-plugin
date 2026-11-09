@@ -3229,8 +3229,8 @@ var require_utils = __commonJS({
       }
       return ind;
     }
-    function removeDotSegments(path2) {
-      let input = path2;
+    function removeDotSegments(path3) {
+      let input = path3;
       const output = [];
       let nextSlash = -1;
       let len = 0;
@@ -3482,8 +3482,8 @@ var require_schemes = __commonJS({
         wsComponent.secure = void 0;
       }
       if (wsComponent.resourceName) {
-        const [path2, query] = wsComponent.resourceName.split("?");
-        wsComponent.path = path2 && path2 !== "/" ? path2 : void 0;
+        const [path3, query] = wsComponent.resourceName.split("?");
+        wsComponent.path = path3 && path3 !== "/" ? path3 : void 0;
         wsComponent.query = query;
         wsComponent.resourceName = void 0;
       }
@@ -6876,12 +6876,12 @@ var require_dist = __commonJS({
         throw new Error(`Unknown format "${name}"`);
       return f;
     };
-    function addFormats(ajv, list, fs2, exportName) {
+    function addFormats(ajv, list, fs3, exportName) {
       var _a3;
       var _b;
       (_a3 = (_b = ajv.opts.code).formats) !== null && _a3 !== void 0 ? _a3 : _b.formats = (0, codegen_1._)`require("ajv-formats/dist/formats").${exportName}`;
       for (const f of list)
-        ajv.addFormat(f, fs2[f]);
+        ajv.addFormat(f, fs3[f]);
     }
     module.exports = exports = formatsPlugin;
     Object.defineProperty(exports, "__esModule", { value: true });
@@ -7129,10 +7129,10 @@ function mergeDefs(...defs) {
 function cloneDef(schema) {
   return mergeDefs(schema._zod.def);
 }
-function getElementAtPath(obj, path2) {
-  if (!path2)
+function getElementAtPath(obj, path3) {
+  if (!path3)
     return obj;
-  return path2.reduce((acc, key) => acc?.[key], obj);
+  return path3.reduce((acc, key) => acc?.[key], obj);
 }
 function promiseAllObject(promisesObj) {
   const keys = Object.keys(promisesObj);
@@ -7541,11 +7541,11 @@ function explicitlyAborted(x, startIndex = 0) {
   }
   return false;
 }
-function prefixIssues(path2, issues) {
+function prefixIssues(path3, issues) {
   return issues.map((iss) => {
     var _a3;
     (_a3 = iss).path ?? (_a3.path = []);
-    iss.path.unshift(path2);
+    iss.path.unshift(path3);
     return iss;
   });
 }
@@ -7692,16 +7692,16 @@ function flattenError(error2, mapper = (issue2) => issue2.message) {
 }
 function formatError(error2, mapper = (issue2) => issue2.message) {
   const fieldErrors = { _errors: [] };
-  const processError = (error3, path2 = []) => {
+  const processError = (error3, path3 = []) => {
     for (const issue2 of error3.issues) {
       if (issue2.code === "invalid_union" && issue2.errors.length) {
-        issue2.errors.map((issues) => processError({ issues }, [...path2, ...issue2.path]));
+        issue2.errors.map((issues) => processError({ issues }, [...path3, ...issue2.path]));
       } else if (issue2.code === "invalid_key") {
-        processError({ issues: issue2.issues }, [...path2, ...issue2.path]);
+        processError({ issues: issue2.issues }, [...path3, ...issue2.path]);
       } else if (issue2.code === "invalid_element") {
-        processError({ issues: issue2.issues }, [...path2, ...issue2.path]);
+        processError({ issues: issue2.issues }, [...path3, ...issue2.path]);
       } else {
-        const fullpath = [...path2, ...issue2.path];
+        const fullpath = [...path3, ...issue2.path];
         if (fullpath.length === 0) {
           fieldErrors._errors.push(mapper(issue2));
         } else {
@@ -15450,9 +15450,9 @@ var StdioServerTransport = class {
 };
 
 // src/mcp/ask-human.mjs
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
+import fs2 from "node:fs";
+import os2 from "node:os";
+import path2 from "node:path";
 import crypto from "node:crypto";
 
 // src/providers/util.mjs
@@ -15528,17 +15528,32 @@ function validateAskArgs(a = {}) {
   return problems;
 }
 
+// src/local-auth.mjs
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+var LOCAL_SECRET_HEADER = "x-myna-local-secret";
+var secretFile = (env = process.env) => env.MYNA_RELAY_SECRET_FILE || path.join(path.dirname(env.MYNA_ENV || path.join(os.homedir(), ".myna", ".env")), "relay-secret");
+function localHeaders(headers = {}, env = process.env) {
+  try {
+    const s = fs.readFileSync(secretFile(env), "utf8").trim();
+    if (s) return { ...headers, [LOCAL_SECRET_HEADER]: s };
+  } catch {
+  }
+  return headers;
+}
+
 // src/mcp/ask-human.mjs
 var RELAY = process.env.MYNA_RELAY_URL || "http://127.0.0.1:7800";
-var AUTOPILOT_FILE = process.env.MYNA_AUTOPILOT_FILE || path.join(os.homedir(), ".myna", "autopilot");
+var AUTOPILOT_FILE = process.env.MYNA_AUTOPILOT_FILE || path2.join(os2.homedir(), ".myna", "autopilot");
 var HEARTBEAT_MS = Number(process.env.MYNA_HEARTBEAT_MS || 15e3);
 var ANSWER_POLL_MS = Number(process.env.MYNA_ANSWER_POLL_MS || 35e3);
 var log = (...a) => console.error(`[myna ${(/* @__PURE__ */ new Date()).toISOString()}]`, ...a);
 var FALLBACK_SESSION_ID = process.env.CLAUDE_CODE_SESSION_ID || crypto.randomBytes(4).toString("hex");
-var SESSIONS_FILE = path.join(process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), ".claude"), "sessions", `${process.ppid}.json`);
+var SESSIONS_FILE = path2.join(process.env.CLAUDE_CONFIG_DIR || path2.join(os2.homedir(), ".claude"), "sessions", `${process.ppid}.json`);
 function liveSessionId() {
   try {
-    const s = JSON.parse(fs.readFileSync(SESSIONS_FILE, "utf8"));
+    const s = JSON.parse(fs2.readFileSync(SESSIONS_FILE, "utf8"));
     if (s?.pid === process.ppid && typeof s.sessionId === "string" && s.sessionId) return s.sessionId;
   } catch {
   }
@@ -15556,7 +15571,7 @@ function sessionId() {
 }
 var SESSION_BASE = process.env.MYNA_SESSION_NAME || (() => {
   const d = /* @__PURE__ */ new Date(), two = (n) => String(n).padStart(2, "0");
-  return `${path.basename(process.cwd()) || "session"} ${two(d.getMonth() + 1)}/${two(d.getDate())} ${two(d.getHours())}:${two(d.getMinutes())}`;
+  return `${path2.basename(process.cwd()) || "session"} ${two(d.getMonth() + 1)}/${two(d.getDate())} ${two(d.getHours())}:${two(d.getMinutes())}`;
 })();
 var TICKET_RE = /\b[A-Z][A-Z0-9]+-\d+\b/;
 var ticketIn = (s) => typeof s === "string" && s.match(TICKET_RE)?.[0] || "";
@@ -15566,11 +15581,11 @@ var currentTicket = (args) => ticketIn(String(args.ticket || "").toUpperCase()) 
 var askedSessions = /* @__PURE__ */ new Set();
 var inflight = /* @__PURE__ */ new Set();
 var requestSession = /* @__PURE__ */ new Map();
-var cancelAtRelay = (request_id) => fetch(`${RELAY}/cancel/${request_id}`, { method: "POST", signal: AbortSignal.timeout(1500) }).catch(() => {
+var cancelAtRelay = (request_id) => fetch(`${RELAY}/cancel/${request_id}`, { method: "POST", headers: localHeaders(), signal: AbortSignal.timeout(1500) }).catch(() => {
 });
 var closeAtRelay = (session_id) => fetch(`${RELAY}/session/close`, {
   method: "POST",
-  headers: { "content-type": "application/json" },
+  headers: localHeaders({ "content-type": "application/json" }),
   body: JSON.stringify({ session_id }),
   signal: AbortSignal.timeout(1500)
 }).catch(() => {
@@ -15584,7 +15599,7 @@ async function fetchRelayJson(url, opts, tries = 2, delayMs = 0) {
   let lastErr;
   for (let i = 0; i < tries; i++) {
     try {
-      const r = await fetch(url, opts);
+      const r = await fetch(url, { ...opts, headers: localHeaders(opts?.headers ?? {}) });
       return { status: r.status, json: await r.json().catch(() => ({})) };
     } catch (e) {
       lastErr = e;
@@ -15596,7 +15611,7 @@ async function fetchRelayJson(url, opts, tries = 2, delayMs = 0) {
 var ANSWER_POLL_TRIES = Number(process.env.MYNA_ANSWER_POLL_TRIES || 8);
 var autopilotOn = () => {
   try {
-    return fs.existsSync(AUTOPILOT_FILE);
+    return fs2.existsSync(AUTOPILOT_FILE);
   } catch {
     return false;
   }
@@ -15609,11 +15624,11 @@ function recommendedIdx(args) {
 function logDecision(rec, logDir) {
   try {
     const base = logDir || process.env.MYNA_LOG_DIR || process.cwd();
-    fs.appendFileSync(path.join(base, "MYNA-DECISIONS.jsonl"), JSON.stringify(rec) + "\n");
-    const md = path.join(base, "MYNA-DECISIONS.md");
-    if (!fs.existsSync(md)) fs.writeFileSync(md, "# Myna decisions\n\n| time | mode | header | question | chosen |\n|---|---|---|---|---|\n");
+    fs2.appendFileSync(path2.join(base, "MYNA-DECISIONS.jsonl"), JSON.stringify(rec) + "\n");
+    const md = path2.join(base, "MYNA-DECISIONS.md");
+    if (!fs2.existsSync(md)) fs2.writeFileSync(md, "# Myna decisions\n\n| time | mode | header | question | chosen |\n|---|---|---|---|---|\n");
     const cell = (s) => String(s ?? "").replace(/\|/g, "\\|").replace(/\r?\n/g, " ");
-    fs.appendFileSync(md, `| ${rec.ts} | ${rec.mode} | ${cell(rec.header)} | ${cell(rec.question)} | ${cell(JSON.stringify(rec.chosen))} |
+    fs2.appendFileSync(md, `| ${rec.ts} | ${rec.mode} | ${cell(rec.header)} | ${cell(rec.question)} | ${cell(JSON.stringify(rec.chosen))} |
 `);
   } catch (e) {
     log("logDecision failed:", e.message);
@@ -15720,7 +15735,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req, extra) => {
   if (req.params.name !== "ask_human") throw new Error(`unknown tool: ${req.params.name}`);
   const args = req.params.arguments || {};
   const ts = (/* @__PURE__ */ new Date()).toISOString();
-  const machine = os.hostname();
+  const machine = os2.hostname();
   const problems = validateAskArgs(args);
   if (problems.length) {
     log(`rejecting ask_human call: ${problems.join("; ")}`);
@@ -15818,7 +15833,7 @@ async function awaitHuman(args, req, extra) {
     const result = await waitForAnswer(id, extra, req.params?._meta?.progressToken);
     const answered_at = (/* @__PURE__ */ new Date()).toISOString();
     if (result.kind === "selection") {
-      logDecision({ ts, answered_at, machine: os.hostname(), mode: "human", ...info.gate ? { gate: info.gate } : {}, header: info.header, question: info.question, options: info.options, chosen: result.value, ...info.approves !== void 0 ? { approves: info.approves } : {}, reattached: id }, args.logDir);
+      logDecision({ ts, answered_at, machine: os2.hostname(), mode: "human", ...info.gate ? { gate: info.gate } : {}, header: info.header, question: info.question, options: info.options, chosen: result.value, ...info.approves !== void 0 ? { approves: info.approves } : {}, reattached: id }, args.logDir);
     }
     return textResult({ ...result, request_id: id });
   } catch (e) {
