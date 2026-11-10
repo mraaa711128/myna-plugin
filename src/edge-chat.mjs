@@ -22,7 +22,8 @@
 //   an edge restart: the sessions, their unread messages and unsent progress are in edge-state.json
 //     (local tokens are not — the mod gets a 401 and registers again, as after any relay restart)
 import crypto from "node:crypto";
-import { CHAT_TOKEN_HEADER, takeBatch, takeView, normNick } from "./chat.mjs";
+import { CHAT_TOKEN_HEADER, takeBatch, takeLocal, normNick } from "./chat.mjs";
+import * as inbox from "./inbox.mjs";
 
 const MAX_BODY = 256 * 1024;
 const POST_GAP_MS = 220;            // between two progress posts of one session: under the hub's 5 a second
@@ -30,10 +31,12 @@ const MERGE_BACKLOG = 8;            // more queued progress than this → consec
 const DOWN_SESSIONS = 50, DOWN_BYTES = 32 * 1024; // what is kept while the hub is away
 const TAKE_WAIT_MS = 20000;         // the long-poll for the human's words
 const LOCAL_IDLE_MS = 90000;        // a mod silent this long: stop pulling its messages (the hub may say it is unresponsive)
+const FILE_TRIES = 3;               // a file the hub keeps handing out wrong (5xx, wrong size / sha256): given up after this many
 
 // hub: the edge's hub link (src/relay.mjs edgeLink): {url, reachable, headers(), markDown(), why(), failStatus()}
 // secretOk(token): the relay secret check; save(): persist edge-state.json (it calls exportState)
-export function createEdgeChat({ hub, log, secretOk, save }) {
+// dir: this machine's relay dir (its inbox/ keeps the files the hub's sessions were sent, SPEC §5.3)
+export function createEdgeChat({ hub, log, secretOk, save, dir, cfg = {} }) {
   // sid -> {nick, label, cwd, topic, inbox, queue, closing?, ever?: registered at the hub once,
   //         remote?: hub token, registered?, pumping?, sending?, lastLocal, hubQueued}
   const sessions = new Map();
@@ -82,19 +85,80 @@ export function createEdgeChat({ hub, log, secretOk, save }) {
     s.pumping = true;
     try {
       while (sessions.get(sid) === s && !s.closing && s.registered && !down() && Date.now() - s.lastLocal < LOCAL_IDLE_MS) {
-        const r = await hubCall("/chat/take", { max: 50, wait_ms: TAKE_WAIT_MS, ack: s.ack || [] }, s.remote, TAKE_WAIT_MS + 15000);
+        // files: true — this edge fetches the files itself (an older hub ignores it)
+        const r = await hubCall("/chat/take", { max: 50, wait_ms: TAKE_WAIT_MS, ack: s.ack || [], files: true }, s.remote, TAKE_WAIT_MS + 15000);
         if (!r.ok) break;
         if (r.reregister) { s.registered = false; if (!(await register(sid))) break; continue; }
         if (r.status !== 200) { log(`edge chat: take for ${sid} → HTTP ${r.status}`); break; }
         const got = Array.isArray(r.json?.messages) ? r.json.messages : [];
         s.hubQueued = r.json?.queued || 0;
-        s.ack = got.map((m) => m.id);
-        const fresh = got.filter((m) => !s.seen.includes(m.id));
-        s.seen = [...s.seen, ...fresh.map((m) => m.id)].slice(-200);
-        if (fresh.length) s.inbox.push(...fresh);
+        // in order; a message with a file counts as taken once its file is here (or given up on). The first
+        // that is not stops the batch: only what came before it is acked, the hub hands the rest out again
+        const done = [];
+        let stalled = false;
+        for (const one of got) {
+          let m = one;
+          if (!s.seen.includes(m.id)) {
+            if (m.file) {
+              const f = await fetchFile(sid, s, m);
+              if (f === "retry") { stalled = true; break; }
+              m = { ...m, file: { ...m.file, path: f } }; // null: given up — the session is told it is unavailable
+            }
+            s.inbox.push(m);
+            s.seen = [...s.seen, m.id].slice(-200);
+          }
+          done.push(m.id);
+        }
+        s.ack = done;
         if (got.length) changed();
+        if (stalled) break; // tried again from the mod's next take (every few seconds), not in a tight loop
       }
     } finally { s.pumping = false; }
+  }
+
+  // one file of a hub message -> its local path, null (given up: gone at the hub, or wrong FILE_TRIES times),
+  // or "retry" (the hub is away or refused the link, or the session must register again — not counted)
+  async function fetchFile(sid, s, m) {
+    const f = m.file;
+    if (!inbox.FID_RE.test(String(f?.fid))) return null;
+    s.fileFails = s.fileFails || {};
+    const strike = (why) => {
+      const n = (s.fileFails[f.fid] || 0) + 1;
+      s.fileFails[f.fid] = n; changed();
+      log(`edge chat: file ${f.fid} for ${sid} — ${why} (${n}/${FILE_TRIES})`);
+      if (n < FILE_TRIES) return "retry";
+      delete s.fileFails[f.fid];
+      return null;
+    };
+    const drop = (r) => r.body?.cancel().catch(() => {});
+    let r;
+    try {
+      r = await fetch(`${hub.url}/chat/file/${f.fid}`, {
+        method: "GET", redirect: "manual", signal: AbortSignal.timeout(Number(cfg.MYNA_FILE_TIMEOUT_MS || 120000)),
+        headers: hub.headers({ [CHAT_TOKEN_HEADER]: s.remote || "" }),
+      });
+    } catch (e) { hub.markDown(`cannot connect (${e.name === "TimeoutError" ? "timeout" : e.cause?.code || e.message})`); return "retry"; }
+    if (r.status === 404) { await drop(r); log(`edge chat: file ${f.fid} for ${sid} is gone at the hub`); return null; }
+    if (r.status === 401) {
+      const j = await r.json().catch(() => null);
+      if (j?.reregister) { s.registered = false; return "retry"; }
+      hub.markDown(hub.why(401, j)); return "retry";
+    }
+    if (r.status >= 500) { await drop(r); return strike(`HTTP ${r.status}`); }
+    if (hub.failStatus(r.status)) { const j = await r.json().catch(() => null); hub.markDown(hub.why(r.status, j)); return "retry"; }
+    if (r.status !== 200 || !r.body) { await drop(r); return strike(`HTTP ${r.status}`); }
+    const cl = r.headers.get("content-length"), len = Number(cl);
+    if (cl && (len > inbox.MAX_FILE_BYTES || (Number.isFinite(f.size) && len !== f.size))) { await drop(r); return strike("wrong size"); }
+    try {
+      try { inbox.prune(dir, inbox.readKeep(inbox.keepFile(dir, cfg)).days, log); } catch {}
+      const saved = await inbox.save({ dir, sid, name: inbox.fileName({ fid: f.fid, original: f.name, mime: f.mime, at: m.at }), body: r.body, sha256: f.sha256, size: Number.isFinite(f.size) ? f.size : undefined });
+      if (s.fileFails[f.fid]) { delete s.fileFails[f.fid]; changed(); }
+      return saved.path;
+    } catch (e) {
+      if (e?.code === "too_big" || e?.code === "mismatch" || e?.code === "write") return strike(e.code);
+      hub.markDown(`file download cut (${e?.name === "TimeoutError" ? "timeout" : e?.message || e})`);
+      return "retry";
+    }
   }
 
   // progress: what piles up while the hub is away is cut to the turn's latest state
@@ -213,7 +277,7 @@ export function createEdgeChat({ hub, log, secretOk, save }) {
       const max = Math.max(1, Math.min(50, Number(body.max) || 1));
       const out = takeBatch(s.inbox, max);
       if (out.length) changed();
-      return reply(res, 200, { message: out[0] ? takeView(out[0]) : null, messages: out.map(takeView), queued: s.inbox.length + (s.hubQueued || 0), ...extra });
+      return reply(res, 200, { message: out[0] ? takeLocal(out[0]) : null, messages: out.map(takeLocal), queued: s.inbox.length + (s.hubQueued || 0), ...extra });
     }
     if (p === "/chat/progress") {
       if (!["start", "step", "done"].includes(body.event)) return reply(res, 400, { error: "event must be start | step | done" });
@@ -247,11 +311,11 @@ export function createEdgeChat({ hub, log, secretOk, save }) {
     count: () => [...sessions.values()].filter((s) => !s.closing).length,
     held: () => [...sessions.values()].reduce((n, s) => n + s.queue.length, 0),
     // edge-state.json: sessions, unread messages and unsent progress (no tokens)
-    exportState: () => [...sessions].map(([sid, s]) => [sid, { nick: s.nick, label: s.label, cwd: s.cwd, topic: s.topic ?? null, inbox: s.inbox, queue: s.queue, seen: s.seen, ack: s.ack || [], ...(s.closing ? { closing: true } : {}), ...(s.ever ? { ever: true } : {}) }]),
+    exportState: () => [...sessions].map(([sid, s]) => [sid, { nick: s.nick, label: s.label, cwd: s.cwd, topic: s.topic ?? null, inbox: s.inbox, queue: s.queue, seen: s.seen, ack: s.ack || [], ...(s.fileFails && Object.keys(s.fileFails).length ? { fileFails: s.fileFails } : {}), ...(s.closing ? { closing: true } : {}), ...(s.ever ? { ever: true } : {}) }]),
     importState(list) {
       for (const [sid, v] of Array.isArray(list) ? list : []) {
         const list = (x) => (Array.isArray(x) ? x : []);
-        sessions.set(String(sid), { nick: v.nick, label: v.label, cwd: v.cwd, topic: v.topic ?? null, inbox: list(v.inbox), queue: list(v.queue), seen: list(v.seen), ack: list(v.ack), ...(v.closing ? { closing: true } : {}), ...(v.ever ? { ever: true } : {}), lastLocal: Date.now() });
+        sessions.set(String(sid), { nick: v.nick, label: v.label, cwd: v.cwd, topic: v.topic ?? null, inbox: list(v.inbox), queue: list(v.queue), seen: list(v.seen), ack: list(v.ack), ...(v.fileFails && typeof v.fileFails === "object" ? { fileFails: v.fileFails } : {}), ...(v.closing ? { closing: true } : {}), ...(v.ever ? { ever: true } : {}), lastLocal: Date.now() });
       }
       return sessions.size;
     },

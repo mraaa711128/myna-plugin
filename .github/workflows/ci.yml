@@ -29,6 +29,12 @@ jobs:
             exit 1
           fi
 
+      - name: Smoke — files sent from the phone to a chat session (one machine)
+        run: node test/smoke-files.mjs
+
+      - name: Smoke — files for a chat session on another machine (hub → edge)
+        run: node test/smoke-edge-files.mjs
+
       - name: Smoke — src (autopilot + fallback)
         run: node test/smoke-autopilot.mjs
 

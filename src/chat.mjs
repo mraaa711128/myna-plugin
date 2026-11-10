@@ -24,6 +24,10 @@
 //   POST /chat/nick      Authorization: Bearer <token>  {nick} → {nick}
 //   POST /chat/close     Authorization: Bearer <token>  → the session ended; its topic is kept, marked 🔒
 //   GET  /chat/session?session_id=<sid> → {chat, nick?}  (no auth: the Stop hook asks whether a session chats)
+// Files from the phone (SPEC §5.3): an inbox message may carry file {fid, name, mime, size, sha256, path}. The
+// local take puts the file's local path at the front of its text (+ file_path, for the mod's tool.check); the
+// remote take, asked with files: true, gives the description without the path, and another machine's relay
+// fetches its own copy with GET /chat/file/<fid> (remote port only: machine token + X-Myna-Chat-Token).
 // A per-session token scopes everything after registering: one session never reads another's inbox.
 // Nicknames are unique among live sessions (a taken one gets a number: egret → egret2).
 // Another machine's edge relay (SPEC §5.2) reaches the same endpoints on the hub's remote port: its
@@ -33,6 +37,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
+import { fileText, FID_RE } from "./inbox.mjs";
 
 const NICK_MAX = 24;
 // "!name args" (or full-width "！name") — a command typed on the phone (run as a command in the session,
@@ -57,6 +62,22 @@ export function takeBatch(inbox, max) {
   return out;
 }
 export const takeView = (m) => ({ id: m.id, text: m.text, from: m.from, at: m.at, ...(m.reply_to ? { reply_to: m.reply_to } : {}) });
+// what a local chat mod gets (SPEC §5.3): a message with a file has the file's local path at the front of
+// its text, and file_path (the mod lets the session Read exactly that file without a prompt)
+export const takeLocal = (m) => {
+  if (!m.file) return takeView(m);
+  const { text, path: p } = fileText(m);
+  return { ...takeView(m), text, ...(p ? { file_path: p } : {}) };
+};
+export const OLD_EDGE_FILE = "📎 有附檔沒有送到:這台機器的 Myna 要升級到 0.22.0 以上。";
+// what another machine's relay gets: the file's description without its path here (it fetches its own copy,
+// GET /chat/file/<fid>) — or, for a relay too old to fetch, a line saying the file did not come
+const takeRemote = (m, files) => {
+  if (!m.file) return takeView(m);
+  if (!files) return { ...takeView(m), text: `${OLD_EDGE_FILE}${m.text ? `\n${m.text}` : ""}` };
+  const { fid, name, mime, size, sha256 } = m.file;
+  return { ...takeView(m), file: { fid, name, mime, size, sha256 } };
+};
 
 // topicMachine(scope): the machine-name prefix of a session's topic ("" = none; see MYNA_TOPIC_MACHINE)
 // progressPerSec: progress posts per second one remote session may make (more → 429)
@@ -160,6 +181,24 @@ export function createChat({ cfg, log, dir, topicMachine = () => "", progressPer
       reply(200, { chat: live(sid), ...(s ? { nick: s.nick } : {}) });
       return true;
     }
+    // another machine's relay fetches a file of one of its sessions (SPEC §5.3): its machine token was
+    // checked by the remote listener; the session's chat token says which session; a file that is not
+    // that session's — or is gone — is a 404 either way
+    const fm = remote && req.method === "GET" ? /^\/chat\/file\/([^/]+)$/.exec(url.pathname) : null;
+    if (fm) {
+      const sid = tokens.get(String(req.headers[CHAT_TOKEN_HEADER] || ""));
+      const s = sid && sessions.get(sid);
+      if (!s || s.closed || s.machine_id !== scope.id) { reply(401, { error: "unknown or expired token — register again", reregister: true }); return true; }
+      lastSeen.set(sid, Date.now());
+      const fid = fm[1];
+      const m = FID_RE.test(fid) ? [...(s.unacked || []), ...s.inbox].find((x) => x.file?.fid === fid) : null;
+      let st = null;
+      try { st = m?.file?.path ? fs.lstatSync(m.file.path) : null; } catch {}
+      if (!st || !st.isFile() || st.isSymbolicLink()) { reply(404, { error: "file unavailable" }); return true; }
+      res.writeHead(200, { "content-type": "application/octet-stream", "content-length": String(st.size) });
+      fs.createReadStream(m.file.path).on("error", () => res.destroy()).pipe(res);
+      return true;
+    }
     if (req.method !== "POST") { reply(405, { error: "POST only" }); return true; }
     // whole buffers, decoded once: a multi-byte character split across chunks must not turn into U+FFFD
     const chunks = []; let size = 0;
@@ -231,7 +270,8 @@ export function createChat({ cfg, log, dir, topicMachine = () => "", progressPer
       if (remote && !again) s.unacked = out;
       if (out.length && !again) save();
       if (!again) for (const m of out) Promise.resolve(provider.chatTaken?.(sid, m)).catch((e) => log("chatTaken err", e.message));
-      reply(200, { message: out[0] ? takeView(out[0]) : null, messages: out.map(takeView), queued: s.inbox.length });
+      const view = remote ? (m) => takeRemote(m, body.files === true) : takeLocal;
+      reply(200, { message: out[0] ? view(out[0]) : null, messages: out.map(view), queued: s.inbox.length });
       return true;
     }
     if (url.pathname === "/chat/progress") {
