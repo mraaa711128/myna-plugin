@@ -4,14 +4,15 @@
 // and Telegram getMe (+ getChat / getChatMember for a group). The data comes from src/status.mjs collect();
 // this only lays it out. Credentials are never printed (and the whole output goes through a redactor).
 import os from "node:os";
+import path from "node:path";
 import { loadEnv } from "../src/remote.mjs";
-import { collect, makeRedactor, readEnvFile } from "../src/status.mjs";
+import { collect, makeRedactor, readEnvFile, tildePath as p } from "../src/status.mjs";
 
-const cfg = loadEnv();
-const d = await collect(cfg);
-
-const HOME = os.homedir();
-const p = (f) => { if (!f) return "?"; let s = String(f); if (HOME && s.toLowerCase().startsWith(HOME.toLowerCase())) s = `~${s.slice(HOME.length)}`; return s.replace(/\\/g, "/"); };
+// a .env that exists but cannot be read must not stop the page: carry on with the environment alone
+let cfg, envError;
+try { cfg = loadEnv(); }
+catch (e) { envError = e.code || e.name; cfg = { ...process.env, MYNA_ENV: process.env.MYNA_ENV || path.join(os.homedir(), ".myna", ".env") }; }
+const d = await collect(cfg, { envError });
 const pad = (n) => String(n).padStart(2, "0");
 const when = (iso) => { const t = new Date(iso); return Number.isNaN(t.getTime()) ? "?" : `${pad(t.getMonth() + 1)}/${pad(t.getDate())} ${pad(t.getHours())}:${pad(t.getMinutes())}`; };
 const OS = { win32: "Windows", darwin: "macOS", linux: "Linux" }[d.machine.platform] || d.machine.platform;
@@ -25,7 +26,10 @@ L.push("（不含 token；有聊天室 id、名稱和 bot 名稱，給別人看�
 // --- relay
 L.push("", "relay");
 const r = d.relay;
-if (!r.running) {
+if (d.env_file.error) L.push(`  ⚠ 設定檔 ${p(d.env_file.path)} 讀不到（${d.env_file.error}），下面只用這個 session 的環境變數`);
+if (r.other) {
+  L.push(`  127.0.0.1:${r.port} 有程式在回應，但不是 myna relay（${r.why}）`);
+} else if (!r.running) {
   L.push(`  ${r.why === "沒在跑" ? "沒在跑" : `沒在跑或沒回應（${r.why}）`}（127.0.0.1:${r.port}）`);
   L.push(`  ${r.autostart ? "下一個 session 開始時會自動啟動（有設定）" : "不會自動啟動：還沒設定 IM（或子節點沒有主節點網址）"}`);
 } else if (r.legacy) {
@@ -36,7 +40,7 @@ if (!r.running) {
   L.push(`  角色：${r.role === "edge" ? "子節點（edge）" : "主節點（hub）"}；provider：${r.provider ?? "這版 relay 沒回報"}；等待中的題目 ${r.pending ?? "?"}`);
   if (r.role !== d.role_config) L.push(`  ⚠ 設定檔的角色是 ${d.role_config}，relay 用的是 ${r.role}：/myna:relay restart 後才會照設定檔`);
 }
-if (d.env_changed_since_start) L.push("  ⚠ ~/.myna/.env 在 relay 啟動之後改過：/myna:relay restart 後才會生效");
+if (d.env_changed_since_start) L.push(`  ⚠ ${p(d.env_file.path)} 在 relay 啟動之後改過：/myna:relay restart 後才會生效`);
 
 // --- edge
 if (d.edge) {
@@ -46,13 +50,15 @@ if (d.edge) {
   if (!e.reported) L.push(`  主節點連線：${r.running ? "這版 relay 沒回報" : "relay 沒在跑"}`);
   else {
     L.push(`  主節點連線：${e.reachable ? "連得上" : `連不上（${e.reason || "原因沒回報"}）`}；主節點版本 ${e.hub_version ?? "沒回報"}`);
-    L.push(`  這台自己的 bot：${e.own_bot === null ? "這版 relay 沒回報" : e.own_bot ? "有在用（主節點連不上時接手）" : "沒在用"}`);
+    L.push(`  這台自己的 bot：${e.own_bot === null ? "這版 relay 沒回報" : e.own_bot ? "有（主節點連不上、斷線排隊關著時接手新題目）" : "沒在用"}`);
   }
 }
 
 // --- Telegram
 const t = d.telegram;
-if (t) {
+if (t?.unused) {
+  L.push("", "Telegram", `  token 有設，但 relay 用的是 ${t.unused}，不檢查 Telegram`);
+} else if (t) {
   L.push("", "Telegram");
   const maybe = t.bot_maybe_other ? "（用設定檔的 bot 查的，relay 可能用別支）" : "";
   if (!t.token_set) L.push("  bot：token 沒設");
@@ -108,7 +114,7 @@ L.push("", "開關");
 const dflt = (s) => (s.isDefault ? "（預設）" : "");
 const cell = (s) => {
   if (s.key === "files") return `files 保留 ${s.days} 天${dflt(s)}${s.bad ? "（設定檔讀不懂）" : ""}`;
-  if (s.key === "perm") return `perm ${s.on ? "開" : "關"}${s.isDefault ? `（預設，${s.delay_s} 秒）` : `（${s.delay_s} 秒）`}`;
+  if (s.key === "perm") return `perm ${s.on ? "開" : "關"}（${s.isDefault ? "預設，" : ""}${s.delay_s} 秒${s.delayDefault ? "" : "，MYNA_PERMISSION_DELAY"}）`;
   if (s.key === "hold") return `hold ${s.on ? "開" : "關"}，上限 ${human(s.max_s)}（${s.isDefault ? "預設；" : ""}${s.from === "relay" ? "relay 在用的" : "設定檔／這個 session"}）`;
   return `${s.label} ${s.on ? "開" : "關"}${dflt(s)}`;
 };
@@ -132,5 +138,5 @@ d.next.forEach((s, i) => L.push(`  ${i + 1}. ${s}`));
 
 // last line of defence: the same redactor collect() used, over the whole page
 const redact = makeRedactor(readEnvFile(cfg.MYNA_ENV).values, process.env, cfg);
-console.log(redact(L.join("\n")));
-process.exit(0);
+// let stdout drain before leaving (a pipe is asynchronous); then exit, so nothing left open keeps it alive
+process.stdout.write(redact(L.join("\n")) + "\n", () => process.exit(0));

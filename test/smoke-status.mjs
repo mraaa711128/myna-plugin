@@ -9,6 +9,8 @@
 //    7 credentials never printed            8 Telegram does not answer  9 edge
 //   10 the relay's start line vs the file   11 .env newer than the relay
 //   13 the environment wins over .env       14 /pair/status wins over telegram-chat.json
+//   15 another provider in use, MYNA_ENV elsewhere, not a myna relay on the port, an edge's own bot
+//      taking over, an unreadable .env, a huge log line through a pipe, MYNA_PERMISSION_DELAY set
 import http from "node:http";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
@@ -68,12 +70,14 @@ const TG_BASE = `http://127.0.0.1:${tg.address().port}`;
 
 // --- a fresh HOME for each case ---
 let n = 0;
-function home({ env = "", chatFile, topicsFile, log, envAgeMs = 3600000 } = {}) {
-  const H = path.join(TMP, `h${++n}`), D = path.join(H, ".myna");
+// envAt(H): where MYNA_ENV points (default H/.myna/.env); envDir: make it a directory (unreadable as a file)
+function home({ env = "", chatFile, topicsFile, log, envAgeMs = 3600000, envAt, envDir = false } = {}) {
+  const H = path.join(TMP, `h${++n}`);
+  fs.mkdirSync(H, { recursive: true });
+  const ENV = envAt ? envAt(H) : path.join(H, ".myna", ".env"), D = path.dirname(ENV);
   fs.mkdirSync(D, { recursive: true });
-  const ENV = path.join(D, ".env");
-  fs.writeFileSync(ENV, env);
-  const t = new Date(Date.now() - envAgeMs); fs.utimesSync(ENV, t, t);
+  if (envDir) fs.mkdirSync(ENV);
+  else { fs.writeFileSync(ENV, env); const t = new Date(Date.now() - envAgeMs); fs.utimesSync(ENV, t, t); }
   if (chatFile) fs.writeFileSync(path.join(D, "telegram-chat.json"), JSON.stringify(chatFile));
   if (topicsFile) fs.writeFileSync(path.join(D, "telegram-topics.json"), JSON.stringify(topicsFile));
   if (log) fs.writeFileSync(path.join(D, "relay.log"), log.join("\n") + "\n");
@@ -297,6 +301,58 @@ h = home({ env: `TELEGRAM_BOT_TOKEN=${TOKEN}\n`, chatFile: { chat_id: "111", typ
 pair = { chat: { id: "222", type: "private", title: "New", paired_at: iso(-1000) }, pairing: false };
 r = await run(h);
 ok(/id 222/.test(r.out) && !/id 111/.test(r.out) && /（relay 在用）/.test(r.out), "14 the relay's chat is shown, not the file's");
+
+// 15 — review round 1 (X1–X7)
+// X1: the relay uses Discord, a Telegram token is left over → no Telegram checks, no Telegram steps
+h = home({ env: `TELEGRAM_BOT_TOKEN=${TOKEN}\nTELEGRAM_TOPICS=off\nDISCORD_BOT_TOKEN=d.fake.tok\nDISCORD_CHANNEL_ID=42\nMYNA_PROVIDER=discord\n` });
+health = { ...hubHealth(iso(-60000)), provider: "discord" };
+pair = null; tgAnswers = { getMe: { ok: true, result: { id: 7012345678, username: "x_bot", has_topics_enabled: false } } };
+r = await run(h);
+ok(/token 有設，但 relay 用的是 discord，不檢查 Telegram/.test(r.out) && r.tg.length === 0, `15 X1 provider discord → Telegram not checked (telegram calls: ${r.tg.join(",") || "none"})`);
+ok(!/\/myna:pair|TELEGRAM_TOPICS=off 刪掉|BotFather/.test(nextOf(r.out)), "15 X1 …and no Telegram next steps");
+h = home({ env: `TELEGRAM_BOT_TOKEN=${TOKEN}\nSLACK_BOT_TOKEN=xoxb-fake\nSLACK_APP_TOKEN=xapp-fake\nSLACK_CHANNEL_ID=C1\n` });
+r = await run(h, {}, { port: DEAD_PORT });
+ok(/relay 用的是 slack/.test(r.out) && r.tg.length === 0, "15 X1 auto: Slack fully set, Telegram not paired → the relay would pick Slack, Telegram not checked");
+// X2: MYNA_ENV elsewhere → the messages name that file
+h = home({ env: `TELEGRAM_BOT_TOKEN=${TOKEN}\nTELEGRAM_TOPICS=off\n`, envAt: (H) => path.join(H, "config", "custom.env"), envAgeMs: 1000, log: [startLine(iso(-59000), "off")] });
+health = hubHealth(iso(-60000));
+pair = { chat: { id: "123456", type: "private", title: "Alex" }, pairing: false };
+r = await run(h);
+ok(/⚠ ~\/config\/custom\.env 在 relay 啟動之後改過/.test(r.out) && /把 ~\/config\/custom\.env 的 TELEGRAM_TOPICS=off 刪掉/.test(r.out) && !/~\/\.myna\/\.env/.test(r.out), "15 X2 MYNA_ENV=~/config/custom.env → named in the warning and the step");
+h = home({ env: `TELEGRAM_BOT_TOKEN=${TOKEN}\nTELEGRAM_TOPICS=off\n`, envAt: () => path.join(TMP, `outside${n}`, "m.env") });
+r = await run(h);
+ok(r.out.includes(`把 ${path.join(TMP, `outside${n}`, "m.env").replace(/\\/g, "/")} 的 TELEGRAM_TOPICS=off`), "15 X2 MYNA_ENV outside the home directory → its full path");
+// X3: something else on the port
+h = home({ env: `TELEGRAM_BOT_TOKEN=${TOKEN}\n` });
+for (const [label, doc] of [["404 {}", null], ["200 unrelated JSON", { foo: 1 }]]) {
+  health = doc;
+  r = await run(h);
+  ok(/有程式在回應，但不是 myna relay/.test(r.out) && /被別的程式占用/.test(nextOf(r.out)) && !/在跑：/.test(r.out), `15 X3 ${label} on the port → not a myna relay`);
+}
+// X4: edge, hub away, holding off, own bot on → the own bot takes new questions: look here
+h = home({ env: `MYNA_ROLE=edge\nMYNA_UPSTREAM=https://hub.example.com\nTELEGRAM_BOT_TOKEN=${TOKEN}\n`, log: [startLine(iso(-59000))] });
+health = { ...hubHealth(iso(-60000)), role: "edge", upstream: { url: "https://hub.example.com", reachable: false, reason: "timeout", version: VERSION, hold: { on: false, max_s: 86400, source: "file", queued: 0, waiting: 0 } }, own_bot: { on: true, id: "telegram:7012345678" } };
+pair = { chat: { id: "123456", type: "private", title: "Alex" }, pairing: false };
+tgAnswers = { getMe: { ok: true, result: { id: 7012345678, username: "x_bot", has_topics_enabled: true } } };
+r = await run(h);
+ok(/新題目現在由這台自己的 bot 發：topic 看上面 Telegram 那段/.test(nextOf(r.out)) && /\nTelegram\n/.test(r.out), "15 X4 edge + own bot taking over → topics are diagnosed here");
+health = { ...health, upstream: { ...health.upstream, hold: { ...health.upstream.hold, on: true } } };
+r = await run(h);
+ok(/新題目先排著（還沒送到手機）/.test(nextOf(r.out)), "15 X4 edge, hub away, holding on → the questions are held, not sent");
+// X5: an .env that cannot be read (a directory) → still a page, exit 0, the reason shown
+h = home({ envDir: true });
+health = hubHealth(iso(-60000));
+r = await run(h, { TELEGRAM_BOT_TOKEN: TOKEN });
+ok(r.rc === 0 && /設定檔 .* 讀不到（EISDIR）/.test(r.out) && /建議的下一步/.test(r.out), `15 X5 unreadable .env → exit ${r.rc}, the reason shown, the rest still printed`);
+// X6: a huge relay.log line through a pipe → the page arrives whole
+h = home({ env: `TELEGRAM_BOT_TOKEN=${TOKEN}\n`, log: [`[relay ${iso(-30000)}] topics unavailable for session s1 (Bad Request: ${"x".repeat(200000)}) — falling back to the flat chat.`, startLine(iso(-59000))] });
+tgAnswers = { getMe: { ok: true, result: { id: 7012345678, username: "x_bot", has_topics_enabled: true } } };
+r = await run(h);
+ok(r.out.length > 200000 && /建議的下一步\n  (1\.|沒有)/.test(r.out) && /\/myna:status 確認|看起來都正常/.test(r.out.slice(-200)), `15 X6 a 200 KB log line → the whole page through the pipe (${r.out.length} chars)`);
+// X7: MYNA_PERMISSION_DELAY changed → not shown as the default delay
+h = home({ env: `TELEGRAM_BOT_TOKEN=${TOKEN}\nMYNA_PERMISSION_DELAY=5\n` });
+r = await run(h);
+ok(/perm 開（預設，5 秒，MYNA_PERMISSION_DELAY）/.test(r.out), "15 X7 MYNA_PERMISSION_DELAY=5 → the delay is marked as set");
 
 relay.closeAllConnections?.(); tg.closeAllConnections?.();
 await Promise.all([new Promise((x) => relay.close(x)), new Promise((x) => tg.close(x))]);

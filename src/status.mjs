@@ -36,11 +36,11 @@ export const pluginVersion = () => { try { return JSON.parse(fs.readFileSync(pat
 
 // ~/.myna/.env as written (no environment merged) → {path, values, exists, mtime}
 export function readEnvFile(envPath) {
-  let text = "", st = null;
-  try { st = fs.statSync(envPath); text = fs.readFileSync(envPath, "utf8"); } catch {}
+  let text = "", st = null, error = null;
+  try { st = fs.statSync(envPath); text = fs.readFileSync(envPath, "utf8"); } catch (e) { if (e.code !== "ENOENT") error = e.code || e.name; }
   const values = Object.fromEntries(text.split(/\r?\n/).filter((l) => l && !l.startsWith("#") && l.includes("="))
     .map((l) => { const i = l.indexOf("="); return [l.slice(0, i).trim(), l.slice(i + 1).trim()]; }));
-  return { path: envPath, values, exists: !!st, mtime: st ? st.mtime.toISOString() : null };
+  return { path: envPath, values, exists: !!st, mtime: st ? st.mtime.toISOString() : null, ...(error ? { error } : {}) };
 }
 
 // The redactor: every value of a credential key (any length), the secret half of a Telegram token, and
@@ -61,6 +61,14 @@ export function makeRedactor(...sources) {
 }
 const deepMap = (x, f) => (typeof x === "string" ? f(x) : Array.isArray(x) ? x.map((y) => deepMap(y, f))
   : x && typeof x === "object" ? Object.fromEntries(Object.entries(x).map(([k, v]) => [k, deepMap(v, f)])) : x);
+
+// a path as shown: the home directory as ~, forward slashes (the same on Windows and macOS)
+export function tildePath(f, home = os.homedir()) {
+  if (!f) return "?";
+  let s = String(f);
+  if (home && s.toLowerCase().startsWith(home.toLowerCase())) s = `~${s.slice(home.length)}`;
+  return s.replace(/\\/g, "/");
+}
 
 // the hub URL without credentials, path or query
 export const originOf = (u) => { try { return new URL(String(u)).origin; } catch { return u ? "（網址看不懂）" : null; } };
@@ -177,6 +185,18 @@ export function topicSettings(get) {
   };
 }
 
+// the provider the relay picks (src/relay.mjs): MYNA_PROVIDER, else the first fully configured one
+// (telegram, discord, slack), else telegram waiting to be paired (a token only). null: none.
+export function expectedProvider(cfg, { paired = false } = {}) {
+  const want = String(cfg.MYNA_PROVIDER || "").trim().toLowerCase();
+  if (want) return want;
+  const has = (k) => cfg[k] !== undefined && String(cfg[k]).trim() !== "";
+  if (has("TELEGRAM_BOT_TOKEN") && (paired || has("TELEGRAM_CHAT_ID"))) return "telegram";
+  if (has("DISCORD_BOT_TOKEN") && has("DISCORD_CHANNEL_ID")) return "discord";
+  if (has("SLACK_BOT_TOKEN") && has("SLACK_APP_TOKEN") && has("SLACK_CHANNEL_ID")) return "slack";
+  return has("TELEGRAM_BOT_TOKEN") ? "telegram" : null;
+}
+
 const errWhy = (e) => (e?.name === "TimeoutError" || e?.name === "AbortError" ? "逾時" : e?.cause?.code || e?.code || e?.name || "錯誤");
 
 // --- collect --------------------------------------------------------------------------------------------
@@ -200,7 +220,7 @@ export async function collect(cfg, opts = {}) {
     at: new Date(now).toISOString(),
     machine: { name: String(cfg.MYNA_MACHINE_NAME || os.hostname().split(".")[0] || "?"), platform: process.platform },
     plugin_version: version,
-    env_file: { path: envFile.path, exists: envFile.exists, mtime: envFile.mtime },
+    env_file: { path: envFile.path, exists: envFile.exists, mtime: envFile.mtime, ...(envFile.error ? { error: envFile.error } : opts.envError ? { error: opts.envError } : {}) },
     role_config: role,
   };
 
@@ -213,20 +233,28 @@ export async function collect(cfg, opts = {}) {
   };
   const relayBase = `http://127.0.0.1:${port}`;
   const healthP = getJSON(`${relayBase}/health`).then(
-    (r) => (r.json && typeof r.json === "object" ? { ok: true, h: r.json } : { ok: true, legacy: true }),
+    // ensure-relay's rule: a relay says name "myna-relay"; a 200 that is not JSON is a pre-0.7.2 relay;
+    // anything else on the port is not Myna
+    (r) => (r.json?.name === "myna-relay" && r.status === 200 ? { ok: true, h: r.json }
+      : r.status === 200 && r.json === undefined ? { ok: true, legacy: true }
+      : { ok: false, other: true, why: `HTTP ${r.status}${r.json && typeof r.json === "object" ? "，不是 myna relay 的回應" : ""}` }),
     (e) => ({ ok: false, why: errWhy(e) }));
   const token = String(cfg.TELEGRAM_BOT_TOKEN || "").trim();
   const API = `${cfg.TELEGRAM_API_BASE || "https://api.telegram.org"}/bot${token}`;
   // the token is in the URL: only in fetch; errors keep the error's name/code, never the URL
   const tg = (method, body = {}) => getJSON(`${API}/${method}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) })
     .then((r) => (r.json?.ok ? { ok: true, result: r.json.result } : { ok: false, why: r.json?.description || `HTTP ${r.status}` }), (e) => ({ ok: false, why: errWhy(e) }));
-  const meP = token ? tg("getMe") : null;
+  const chatFile = cfg.MYNA_TELEGRAM_CHAT_FILE || path.join(dir, "telegram-chat.json");
+  let paired = false; try { paired = JSON.parse(fs.readFileSync(chatFile, "utf8"))?.chat_id != null; } catch {}
+  const expected = expectedProvider(cfg, { paired });
+  let meP = token && expected === "telegram" ? tg("getMe") : null;
 
   // --- relay
   const health = await healthP;
   const relay = { port };
   if (!health.ok) {
     relay.running = false; relay.why = health.why === "ECONNREFUSED" ? "沒在跑" : health.why;
+    if (health.other) relay.other = true; // the port answers, but not as a Myna relay
   } else if (health.legacy) {
     relay.running = true; relay.legacy = true;
   } else {
@@ -241,6 +269,10 @@ export async function collect(cfg, opts = {}) {
       : false;
   }
   data.relay = relay;
+  // the provider in use: the relay's own word, else what it would pick from the config
+  const provider = relay.running && !relay.legacy && relay.provider && relay.provider !== "none" ? relay.provider : expected;
+  data.provider = provider;
+  if (token && provider === "telegram" && !meP) meP = tg("getMe");
   const relayRole = relay.running && !relay.legacy ? relay.role : null;
   data.role = relayRole || role;
   data.im_configured = has("TELEGRAM_BOT_TOKEN") || (has("DISCORD_BOT_TOKEN") && has("DISCORD_CHANNEL_ID")) || (has("SLACK_BOT_TOKEN") && has("SLACK_APP_TOKEN") && has("SLACK_CHANNEL_ID"));
@@ -256,17 +288,22 @@ export async function collect(cfg, opts = {}) {
       reason: u?.reason ?? null,
       hub_version: u?.version ?? null,
       own_bot: ob ? !!ob.on : null,
+      hold_on: u?.hold ? !!u.hold.on : null,
     };
   }
 
   // --- the relay's own start line in relay.log (only this run's: not before /health started_at)
-  const lines = readLogTail(path.join(dir, "relay.log"));
+  data.relay_log = path.join(dir, "relay.log");
+  const lines = readLogTail(data.relay_log);
   const startLine = relay.running && relay.started_at ? relayTopicLine(lines, relay.started_at) : null;
   const envChangedSinceStart = !!(relay.running && relay.started_at && envFile.mtime && Date.parse(envFile.mtime) > Date.parse(relay.started_at));
   data.env_changed_since_start = envChangedSinceStart;
 
   // --- Telegram
-  if (token || (!data.im_configured && data.role !== "edge")) {
+  if (token && provider && provider !== "telegram") {
+    // a Telegram token left in the config while the relay uses another provider: no Telegram checks or steps
+    data.telegram = { token_set: true, token_source: sourceOf("TELEGRAM_BOT_TOKEN"), unused: provider };
+  } else if (token || (!data.im_configured && data.role !== "edge")) {
     const t = { token_set: !!token, token_source: token ? sourceOf("TELEGRAM_BOT_TOKEN") : null };
     const me = meP ? await meP : null;
     if (me) t.bot = me.ok ? { ok: true, id: me.result.id, username: me.result.username, has_topics_enabled: me.result.has_topics_enabled } : { ok: false, why: me.why };
@@ -277,7 +314,6 @@ export async function collect(cfg, opts = {}) {
       const c = pr.json.chat;
       chat = c ? { from: "relay", id: String(c.id), type: c.type || null, title: c.title ?? null, paired_at: c.paired_at || null, legacy_env: c.source === "TELEGRAM_CHAT_ID" } : { from: "relay", none: true };
     } else {
-      const chatFile = cfg.MYNA_TELEGRAM_CHAT_FILE || path.join(dir, "telegram-chat.json");
       let b = null; try { const j = JSON.parse(fs.readFileSync(chatFile, "utf8")); if (j?.chat_id != null) b = j; } catch {}
       if (b) chat = { from: "file", id: String(b.chat_id), type: b.type || null, title: b.title ?? null, paired_at: b.paired_at || null };
       else if (has("TELEGRAM_CHAT_ID")) chat = { from: "file", id: String(cfg.TELEGRAM_CHAT_ID).trim(), type: null, title: null, legacy_env: true };
@@ -383,14 +419,17 @@ export function topicVerdict(t) {
 export function nextSteps(d) {
   const out = [], t = d.telegram, r = d.relay;
   if (!d.im_configured && d.role !== "edge") out.push("設定 IM：/myna:setup <bot token>（Telegram；Discord／Slack 見 README）。");
-  if (!r.running && r.autostart) out.push("啟動 relay：/myna:relay start；還是起不來就看 ~/.myna/relay.log。");
+  const envPath = tildePath(d.env_file.path);
+  if (d.env_file.error) out.push(`設定檔 ${envPath} 讀不到（${d.env_file.error}），先檢查檔案權限。`);
+  if (r.other) out.push(`127.0.0.1:${r.port} 被別的程式占用（不是 myna relay）：關掉它，或在 ${envPath} 設 RELAY_PORT 換一個 port。`);
+  if (!r.running && !r.other && r.autostart) out.push(`啟動 relay：/myna:relay start；還是起不來就看 ${tildePath(d.relay_log)}。`);
   const old = r.running && (r.legacy || r.compare === -1);
   if (old) out.push("relay 比這個 plugin 舊：/myna:relay restart。");
   if (r.running && r.compare === 1) out.push("relay 比這個 plugin 新：/plugin update 更新 plugin。");
-  if (!old && (t?.topic_settings?.differs || d.env_changed_since_start)) out.push("relay 用的設定跟設定檔不同（或 ~/.myna/.env 在 relay 啟動後改過）：/myna:relay restart 後才會照設定檔。");
+  if (!old && (t?.topic_settings?.differs || d.env_changed_since_start)) out.push(`relay 用的設定跟設定檔不同（或 ${envPath} 在 relay 啟動後改過）：/myna:relay restart 後才會照設定檔。`);
   else if (!old && t?.bot_maybe_other) out.push("（推測）Telegram 這幾項是用這個 session 的 bot token 查的，relay 可能用別支；要確定就 /myna:relay restart 再跑一次 /myna:status。");
-  if (t && t.token_set && !t.chat && d.role !== "edge") out.push("配對聊天室：/myna:pair。");
-  if (t?.chat) {
+  if (t && !t.unused && t.token_set && !t.chat && d.role !== "edge") out.push("配對聊天室：/myna:pair。");
+  if (t?.chat && !t.unused) {
     const g = t.group;
     if (t.chat.type === "private" && t.bot?.ok && t.bot.has_topics_enabled === false)
       out.push("BotFather → /mybots → 選 bot → Bot Settings → Threaded Mode → 開（不用重啟 relay）。");
@@ -399,14 +438,18 @@ export function nextSteps(d) {
     else if (g?.chat.ok && !g.chat.is_forum) out.push("群組設定開「主題」。");
     if (g?.member.ok && !g.member.can_manage_topics) out.push("把 bot 設成群組管理員，勾「管理主題」。");
   }
-  if (t?.token_set && t.topic_settings.file.topics === "off") {
+  if (t?.token_set && !t.unused && t.topic_settings.file.topics === "off") {
     out.push(t.topic_settings.file_source.TELEGRAM_TOPICS === "env"
       ? "拿掉環境變數 TELEGRAM_TOPICS=off（或改成 auto），再 /myna:relay restart。"
-      : "把 ~/.myna/.env 的 TELEGRAM_TOPICS=off 刪掉（或改成 auto），再 /myna:relay restart。");
+      : `把 ${envPath} 的 TELEGRAM_TOPICS=off 刪掉（或改成 auto），再 /myna:relay restart。`);
   }
   if (d.role === "edge" && d.edge) {
     if (d.edge.reachable === false) out.push(`主節點連不上（${d.edge.reason || "原因沒回報"}）：看主節點的 relay 和 tunnel。`);
-    out.push("這台的題目用主節點的 bot；topic 的原因要在主節點跑 /myna:status。");
+    // the own bot takes new questions only while the hub is away and holding is off (SPEC §5.2)
+    const ownTakes = d.edge.own_bot === true && d.edge.reachable === false && d.edge.hold_on === false;
+    if (ownTakes) out.push("主節點連不上、斷線排隊關著，新題目現在由這台自己的 bot 發：topic 看上面 Telegram 那段；經主節點的題目，topic 的原因要在主節點跑 /myna:status。");
+    else if (d.edge.reachable === false && d.edge.hold_on !== false) out.push("主節點連不上時新題目先排著（還沒送到手機），恢復後才會開 topic；topic 的原因要在主節點跑 /myna:status。");
+    else out.push("這台的題目用主節點的 bot；topic 的原因要在主節點跑 /myna:status。");
   }
   if (out.length) out.push("改完再跑一次 /myna:status 確認。");
   return out;
