@@ -692,6 +692,7 @@ MYNA_MACHINE_NAME=win        # 選填,topic 前面的短名稱(預設 hostname)
 
 | 指令 | 作用 |
 |---|---|
+| `/myna:status` | 一頁看這台 Myna 的狀態(只讀):relay 版本和角色、配對的聊天室、Telegram topic 會不會開(卡在哪一項)、各開關、主要設定,最後列出建議的下一步。不含 token;有聊天室 id、名稱和 bot 名稱(v0.23.0) |
 | `/myna:setup <token>` | 一鍵(Telegram):存 token → 配對 chat id → 起 relay |
 | `/myna:setup discord\|slack …` | 一鍵(Discord / Slack):存憑證 → 起 relay |
 | `/myna:configure <token> [chat_id]` | 只設/換 Telegram bot token(+可選 chat id) |
@@ -781,11 +782,11 @@ node scripts/ensure-relay.mjs --force          # 強制換成這份原始碼的 
 
 ## 疑難排解
 
-- **手機沒收到訊息** — 先 `/myna:relay status`(或 `curl http://127.0.0.1:7800/health`)確認 relay 在跑;看 `~/.myna/relay.log`(開頭會印 `provider=…`,確認起的是你要的平台)。Telegram:確認第 1 步真的 **DM 過 bot**、chat id 有存;Discord/Slack:確認 bot 已在該頻道、channel id 沒抄錯。
+- **手機沒收到訊息** — 先跑 `/myna:status`:relay 有沒有在跑、配對到哪個聊天室、建議的下一步都在同一頁。要細看再用 `/myna:relay status`(或 `curl http://127.0.0.1:7800/health`)確認 relay 在跑;看 `~/.myna/relay.log`(開頭會印 `provider=…`,確認起的是你要的平台)。Telegram:確認第 1 步真的 **DM 過 bot**、chat id 有存;Discord/Slack:確認 bot 已在該頻道、channel id 沒抄錯。
 - **flow 收到 `{kind:"unreachable"}`** — relay 沒起或已掛超過約 8 秒(client 端每秒重試、共 8 次,可用 `MYNA_ANSWER_POLL_TRIES` 調)。`/myna:relay start` 重起;若 `~/.myna/relay-pending.json` 還留著那一題,新 relay 會接手,手機上按鈕仍可回答;flow 端應已 fallback 到本機 gate。
 - **升級 plugin 後新功能沒生效(例如 Telegram 沒開 topic、log 沒印 `topics=…`)** — 多半是**舊版 relay 還在跑**:`/plugin update` 只換磁碟上的檔案,不會動已經在 :7800 服務的 relay process。`curl http://127.0.0.1:7800/health` 看 `version`(回的不是 JSON = 0.7.2 以前的 relay);比 `/plugin` 顯示的版本舊就 `/myna:relay restart`。0.7.2 起 `ensure-relay` 在每次 SessionStart 會自動比對版本並換新,舊 relay 有題目在等時除外(log 會說)。
 - **relay 的版本一下新一下舊** — 多個 session 用不同版本的 plugin 同時在跑(有的 session 還在用舊的 plugin cache)時,0.19.0 以前的 `ensure-relay` 會把比較新的 relay 換成自己的舊版。0.19.1 起比較新的 relay 不會被換掉(SessionStart 會印「… is v… (newer than this plugin's v…) — leaving it」);但還在跑舊版 plugin 的 session 用的是**它自己那份舊的** `ensure-relay`,所以要把每個 session 都 `/plugin update` 到 0.19.1 以上(或重開)才會完全停止。
-- **Telegram 沒有分 topic、全部擠在同一個視窗** — 先看 `~/.myna/relay.log` 開頭:`bot has Threaded Mode OFF` = bot 沒開 Threaded Mode(BotFather → `/mybots` → 選 bot → Bot Settings → Threaded Mode → 開);`Threaded Mode ON` 但還是平面 → 多半是**客戶端**問題:Telegram Desktop 要 **6.2 以上**才顯示 bot topic,舊版會把所有 topic 的訊息攤平在同一個視窗;或 bot 聊天視窗在開 Threaded Mode 前就開著,關掉重開。已開但**某一個** session 還是平面的:那個 session 在開 Threaded Mode **之前**就問過(失敗的 createForumTopic 每一輪只試一次),等這一輪結束(Claude 回應結束)後的下一題就會開 topic。
+- **Telegram 沒有分 topic、全部擠在同一個視窗** — 先跑 `/myna:status`:它會說 topic 會不會開、卡在哪一項(`TELEGRAM_TOPICS=off`、私聊的 Threaded Mode、群組沒開「主題」、bot 不是能管理主題的管理員),以及建 topic 失敗時 Telegram 給的原因。配對的是**群組**時 Threaded Mode 沒有作用,要看群組有沒有開主題、bot 是不是有「管理主題」權限的管理員。也可以看 `~/.myna/relay.log` 開頭:`bot has Threaded Mode OFF` = bot 沒開 Threaded Mode(BotFather → `/mybots` → 選 bot → Bot Settings → Threaded Mode → 開);`Threaded Mode ON` 但還是平面 → 多半是**客戶端**問題:Telegram Desktop 要 **6.2 以上**才顯示 bot topic,舊版會把所有 topic 的訊息攤平在同一個視窗;或 bot 聊天視窗在開 Threaded Mode 前就開著,關掉重開。已開但**某一個** session 還是平面的:那個 session 在開 Threaded Mode **之前**就問過(失敗的 createForumTopic 每一輪只試一次),等這一輪結束(Claude 回應結束)後的下一題就會開 topic。
 - **聊天沒反應(手機打字沒有 👀)** — 先看輸入框下方有沒有 `myna: 💬 暱稱` 這一行:沒有、或寫著「聊天未連線」時,用 `/myna:chat` 查原因(Claude Code 低於 2.1.287 時這個指令會說明需要升級;`relay 版本太舊` = 跑的是 0.12.0 以前的 relay,`/myna:relay restart`;`目前的 IM 不支援聊天` = 用的是 Discord / Slack)。在群組裡:確認 bot 已關閉 privacy mode 或是管理員。session 正在跑一個很長的回合時,訊息會排隊,要等回合結束才會被取走(👀)。
 - **Claude 回應結束了(或 session 已經關了),topic 卻沒收掉** — 先確認是不是還在寬限期內(預設 10 分鐘,relay.log 會有 `round ended — topic … goes in 600s`;session 結束則是 `ended — topic … goes in …s`),或 AI 答完題目後啟動的背景工作還在跑。過了寬限期,`~/.myna/relay.log` 應該有 `round ended — topic … deleted`。沒有的話,多半是 MCP server 的 session id 和 `Stop` hook 收到的對不上(較舊的 Claude Code 沒提供 `CLAUDE_CODE_SESSION_ID`,也沒有 `~/.claude/sessions/<pid>.json`);這時退回「換 gate / session 結束」才收尾,不影響問答本身。
 - **relay.log 一直出現 `poll err fetch failed`、手機什麼都收不到,但 `curl https://api.telegram.org` 連得上** — 0.18.1 起 log 會在括號裡寫出底層原因(`fetch failed (cause: …)`,例如 `ETIMEDOUT`、`ENETUNREACH`,以及每個試過的位址)。全是 `ETIMEDOUT` 時,多半是那台機器的 IPv6 不通、IPv4 握手又慢:Node 連線時 IPv6、IPv4 輪流試,每個位址預設只給 250ms,兩邊都逾時就失敗(curl 不受影響)。relay 啟動時會把這個時間拉長到 2000ms(只影響 relay 自己,不改 shell 的 `NODE_OPTIONS`、不影響其他 Node 程式);還是不夠就在 `~/.myna/.env` 加 `MYNA_NET_ATTEMPT_MS=5000` 之類的值(毫秒;0、負數、不是數字都當 2000),再 `/myna:relay restart`。實際套用的值看 relay.log 啟動那行的 `net_attempt_ms=…`,或 `/health` 的 `net_attempt_ms`(`null` = 這版 Node 沒有這個設定,沿用 Node 預設)。
