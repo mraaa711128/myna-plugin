@@ -545,7 +545,7 @@ const chat = createChat({
   registerNote: () => (EDGE && CHAT_FORWARD && hub.features && !hub.features.includes("chat") ? `${OLD_HUB_CHAT}，聊天改用這台自己的 bot` : ""),
 });
 // an edge whose hub forwards chat relays /chat/* there (src/edge-chat.mjs); its state rides in edge-state.json
-const edgeChat = EDGE ? createEdgeChat({ hub, log, secretOk: chat.secretOk, save: () => hub.save() }) : null;
+const edgeChat = EDGE ? createEdgeChat({ hub, log, secretOk: chat.secretOk, save: () => hub.save(), dir: path.dirname(ENV_PATH), cfg }) : null;
 if (edgeChat) {
   const n = edgeChat.importState(hub.chatState);
   if (n) log(`edge: picked up ${n} chat session(s) forwarded to the hub from the last run`);
@@ -1008,6 +1008,8 @@ async function handleRemote(req, res) {
   }
   // chat through the hub (SPEC §5.2): an edge relays its sessions' /chat/* — scoped to its machine
   if (req.method === "POST" && /^\/chat\/(register|take|progress|nick|close)$/.test(url.pathname)) { await chat.handle(req, res, url, scope); return; }
+  // a file of one of its chat sessions (SPEC §5.3): the edge keeps its own copy for the session there
+  if (req.method === "GET" && /^\/chat\/file\/[^/]+$/.test(url.pathname)) { await chat.handle(req, res, url, scope); return; }
   if (req.method === "POST" && url.pathname === "/ask") return handleAsk(req, res, scope);
   const am = url.pathname.match(/^\/answer\/([a-f0-9]+)$/);
   if (req.method === "GET" && am) return handleAnswer(res, am[1], scope);

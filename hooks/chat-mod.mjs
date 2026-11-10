@@ -135,6 +135,23 @@ export function turnSource(text, origins = []) {
   return null;
 }
 
+// A file the human sent from the phone (relay ≥ 0.22.0, SPEC §5.3) comes with file_path: its local path,
+// the one written at the front of the prompt. The session may Read exactly those files without a prompt
+// (tool.check below); everything else about Read is left to Claude Code. readKey: the form two paths
+// are compared in, or null for anything that is not a plain absolute path — relative, "~", UNC or
+// "\\?\", a "." / ".." / empty segment, a NUL. Windows paths: "/" read as "\", case folded (NTFS).
+export function readKey(p) {
+  if (typeof p !== "string" || !p || p.includes("\0") || p.includes("~")) return null;
+  const win = /^[A-Za-z]:[\\/]/.test(p);
+  if (!win && (!p.startsWith("/") || p.includes("\\"))) return null;
+  if (p.startsWith("//")) return null;
+  const segs = p.split(win ? /[\\/]/ : "/").slice(1);
+  if (segs.some((s) => s === "" || s === "." || s === "..")) return null;
+  return win ? p.replace(/\//g, "\\").toLowerCase() : p;
+}
+export const parentOf = (p) => String(p).replace(/[\\/][^\\/]*$/, "");
+const MAY_READ_MAX = 500;
+
 export const register = (on) => {
   // module state — a hot reload starts it over, and session.start fires again
   let io = null;          // closures over session.start's `$`
@@ -153,6 +170,13 @@ export const register = (on) => {
   let pendingCmd = null;  // {mark, name, at}: a phone command that printed nothing — a turn or nothing to come
   let submitted = [];     // {text, origin, at}: prompts submitted while idle, oldest first, until their turn starts
   let chain = Promise.resolve(); // progress posts, in order
+  const mayRead = new Map();     // readKey -> path of a file the relay handed this session (memory only: a reload asks again)
+  const allowRead = (p) => {
+    const k = readKey(p);
+    if (!k) return;
+    mayRead.delete(k); mayRead.set(k, p);
+    if (mayRead.size > MAY_READ_MAX) mayRead.delete(mayRead.keys().next().value);
+  };
 
   const now = () => Date.now();
   const storeKey = (id) => `chat:${id}`;
@@ -215,6 +239,7 @@ export const register = (on) => {
 
   async function registerNow() {
     const id = await io.sessionId();
+    if (sid && sid !== id) mayRead.clear(); // another session now: the files handed to the old one are not its
     if (sid && sid !== id && token) await close(); // a /clear: the old conversation is over
     let secret = "";
     try { secret = String(await io.read(cfg.secretFile)).trim(); } catch {}
@@ -272,6 +297,7 @@ export const register = (on) => {
       else if (note === "主節點連不上,恢復後補上") note = "";
       // everything that piled up comes at once (an older relay hands over one); a command comes alone
       const msgs = (Array.isArray(r.messages) ? r.messages : r.message ? [r.message] : []).filter((m) => m?.text);
+      for (const m of msgs) if (typeof m.file_path === "string") allowRead(m.file_path);
       if (msgs.length === 1 && PHONE_COMMAND.test(msgs[0].text.trim())) runCommand(msgs[0]).catch(() => {});
       else if (msgs.length) submitText(msgs);
       status();
@@ -348,6 +374,7 @@ export const register = (on) => {
   }
 
   on("session.start", async ($, e, next) => {
+    mayRead.clear(); // a new (or resumed) session: nothing handed to it yet
     const r = await next(e);
     io = {
       fetch: (url, init) => $.http.fetch(url, init),
@@ -394,6 +421,7 @@ export const register = (on) => {
     // after a /clear or an in-app /resume the process goes on under another session id: keep polling,
     // the next tick registers that one; any other reason is the process going away
     if (e.reason !== "clear" && e.reason !== "resume") stop();
+    mayRead.clear();
     await close();
     return next(e);
   });
@@ -453,6 +481,37 @@ export const register = (on) => {
       progress({ event: "done", text: String(e.answer || "").slice(0, 100000), interrupted: !!e.isAborted });
     }
     return r;
+  });
+
+  // A Read of a file the human sent this session from the phone: no prompt. Only ever turns Claude Code's
+  // "ask" into "allow" — never a deny (a deny rule, a PreToolUse hook), never a subagent's call, never
+  // with permissions.blockReadsOutsideWorkingDirectories on. The path must be one the relay handed over,
+  // compared whole (readKey), and still a plain file there: not a link, resolving to itself. Anything
+  // that cannot be checked leaves Claude Code's decision as it was (it asks); a throw does the same.
+  on("tool.check", { tool: "Read" }, async ($, e, next) => {
+    const d = await next(e);
+    if (d?.decision !== "ask" || e.agentId) return d;
+    const key = readKey(e.input?.file_path);
+    const p = key && mayRead.get(key);
+    if (!p) return d;
+    try {
+      const s = await $.settings.read();
+      if (s?.permissions?.blockReadsOutsideWorkingDirectories === true) return d;
+      // the path Read will read, resolved: it must be the very file handed over — same string, case
+      // included (a case-sensitive folder on Windows can hold File.pdf and file.pdf)
+      const asked = e.input.file_path;
+      const st = await $.fs.stat(asked, { resolve: true });
+      if (!st || st.kind !== "file" || st.isLink !== false) return d;
+      if (typeof st.realPath === "string") { if (st.realPath !== p) return d; }
+      else {
+        // no realPath (an older CLI): the path exactly as handed over, and the two folders above it no links
+        if (asked !== p) return d;
+        const a = await $.fs.stat(parentOf(p));
+        const b = await $.fs.stat(parentOf(parentOf(p)));
+        if (!a || a.kind !== "dir" || a.isLink !== false || !b || b.kind !== "dir" || b.isLink !== false) return d;
+      }
+    } catch { return d; }
+    return { decision: "allow", reason: "myna:這個 session 從 Telegram 收到的附檔" };
   });
 
   // /myna:chat and /myna:nick: answered here; the markdown files are the fallback for an old CLI

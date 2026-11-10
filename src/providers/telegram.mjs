@@ -48,6 +48,7 @@ import crypto from "node:crypto";
 import { questionLines, newToken, oneLine, toolLine, errText } from "./util.mjs";
 import { mdToPlain } from "./plain.mjs";
 import { isCommand, isSlashCommand } from "../chat.mjs";
+import * as inbox from "../inbox.mjs";
 
 export const name = "telegram";
 // the chat bound by /myna:pair, kept next to .env like the topics map (MYNA_TELEGRAM_CHAT_FILE: tests)
@@ -74,7 +75,10 @@ export function create(cfg, ctx) {
   let pairing = null; // {code, expires, tries}
   const who = (chat, from) => `chat ${chat?.id ?? "?"} user ${from?.id ?? "?"}`;
   // TELEGRAM_API_BASE override exists for the stubbed smoke test (test/smoke-telegram-provider.mjs)
-  const API = `${cfg.TELEGRAM_API_BASE || "https://api.telegram.org"}/bot${TOKEN}`;
+  const API_ROOT = cfg.TELEGRAM_API_BASE || "https://api.telegram.org";
+  const API = `${API_ROOT}/bot${TOKEN}`;
+  // the bot token sits in every API and file URL: never in a log line, a reply, or what a session gets
+  const redact = (s) => (TOKEN ? String(s).split(TOKEN).join("***") : String(s));
   // TELEGRAM_TOPICS=auto (default): one topic per session when the bot has Threaded Mode; off = flat chat.
   const TOPICS = String(cfg.TELEGRAM_TOPICS || "auto").trim().toLowerCase() !== "off";
   // TELEGRAM_TOPIC_SCOPE: gate (default) = one topic per gate, ended per gate/round; session = one per session.
@@ -555,6 +559,160 @@ export function create(cfg, ctx) {
     else if (r.stale) await back(`⚠️ ${nick} 目前沒有回應(可能卡住或已關閉),訊息先排隊,它恢復後會收到。`);
   }
 
+  // --- files (SPEC §5.3): a document or photo sent to a chat session ------------------------------
+  // Downloaded here (≤ 20 MB, the Bot API's limit) into this relay's inbox; the chat inbox message carries
+  // {file: {fid, name, mime, size, sha256, path}} and the session gets the local path (another machine's
+  // session: its relay fetches its own copy, src/edge-chat.mjs). Only the paired chat, only a chat
+  // session (its topic, a reply to its message, or a caption starting "@nick"); anything else is told why.
+  const DIR = path.dirname(cfg.MYNA_ENV || path.join(os.homedir(), ".myna", ".env"));
+  const FILE_TIMEOUT_MS = Number(cfg.MYNA_FILE_TIMEOUT_MS || 60000);
+  const OTHER_MEDIA = ["video", "audio", "voice", "animation", "video_note", "sticker"];
+  const mediaOf = (msg) => {
+    if (OTHER_MEDIA.some((k) => msg[k])) return null; // an animation also carries `document` (Bot API, for older clients)
+    if (msg.document?.file_id) return { f: msg.document, name: msg.document.file_name || "", mime: msg.document.mime_type || "" };
+    if (Array.isArray(msg.photo) && msg.photo.length) {
+      // the biggest size (by bytes, else by pixels) — not the array order, which the docs do not promise
+      const px = (x) => (x.width || 0) * (x.height || 0);
+      const big = [...msg.photo].sort((a, b) => (a.file_size > 0 && b.file_size > 0 ? b.file_size - a.file_size : 0) || px(b) - px(a))[0];
+      return { f: big, name: "", mime: "image/jpeg", photo: true };
+    }
+    return null;
+  };
+  const hasFile = (msg) => !!mediaOf(msg) || OTHER_MEDIA.some((k) => msg[k]);
+  // at most 2 downloads at once (an album is up to 10 files); text and buttons never wait for these
+  let downloading = 0;
+  const slotWaiters = [];
+  async function inSlot(fn) {
+    while (downloading >= 2) await new Promise((r) => slotWaiters.push(r));
+    downloading++;
+    try { return await fn(); } finally { downloading--; slotWaiters.shift()?.(); }
+  }
+  const failReason = (e) => (e?.code === "too_big" ? "超過 20 MB" : e?.code === "write" ? "寫檔失敗"
+    : e?.name === "TimeoutError" || e?.name === "AbortError" ? "逾時" : e?.code === "refused" ? "Telegram 拒絕" : "連不上 Telegram");
+  async function download(sid, m, at) {
+    const g = await tg("getFile", { file_id: m.f.file_id });
+    if (!g.ok || !g.result?.file_path) throw Object.assign(new Error(`getFile: ${g.description || g.error || "no file_path"}`), { code: /too big/i.test(g.description || "") ? "too_big" : "refused" });
+    if (g.result.file_size > inbox.MAX_FILE_BYTES) throw Object.assign(new Error("too big"), { code: "too_big" });
+    const filePath = String(g.result.file_path).split("/").map(encodeURIComponent).join("/");
+    const res = await fetch(`${API_ROOT}/file/bot${TOKEN}/${filePath}`, { signal: AbortSignal.timeout(FILE_TIMEOUT_MS) });
+    if (!res.ok || !res.body) throw Object.assign(new Error(`download: HTTP ${res.status}`), { code: "refused" });
+    // the size Telegram gave (getFile, else the message): a body that ends short is not taken for the file
+    const want = Number.isFinite(g.result.file_size) ? g.result.file_size : Number.isFinite(m.f.file_size) ? m.f.file_size : undefined;
+    const cl = res.headers.get("content-length");
+    if (Number(cl) > inbox.MAX_FILE_BYTES) { await res.body.cancel().catch(() => {}); throw Object.assign(new Error("too big"), { code: "too_big" }); }
+    if (cl && want !== undefined && Number(cl) !== want) { await res.body.cancel().catch(() => {}); throw Object.assign(new Error(`download: ${cl} bytes, expected ${want}`), { code: "refused" }); }
+    const fid = inbox.newFid();
+    let saved;
+    const ext = inbox.extOf(m.photo ? "photo.jpg" : m.name, m.mime);
+    try { saved = await inbox.save({ dir: DIR, sid, name: inbox.fileName({ fid, ext, at }), body: res.body, size: want }); }
+    catch (e) { if (e?.code === "mismatch") e.code = "refused"; throw e; }
+    return { fid, name: m.photo ? "photo.jpg" : inbox.displayName(m.name), ext, mime: m.mime, size: saved.size, sha256: saved.sha256, path: saved.path };
+  }
+  // getUpdates confirms an update before its file is down: a file message being handled is journaled
+  // (inbox-pending.json, 0600) until it is delivered or answered, and a relay that stopped mid-way picks
+  // it up again at start — skipped when the session already has that message
+  const PENDING_FILES = path.join(DIR, "inbox-pending.json");
+  const pendingFiles = (() => {
+    let text;
+    try { text = fs.readFileSync(PENDING_FILES, "utf8"); } catch { return []; }
+    try { const j = JSON.parse(text); if (Array.isArray(j)) return j.filter((x) => x?.msg?.chat); } catch {}
+    // unreadable: kept aside for a human to look at, never silently overwritten
+    try { fs.renameSync(PENDING_FILES, `${PENDING_FILES}.bad-${Date.now()}`); } catch {}
+    log(`inbox: ${PENDING_FILES} could not be read — kept aside as .bad-*; file messages in it are not picked up again`);
+    return [];
+  })();
+  // written whole to a temp file, then renamed over the journal (a crash mid-write leaves the old one)
+  const savePending = () => {
+    try {
+      fs.mkdirSync(DIR, { recursive: true });
+      const tmp = `${PENDING_FILES}.${process.pid}.tmp`;
+      const buf = Buffer.from(JSON.stringify(pendingFiles));
+      const fd = fs.openSync(tmp, "w", 0o600);
+      try {
+        for (let off = 0; off < buf.length;) { const w = fs.writeSync(fd, buf, off, buf.length - off); if (!(w > 0)) throw new Error("no progress writing"); off += w; }
+        fs.fsyncSync(fd);
+      } finally { fs.closeSync(fd); }
+      fs.renameSync(tmp, PENDING_FILES);
+      // the rename itself survives a power cut once the folder is synced (POSIX; Windows cannot open a folder for it)
+      if (process.platform !== "win32") { const dfd = fs.openSync(DIR, "r"); try { fs.fsyncSync(dfd); } finally { fs.closeSync(dfd); } }
+      return true;
+    } catch (e) { log("inbox: could not persist", PENDING_FILES, e.message); return false; }
+  };
+  const pendingKey = (msg) => `${msg.chat.id}:${msg.message_id}`;
+  const inFlight = new Map(); // pendingKey -> the run handling it (a replay and a re-sent update share it)
+  function fileIncoming(msg, sidHint) {
+    const key = pendingKey(msg);
+    if (inFlight.has(key)) return inFlight.get(key);
+    const run = (async () => {
+      let keep = false;
+      try { keep = (await fileIncomingNow(msg, sidHint)) === "keep"; }
+      finally {
+        inFlight.delete(key);
+        const i = pendingFiles.findIndex((x) => pendingKey(x.msg) === key);
+        // kept: the file did not come and the human could not be told — the next relay start tries again
+        if (keep) log(`inbox: file message ${key} kept in ${PENDING_FILES} — not delivered and the human could not be told; tried again at the next start`);
+        else if (i >= 0) { pendingFiles.splice(i, 1); savePending(); }
+      }
+    })();
+    inFlight.set(key, run);
+    return run;
+  }
+  async function fileIncomingNow(msg, sidHint) {
+    const chatId = String(msg.chat.id);
+    if (!fromOurChat(msg.chat)) { log(`ignoring a file from ${who(msg.chat, msg.from)} — not the paired chat`); return; }
+    noteTail(chatId, msg.message_thread_id, msg.message_id);
+    const thread = msg.message_thread_id, replyTo = msg.reply_to_message?.message_id;
+    const back = (t) => tg("sendMessage", { chat_id: msg.chat.id, ...(thread ? { message_thread_id: thread } : {}), text: t, reply_parameters: { message_id: msg.message_id, allow_sending_without_reply: true } });
+    const caption = String(msg.caption ?? "").trim();
+    const at = /^@([a-z0-9][\w-]{0,23})(?=$|[\s,:，：])[\s,:，：]*([\s\S]*)$/i.exec(caption);
+    // which session: its topic, a reply to its message, or "@nick" at the start of the caption
+    let sid = (sidHint && ctx.chat?.get(sidHint) ? sidHint : null) || (thread && chatSidByThread(chatId, thread)) || (replyTo && owners.get(`${chatId}:${replyTo}`)) || null;
+    let text = caption;
+    if (at && ctx.chat?.byNick(at[1]) && (!sid || ctx.chat.byNick(at[1]) === sid)) { sid = ctx.chat.byNick(at[1]); text = at[2].trim(); }
+    if (!sid) { await back("📎 檔案只能傳給開了聊天(/myna:chat)的 session:在它的 💬 topic 裡傳,或在說明文字開頭寫 @暱稱。"); return; }
+    const nick = ctx.chat?.get(sid)?.nick || chatTopics.get(sid)?.nick || "session";
+    if (!ctx.chat?.isLive(sid)) { await back(`🔒 ${nick} 已經結束,檔案沒有送出。`); return; }
+    const m = mediaOf(msg);
+    if (!m) { await back("📎 這種類型還不支援,請改用「檔案」傳送(迴紋針 → 檔案)。"); return; }
+    if (m.f.file_size > inbox.MAX_FILE_BYTES) { await back(`📎 超過 20 MB(Telegram bot 的下載上限),沒有交給 ${nick}。`); return; }
+    // picked up again after a restart: the session may have it already
+    const cs = ctx.chat?.get(sid);
+    if ([...(cs?.inbox || []), ...(cs?.unacked || [])].some((x) => String(x.chat) === chatId && x.message_id === msg.message_id)) return;
+    // journaled before anything is downloaded (still within the update's own turn: Telegram counts it as
+    // handled at the next poll). A journal that cannot be written means a relay stop mid-way would lose the
+    // file without a word — so it is not taken, and the human is told
+    const key = pendingKey(msg);
+    if (!pendingFiles.some((x) => pendingKey(x.msg) === key)) {
+      pendingFiles.push({ msg, sid, at: new Date().toISOString() });
+      if (!savePending()) {
+        pendingFiles.splice(pendingFiles.findIndex((x) => pendingKey(x.msg) === key), 1);
+        const label = m.photo ? "照片" : `「${inbox.displayName(m.name) || "檔案"}」`;
+        log(`inbox: file message ${key} not taken — its journal entry could not be written`);
+        await back(`⚠️ 附檔${label}寫檔失敗(處理紀錄寫不進去),沒有收下,請再傳一次。`);
+        return;
+      }
+    }
+    talkTo(sid);
+    inbox.prune(DIR, cfg, log).catch((e) => log("inbox prune err", e.message));
+    const when = new Date().toISOString();
+    let file;
+    try { file = await inSlot(() => download(sid, m, when)); }
+    catch (e) {
+      const why = failReason(e);
+      log(`chat: a file for ${nick} was not saved (${why}): ${redact(e?.message || e)}`);
+      const told = await back(`⚠️ 檔案沒有下載成功(${why}),沒有交給 ${nick},請再傳一次。`);
+      return told?.ok ? undefined : "keep";
+    }
+    const from = [msg.from?.first_name, msg.from?.last_name].filter(Boolean).join(" ") || msg.from?.username || "";
+    const to = msg.reply_to_message;
+    const reply_to = to?.message_id ? { message_id: to.message_id, text: String(to.text ?? to.caption ?? "").slice(0, 4000) } : undefined;
+    const r = ctx.chat?.deliver(sid, { text, from, chat: chatId, message_id: msg.message_id, at: when, file, ...(reply_to ? { reply_to } : {}) }) || { closed: true };
+    log(`chat: file ${file.fid} (${inbox.fmtSize(file.size)}) saved for ${nick}`);
+    if (r.closed) { const told = await back(`🔒 ${nick} 已經結束,檔案沒有送出。`); return told?.ok ? undefined : "keep"; }
+    else if (r.stale) await back(`⚠️ ${nick} 目前沒有回應(可能卡住或已關閉),檔案先排隊,它恢復後會收到。`);
+  }
+  const talkTo = (sid) => { const c = chatTopics.get(sid); if (c) { c.talked = Date.now(); saveChatTopics(); } };
+
   // send a message for a request: into its session topic (if any) + reply_to threading on thread_id.
   // A topic the human deleted/closed ("message thread not found") is recreated once; if that fails
   // too, the message goes to the flat chat — the gate must never be lost over topic bookkeeping.
@@ -690,6 +848,8 @@ export function create(cfg, ctx) {
       }
       return;
     }
+    // a file (document / photo / other media) without text: for a chat session — never a question's answer
+    if (u.message && !u.message.text && hasFile(u.message)) return fileIncoming(u.message);
     if (u.message && u.message.text) {
       const msg = u.message;
       const pm = /^[!！]pair(?:\s+(\S+))?\s*$/i.exec(msg.text.trim());
@@ -846,6 +1006,11 @@ export function create(cfg, ctx) {
 
   async function start() {
     let offset = 0;
+    // file messages a stopped relay was still handling (see PENDING_FILES)
+    if (pendingFiles.length) {
+      log(`inbox: ${pendingFiles.length} file message(s) from before the restart — handling them again`);
+      for (const x of [...pendingFiles]) fileIncoming(x.msg, x.sid).catch((e) => log("fileIncoming err", redact(e.message)));
+    }
     log(`Telegram getUpdates long-poll started (topics=${TOPICS ? "auto" : "off"}, scope=${SCOPE}, round_grace=${ROUND_GRACE_MS / 1000}s, on_end=${ON_END}, ${topics.size} known session topic(s), answers from chat ${CHAT_ID ?? "(none — run /myna:pair)"})`);
     // diagnostics: Bot API 9.3+ getMe reports whether Threaded Mode is on — say so up front, so a
     // "why is everything in one window?" question is answered by the first lines of relay.log.
