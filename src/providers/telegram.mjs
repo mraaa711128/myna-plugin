@@ -635,10 +635,6 @@ export function create(cfg, ctx) {
   function fileIncoming(msg) {
     const key = pendingKey(msg);
     if (inFlight.has(key)) return inFlight.get(key);
-    if (!pendingFiles.some((x) => pendingKey(x.msg) === key)) {
-      pendingFiles.push({ msg, at: new Date().toISOString() });
-      if (!savePending()) log(`inbox: file message ${key} is handled without a journal entry (a relay stop mid-way would lose it)`);
-    }
     const run = (async () => {
       try { await fileIncomingNow(msg); }
       finally {
@@ -671,6 +667,20 @@ export function create(cfg, ctx) {
     // picked up again after a restart: the session may have it already
     const cs = ctx.chat?.get(sid);
     if ([...(cs?.inbox || []), ...(cs?.unacked || [])].some((x) => String(x.chat) === chatId && x.message_id === msg.message_id)) return;
+    // journaled before anything is downloaded (still within the update's own turn: Telegram counts it as
+    // handled at the next poll). A journal that cannot be written means a relay stop mid-way would lose the
+    // file without a word — so it is not taken, and the human is told
+    const key = pendingKey(msg);
+    if (!pendingFiles.some((x) => pendingKey(x.msg) === key)) {
+      pendingFiles.push({ msg, at: new Date().toISOString() });
+      if (!savePending()) {
+        pendingFiles.splice(pendingFiles.findIndex((x) => pendingKey(x.msg) === key), 1);
+        const label = m.photo ? "照片" : `「${inbox.displayName(m.name) || "檔案"}」`;
+        log(`inbox: file message ${key} not taken — its journal entry could not be written`);
+        await back(`⚠️ 附檔${label}寫檔失敗(處理紀錄寫不進去),沒有收下,請再傳一次。`);
+        return;
+      }
+    }
     talkTo(sid);
     inbox.prune(DIR, cfg, log).catch((e) => log("inbox prune err", e.message));
     const when = new Date().toISOString();

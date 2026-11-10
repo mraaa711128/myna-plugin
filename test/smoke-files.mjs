@@ -261,6 +261,21 @@ let firstPath;
   await startRelay();
   A.token = (await api("/chat/register", { session_id: "s-a", nick: "egret", label: "app" }, SECRET())).token;
   ok(fs.readdirSync(tmp).some((f) => f.startsWith("inbox-pending.json.bad-")) && /could not be read/.test(fs.readFileSync(LOG, "utf8")), "an unreadable journal is kept aside (.bad-*) and logged, not overwritten silently");
+  // the journal cannot be written (its place taken by a folder) → the file is not taken, the human is told
+  const J = path.join(tmp, "inbox-pending.json");
+  fs.rmSync(J, { recursive: true, force: true }); fs.mkdirSync(J);
+  const downloadsBefore = of("download").length;
+  const nj = sendDoc({ thread: tA, name: "nojournal.pdf" });
+  await until(() => repliesTo(nj.id).length, 6000);
+  const r = repliesTo(nj.id)[0]?.text || "";
+  ok(/附檔「nojournal\.pdf」寫檔失敗.*沒有收下/.test(r) && of("download").length === downloadsBefore, `journal not writable → "${r}", nothing downloaded`);
+  await sleep(500);
+  const tj = await api("/chat/take", { max: 20 }, A.token);
+  ok(!tj.messages?.some((m) => m.text.includes("nojournal.pdf")), "…and nothing handed to the session");
+  fs.rmSync(J, { recursive: true, force: true });
+  sendDoc({ thread: tA, name: "journal-back.pdf" });
+  const [jb] = await takeAll(A.token, 1, 6000);
+  ok(jb?.file_path && jb.text.includes("journal-back.pdf"), "…once the journal can be written again, files are taken again");
 }
 
 // 9) retention: /myna:files keep, pruned before the next file; a pruned file shows as unavailable
