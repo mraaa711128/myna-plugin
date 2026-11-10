@@ -568,10 +568,12 @@ export function create(cfg, ctx) {
   const FILE_TIMEOUT_MS = Number(cfg.MYNA_FILE_TIMEOUT_MS || 60000);
   const OTHER_MEDIA = ["video", "audio", "voice", "animation", "video_note", "sticker"];
   const mediaOf = (msg) => {
+    if (OTHER_MEDIA.some((k) => msg[k])) return null; // an animation also carries `document` (Bot API, for older clients)
     if (msg.document?.file_id) return { f: msg.document, name: msg.document.file_name || "", mime: msg.document.mime_type || "" };
     if (Array.isArray(msg.photo) && msg.photo.length) {
       // the biggest size (by bytes, else by pixels) — not the array order, which the docs do not promise
-      const big = [...msg.photo].sort((a, b) => (b.file_size || 0) - (a.file_size || 0) || (b.width * b.height || 0) - (a.width * a.height || 0))[0];
+      const px = (x) => (x.width || 0) * (x.height || 0);
+      const big = [...msg.photo].sort((a, b) => (a.file_size > 0 && b.file_size > 0 ? b.file_size - a.file_size : 0) || px(b) - px(a))[0];
       return { f: big, name: "", mime: "image/jpeg", photo: true };
     }
     return null;
@@ -632,18 +634,18 @@ export function create(cfg, ctx) {
       } finally { fs.closeSync(fd); }
       fs.renameSync(tmp, PENDING_FILES);
       // the rename itself survives a power cut once the folder is synced (POSIX; Windows cannot open a folder for it)
-      if (process.platform !== "win32") { try { const dfd = fs.openSync(DIR, "r"); try { fs.fsyncSync(dfd); } finally { fs.closeSync(dfd); } } catch {} }
+      if (process.platform !== "win32") { const dfd = fs.openSync(DIR, "r"); try { fs.fsyncSync(dfd); } finally { fs.closeSync(dfd); } }
       return true;
     } catch (e) { log("inbox: could not persist", PENDING_FILES, e.message); return false; }
   };
   const pendingKey = (msg) => `${msg.chat.id}:${msg.message_id}`;
   const inFlight = new Map(); // pendingKey -> the run handling it (a replay and a re-sent update share it)
-  function fileIncoming(msg) {
+  function fileIncoming(msg, sidHint) {
     const key = pendingKey(msg);
     if (inFlight.has(key)) return inFlight.get(key);
     const run = (async () => {
       let keep = false;
-      try { keep = (await fileIncomingNow(msg)) === "keep"; }
+      try { keep = (await fileIncomingNow(msg, sidHint)) === "keep"; }
       finally {
         inFlight.delete(key);
         const i = pendingFiles.findIndex((x) => pendingKey(x.msg) === key);
@@ -655,7 +657,7 @@ export function create(cfg, ctx) {
     inFlight.set(key, run);
     return run;
   }
-  async function fileIncomingNow(msg) {
+  async function fileIncomingNow(msg, sidHint) {
     const chatId = String(msg.chat.id);
     if (!fromOurChat(msg.chat)) { log(`ignoring a file from ${who(msg.chat, msg.from)} — not the paired chat`); return; }
     noteTail(chatId, msg.message_thread_id, msg.message_id);
@@ -664,7 +666,7 @@ export function create(cfg, ctx) {
     const caption = String(msg.caption ?? "").trim();
     const at = /^@([a-z0-9][\w-]{0,23})(?=$|[\s,:，：])[\s,:，：]*([\s\S]*)$/i.exec(caption);
     // which session: its topic, a reply to its message, or "@nick" at the start of the caption
-    let sid = (thread && chatSidByThread(chatId, thread)) || (replyTo && owners.get(`${chatId}:${replyTo}`)) || null;
+    let sid = (sidHint && ctx.chat?.get(sidHint) ? sidHint : null) || (thread && chatSidByThread(chatId, thread)) || (replyTo && owners.get(`${chatId}:${replyTo}`)) || null;
     let text = caption;
     if (at && ctx.chat?.byNick(at[1]) && (!sid || ctx.chat.byNick(at[1]) === sid)) { sid = ctx.chat.byNick(at[1]); text = at[2].trim(); }
     if (!sid) { await back("📎 檔案只能傳給開了聊天(/myna:chat)的 session:在它的 💬 topic 裡傳,或在說明文字開頭寫 @暱稱。"); return; }
@@ -681,7 +683,7 @@ export function create(cfg, ctx) {
     // file without a word — so it is not taken, and the human is told
     const key = pendingKey(msg);
     if (!pendingFiles.some((x) => pendingKey(x.msg) === key)) {
-      pendingFiles.push({ msg, at: new Date().toISOString() });
+      pendingFiles.push({ msg, sid, at: new Date().toISOString() });
       if (!savePending()) {
         pendingFiles.splice(pendingFiles.findIndex((x) => pendingKey(x.msg) === key), 1);
         const label = m.photo ? "照片" : `「${inbox.displayName(m.name) || "檔案"}」`;
@@ -706,7 +708,7 @@ export function create(cfg, ctx) {
     const reply_to = to?.message_id ? { message_id: to.message_id, text: String(to.text ?? to.caption ?? "").slice(0, 4000) } : undefined;
     const r = ctx.chat?.deliver(sid, { text, from, chat: chatId, message_id: msg.message_id, at: when, file, ...(reply_to ? { reply_to } : {}) }) || { closed: true };
     log(`chat: file ${file.fid} (${inbox.fmtSize(file.size)}) saved for ${nick}`);
-    if (r.closed) await back(`🔒 ${nick} 已經結束,檔案沒有送出。`);
+    if (r.closed) { const told = await back(`🔒 ${nick} 已經結束,檔案沒有送出。`); return told?.ok ? undefined : "keep"; }
     else if (r.stale) await back(`⚠️ ${nick} 目前沒有回應(可能卡住或已關閉),檔案先排隊,它恢復後會收到。`);
   }
   const talkTo = (sid) => { const c = chatTopics.get(sid); if (c) { c.talked = Date.now(); saveChatTopics(); } };
@@ -1007,7 +1009,7 @@ export function create(cfg, ctx) {
     // file messages a stopped relay was still handling (see PENDING_FILES)
     if (pendingFiles.length) {
       log(`inbox: ${pendingFiles.length} file message(s) from before the restart — handling them again`);
-      for (const x of [...pendingFiles]) fileIncoming(x.msg).catch((e) => log("fileIncoming err", redact(e.message)));
+      for (const x of [...pendingFiles]) fileIncoming(x.msg, x.sid).catch((e) => log("fileIncoming err", redact(e.message)));
     }
     log(`Telegram getUpdates long-poll started (topics=${TOPICS ? "auto" : "off"}, scope=${SCOPE}, round_grace=${ROUND_GRACE_MS / 1000}s, on_end=${ON_END}, ${topics.size} known session topic(s), answers from chat ${CHAT_ID ?? "(none — run /myna:pair)"})`);
     // diagnostics: Bot API 9.3+ getMe reports whether Threaded Mode is on — say so up front, so a

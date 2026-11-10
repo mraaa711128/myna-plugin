@@ -174,6 +174,14 @@ let firstPath;
   ok(m?.file_path?.endsWith(".jpg") && fs.readFileSync(m.file_path).equals(files.get(big).bytes) && m.text.includes("原檔名：photo.jpg"), `photo → the biggest size saved as .jpg (${m?.file_path})`);
 }
 
+// 2b) a photo whose biggest size has no file_size → still the biggest (by pixels)
+{
+  const a = addFile(crypto.randomBytes(300)), b = addFile(crypto.randomBytes(4000));
+  push({ message_thread_id: tA, photo: [{ file_id: a, file_unique_id: "q1", width: 90, height: 60, file_size: 300 }, { file_id: b, file_unique_id: "q2", width: 1280, height: 960 }] });
+  const [m] = await takeAll(A.token);
+  ok(m?.file_path && fs.readFileSync(m.file_path).equals(files.get(b).bytes), "photo: the biggest size has no file_size → chosen by pixels");
+}
+
 // 3) an album: several messages, one media_group_id → each saved, taken together
 {
   for (let i = 0; i < 3; i++) sendDoc({ thread: tA, name: `a${i}.txt`, mime: "text/plain", group: "g1", ...(i === 0 ? { caption: "三個檔" } : {}) });
@@ -222,9 +230,13 @@ let firstPath;
 
 // 7) unsupported types → told to send it as a file
 {
-  const ids = [push({ message_thread_id: tA, video: { file_id: "V1", file_unique_id: "v" } }), push({ message_thread_id: tA, voice: { file_id: "V2", file_unique_id: "w" } }), push({ message_thread_id: tA, sticker: { file_id: "V3", file_unique_id: "s" } })];
+  const gets = of("getFile").length;
+  const anim = addFile(crypto.randomBytes(500));
+  const ids = [push({ message_thread_id: tA, video: { file_id: "V1", file_unique_id: "v" } }), push({ message_thread_id: tA, voice: { file_id: "V2", file_unique_id: "w" } }), push({ message_thread_id: tA, sticker: { file_id: "V3", file_unique_id: "s" } }),
+    // an animation also carries `document` (as Telegram sends it)
+    push({ message_thread_id: tA, animation: { file_id: anim, file_unique_id: "a" }, document: { file_id: anim, file_unique_id: "a", file_name: "x.gif.mp4", mime_type: "video/mp4", file_size: 500 } })];
   await until(() => ids.every((id) => repliesTo(id).length));
-  ok(ids.every((id) => /改用「檔案」傳送/.test(repliesTo(id)[0]?.text || "")), "video / voice / sticker → \"請改用「檔案」傳送\"");
+  ok(ids.every((id) => /改用「檔案」傳送/.test(repliesTo(id)[0]?.text || "")) && of("getFile").length === gets, "video / voice / sticker / an animation (with its document) → \"請改用「檔案」傳送\", no getFile");
 }
 
 // 8) a failed download: a fixed reason; the token nowhere
