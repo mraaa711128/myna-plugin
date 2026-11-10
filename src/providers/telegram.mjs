@@ -594,12 +594,37 @@ export function create(cfg, ctx) {
     const filePath = String(g.result.file_path).split("/").map(encodeURIComponent).join("/");
     const res = await fetch(`${API_ROOT}/file/bot${TOKEN}/${filePath}`, { signal: AbortSignal.timeout(FILE_TIMEOUT_MS) });
     if (!res.ok || !res.body) throw Object.assign(new Error(`download: HTTP ${res.status}`), { code: "refused" });
-    if (Number(res.headers.get("content-length")) > inbox.MAX_FILE_BYTES) throw Object.assign(new Error("too big"), { code: "too_big" });
+    // the size Telegram gave (getFile, else the message): a body that ends short is not taken for the file
+    const want = Number.isFinite(g.result.file_size) ? g.result.file_size : Number.isFinite(m.f.file_size) ? m.f.file_size : undefined;
+    const cl = res.headers.get("content-length");
+    if (Number(cl) > inbox.MAX_FILE_BYTES) { await res.body.cancel().catch(() => {}); throw Object.assign(new Error("too big"), { code: "too_big" }); }
+    if (cl && want !== undefined && Number(cl) !== want) { await res.body.cancel().catch(() => {}); throw Object.assign(new Error(`download: ${cl} bytes, expected ${want}`), { code: "refused" }); }
     const fid = inbox.newFid();
-    const saved = await inbox.save({ dir: DIR, sid, name: inbox.fileName({ fid, original: m.name, mime: m.mime, at }), body: res.body });
+    let saved;
+    try { saved = await inbox.save({ dir: DIR, sid, name: inbox.fileName({ fid, original: m.name, mime: m.mime, at }), body: res.body, size: want }); }
+    catch (e) { if (e?.code === "mismatch") e.code = "refused"; throw e; }
     return { fid, name: m.photo ? "photo.jpg" : inbox.displayName(m.name), mime: m.mime, size: saved.size, sha256: saved.sha256, path: saved.path };
   }
+  // getUpdates confirms an update before its file is down: a file message being handled is journaled
+  // (inbox-pending.json, 0600) until it is delivered or answered, and a relay that stopped mid-way picks
+  // it up again at start — skipped when the session already has that message
+  const PENDING_FILES = path.join(DIR, "inbox-pending.json");
+  const pendingFiles = (() => { try { const j = JSON.parse(fs.readFileSync(PENDING_FILES, "utf8")); return Array.isArray(j) ? j.filter((x) => x?.msg?.chat) : []; } catch { return []; } })();
+  const savePending = () => {
+    try { fs.mkdirSync(DIR, { recursive: true }); fs.writeFileSync(PENDING_FILES, JSON.stringify(pendingFiles), { mode: 0o600 }); }
+    catch (e) { log("inbox: could not persist", PENDING_FILES, e.message); }
+  };
+  const pendingKey = (msg) => `${msg.chat.id}:${msg.message_id}`;
   async function fileIncoming(msg) {
+    const key = pendingKey(msg);
+    if (!pendingFiles.some((x) => pendingKey(x.msg) === key)) { pendingFiles.push({ msg, at: new Date().toISOString() }); savePending(); }
+    try { await fileIncomingNow(msg); }
+    finally {
+      const i = pendingFiles.findIndex((x) => pendingKey(x.msg) === key);
+      if (i >= 0) { pendingFiles.splice(i, 1); savePending(); }
+    }
+  }
+  async function fileIncomingNow(msg) {
     const chatId = String(msg.chat.id);
     if (!fromOurChat(msg.chat)) { log(`ignoring a file from ${who(msg.chat, msg.from)} — not the paired chat`); return; }
     noteTail(chatId, msg.message_thread_id, msg.message_id);
@@ -617,6 +642,9 @@ export function create(cfg, ctx) {
     const m = mediaOf(msg);
     if (!m) { await back("📎 這種類型還不支援,請改用「檔案」傳送(迴紋針 → 檔案)。"); return; }
     if (m.f.file_size > inbox.MAX_FILE_BYTES) { await back(`📎 超過 20 MB(Telegram bot 的下載上限),沒有交給 ${nick}。`); return; }
+    // picked up again after a restart: the session may have it already
+    const cs = ctx.chat?.get(sid);
+    if ([...(cs?.inbox || []), ...(cs?.unacked || [])].some((x) => String(x.chat) === chatId && x.message_id === msg.message_id)) return;
     talkTo(sid);
     try { inbox.prune(DIR, inbox.readKeep(inbox.keepFile(DIR, cfg)).days, log); } catch (e) { log("inbox prune err", e.message); }
     const when = new Date().toISOString();
@@ -931,6 +959,11 @@ export function create(cfg, ctx) {
 
   async function start() {
     let offset = 0;
+    // file messages a stopped relay was still handling (see PENDING_FILES)
+    if (pendingFiles.length) {
+      log(`inbox: ${pendingFiles.length} file message(s) from before the restart — handling them again`);
+      for (const x of [...pendingFiles]) fileIncoming(x.msg).catch((e) => log("fileIncoming err", redact(e.message)));
+    }
     log(`Telegram getUpdates long-poll started (topics=${TOPICS ? "auto" : "off"}, scope=${SCOPE}, round_grace=${ROUND_GRACE_MS / 1000}s, on_end=${ON_END}, ${topics.size} known session topic(s), answers from chat ${CHAT_ID ?? "(none — run /myna:pair)"})`);
     // diagnostics: Bot API 9.3+ getMe reports whether Threaded Mode is on — say so up front, so a
     // "why is everything in one window?" question is answered by the first lines of relay.log.

@@ -122,8 +122,12 @@ const tsrv = http.createServer((req, res) => {
     if (brk.how === "cut") { res.writeHead(200, { "content-length": "100000" }); res.write("partial"); return setTimeout(() => req.socket.destroy(), 30); }
     if (brk.how === "wrong") { const b = Buffer.from("not the file"); res.writeHead(200, { "content-length": String(b.length) }); return res.end(b); }
   }
-  const fwd = http.request({ host: "127.0.0.1", port: R, method: req.method, path: req.url, headers: req.headers }, (r) => { res.writeHead(r.statusCode, r.headers); r.pipe(res); });
-  fwd.on("error", () => { res.writeHead(502); res.end("bad gateway"); });
+  const delay = fm && tunnel.slowFile ? tunnel.slowFile : 0;
+  const fwd = http.request({ host: "127.0.0.1", port: R, method: req.method, path: req.url, headers: req.headers }, (r) => {
+    const go = () => { if (res.destroyed || res.headersSent) return r.resume(); res.writeHead(r.statusCode, r.headers); r.pipe(res); };
+    delay ? setTimeout(go, delay) : go();
+  });
+  fwd.on("error", () => { if (res.headersSent) return res.destroy(); res.writeHead(502); res.end("bad gateway"); });
   req.pipe(fwd);
 });
 await new Promise((r) => tsrv.listen(0, "127.0.0.1", r));
@@ -211,6 +215,51 @@ let fidFirst;
   ok(bad && !bad.file_path && bad.text.includes(inbox.UNAVAILABLE), `13: wrong bytes every time → after 3 tries "${bad?.text.split("\n")[1]}", no file_path`);
   ok(after && got.indexOf(bad) < got.indexOf(after), "13: …the text sent after it arrives, after it");
   ok(edgeLogs.mbp.join("").includes("(3/3)"), "13: …the edge logged the 3 tries");
+}
+
+// === 13b. a file the hub answers 500 for every time → given up after 3 as well ====================================
+{
+  tunnel.breakAll = { how: "500", n: 99 };
+  hubTg.doc(topicA, "always500.pdf");
+  await sleep(300);
+  hubTg.say(topicA, "500 之後的字");
+  const got = await takeN(mbpChat, A.json.token, 2, 20000);
+  tunnel.breakAll = null;
+  const b = got.find((m) => m.text.includes("always500.pdf"));
+  ok(b && !b.file_path && b.text.includes(inbox.UNAVAILABLE) && got.some((m) => m.text === "500 之後的字"), `13b: 500 every time → given up after 3, "${b?.text.split("\n")[1]}"; the next message arrives`);
+}
+
+// === 13c. the edge restarts while a file is on its way → delivered once ==========================================
+{
+  tunnel.slowFile = 2500;
+  const seen0 = tunnel.log.length;
+  const bytes = hubTg.doc(topicA, "edge-restart.pdf");
+  await until(() => tunnel.log.slice(seen0).some((e) => /^\/chat\/file\//.test(e.url)), 8000);
+  mbp.kill(); await until(async () => !(await health(EDGE)), 5000);
+  tunnel.slowFile = 0;
+  mbp = startEdge("mbp", EM, mbpEnv);
+  await up(`${EDGE}/health`);
+  await until(async () => (await health(EDGE))?.upstream?.active, 10000);
+  A = await mbpChat.register({ session_id: "s-1", nick: "egret", label: "mbp-app" });
+  const got = await takeN(mbpChat, A.json.token, 1, 20000);
+  await sleep(1500);
+  const more = await mbpChat.take(A.json.token);
+  ok(got.length === 1 && got[0].text.includes("edge-restart.pdf") && fs.readFileSync(got[0].file_path).equals(bytes) && !(more.json?.messages || []).length, "13c: the edge restarted mid-fetch → the file arrives once, whole");
+}
+
+// === 13d. a file already on the edge (saved before a restart, not yet acked) is not fetched again ====================
+{
+  tunnel.down = true;
+  await until(async () => (await health(EDGE))?.upstream?.reachable === false);
+  const bytes = hubTg.doc(topicA, "already.pdf");
+  const hm = await until(() => [...(hubInbox()[sidHub]?.inbox || []), ...(hubInbox()[sidHub]?.unacked || [])].find((x) => x.file?.name === "already.pdf"));
+  const name = inbox.fileName({ fid: hm.file.fid, original: hm.file.name, mime: hm.file.mime, at: hm.at });
+  const sdir = inbox.sessionDir(MBP_DIR, "s-1"); fs.mkdirSync(sdir, { recursive: true });
+  fs.writeFileSync(path.join(sdir, name), bytes);
+  const before = tunnel.log.length;
+  tunnel.down = false;
+  const [m] = await takeN(mbpChat, A.json.token, 1, 20000);
+  ok(m?.file_path && fs.readFileSync(m.file_path).equals(bytes) && !tunnel.log.slice(before).some((e) => e.url === `/chat/file/${hm.file.fid}`), "13d: the file already there (same size and sha256) → used, no second GET");
 }
 
 // === 14. the hub away, then restarted: the file sent meanwhile still arrives ================================

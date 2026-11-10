@@ -21,7 +21,8 @@ const cmd = cmd0.toLowerCase();
 if (cmd === "keep") {
   const a = String(arg ?? "").trim().toLowerCase();
   if (a === "default") {
-    try { fs.rmSync(FILE, { force: true }); } catch {}
+    try { fs.rmSync(FILE, { force: true }); }
+    catch (e) { console.error(`設定檔刪不掉(${e.code || e.message}),保留天數沒有改:${FILE}`); process.exit(1); }
     console.log(`附檔保留期間改回預設 ${KEEP_DEFAULT_DAYS} 天(收檔後算起)。檔案:${FILE}`);
     process.exit(0);
   }

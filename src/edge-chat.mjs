@@ -131,6 +131,10 @@ export function createEdgeChat({ hub, log, secretOk, save, dir, cfg = {} }) {
       return null;
     };
     const drop = (r) => r.body?.cancel().catch(() => {});
+    const name = inbox.fileName({ fid: f.fid, original: f.name, mime: f.mime, at: m.at });
+    // fetched before (and the edge restarted before it was acked): not fetched again
+    const have = inbox.existing({ dir, sid, name, sha256: f.sha256, size: Number.isFinite(f.size) ? f.size : undefined });
+    if (have) { if (s.fileFails[f.fid]) { delete s.fileFails[f.fid]; changed(); } return have; }
     let r;
     try {
       r = await fetch(`${hub.url}/chat/file/${f.fid}`, {
@@ -151,11 +155,13 @@ export function createEdgeChat({ hub, log, secretOk, save, dir, cfg = {} }) {
     if (cl && (len > inbox.MAX_FILE_BYTES || (Number.isFinite(f.size) && len !== f.size))) { await drop(r); return strike("wrong size"); }
     try {
       try { inbox.prune(dir, inbox.readKeep(inbox.keepFile(dir, cfg)).days, log); } catch {}
-      const saved = await inbox.save({ dir, sid, name: inbox.fileName({ fid: f.fid, original: f.name, mime: f.mime, at: m.at }), body: r.body, sha256: f.sha256, size: Number.isFinite(f.size) ? f.size : undefined });
+      const saved = await inbox.save({ dir, sid, name, body: r.body, sha256: f.sha256, size: Number.isFinite(f.size) ? f.size : undefined });
       if (s.fileFails[f.fid]) { delete s.fileFails[f.fid]; changed(); }
       return saved.path;
     } catch (e) {
-      if (e?.code === "too_big" || e?.code === "mismatch" || e?.code === "write") return strike(e.code);
+      if (e?.code === "too_big" || e?.code === "mismatch") return strike(e.code);
+      // this machine's disk (full, no permission…): the hub's file is fine — try again later, never given up on
+      if (e?.code === "write") { log(`edge chat: file ${f.fid} for ${sid} could not be saved here (${e.message}) — trying again`); return "retry"; }
       hub.markDown(`file download cut (${e?.name === "TimeoutError" ? "timeout" : e?.message || e})`);
       return "retry";
     }

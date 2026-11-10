@@ -239,6 +239,7 @@ export const register = (on) => {
 
   async function registerNow() {
     const id = await io.sessionId();
+    if (sid && sid !== id) mayRead.clear(); // another session now: the files handed to the old one are not its
     if (sid && sid !== id && token) await close(); // a /clear: the old conversation is over
     let secret = "";
     try { secret = String(await io.read(cfg.secretFile)).trim(); } catch {}
@@ -373,6 +374,7 @@ export const register = (on) => {
   }
 
   on("session.start", async ($, e, next) => {
+    mayRead.clear(); // a new (or resumed) session: nothing handed to it yet
     const r = await next(e);
     io = {
       fetch: (url, init) => $.http.fetch(url, init),
@@ -419,6 +421,7 @@ export const register = (on) => {
     // after a /clear or an in-app /resume the process goes on under another session id: keep polling,
     // the next tick registers that one; any other reason is the process going away
     if (e.reason !== "clear" && e.reason !== "resume") stop();
+    mayRead.clear();
     await close();
     return next(e);
   });
@@ -495,13 +498,13 @@ export const register = (on) => {
       const s = await $.settings.read();
       if (s?.permissions?.blockReadsOutsideWorkingDirectories === true) return d;
       const st = await $.fs.stat(p, { resolve: true });
-      if (!st || st.isLink !== false) return d;
+      if (!st || st.kind !== "file" || st.isLink !== false) return d;
       if (typeof st.realPath === "string") { if (readKey(st.realPath) !== key) return d; }
       else {
         // no realPath (an older CLI): the two folders above it must not be links either
         const a = await $.fs.stat(parentOf(p));
         const b = await $.fs.stat(parentOf(parentOf(p)));
-        if (!a || a.isLink !== false || !b || b.isLink !== false) return d;
+        if (!a || a.kind !== "dir" || a.isLink !== false || !b || b.kind !== "dir" || b.isLink !== false) return d;
       }
     } catch { return d; }
     return { decision: "allow", reason: "myna:這個 session 從 Telegram 收到的附檔" };

@@ -104,10 +104,18 @@ export async function save({ dir, sid, name, body, maxBytes = MAX_FILE_BYTES, sh
       n += b.length;
       if (n > maxBytes) throw fail("too_big");
       hash.update(b);
-      try { fs.writeSync(fd, b); } catch (e) { throw fail("write", e.message); }
+      // writeSync may write less than asked: loop until the whole chunk is on disk
+      for (let off = 0; off < b.length;) {
+        let w;
+        try { w = fs.writeSync(fd, b, off, b.length - off); } catch (e) { throw fail("write", e.message); }
+        if (!(w > 0)) throw fail("write", "no progress writing the file");
+        off += w;
+      }
     }
+    const onDisk = fs.fstatSync(fd).size;
     fs.closeSync(fd); fd = null;
     const got = hash.digest("hex");
+    if (onDisk !== n) throw fail("write", `wrote ${onDisk} of ${n} bytes`);
     if ((sha256 && got !== sha256) || (size != null && n !== size)) throw fail("mismatch");
     try { fs.renameSync(part, final); } catch (e) { throw fail("write", e.message); }
     return { path: real(final), size: n, sha256: got };
@@ -116,6 +124,17 @@ export async function save({ dir, sid, name, body, maxBytes = MAX_FILE_BYTES, sh
     try { fs.unlinkSync(part); } catch {}
     throw e;
   }
+}
+
+// a final file already there with this size and sha256 (a retry after a restart) → its path, else null
+export function existing({ dir, sid, name, sha256, size }) {
+  const final = path.resolve(sessionDir(dir, sid), name);
+  try {
+    const st = fs.lstatSync(final);
+    if (!st.isFile() || st.isSymbolicLink() || (size != null && st.size !== size)) return null;
+    if (sha256 && sha256File(final) !== sha256) return null;
+    return real(final);
+  } catch { return null; }
 }
 
 // drop files (and .part leftovers) received more than `days` ago, then empty session folders. Best effort.

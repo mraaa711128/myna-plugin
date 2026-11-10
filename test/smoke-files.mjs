@@ -12,16 +12,21 @@
 // without a prompt (tool.check: ask → allow) and nothing else.
 import http from "node:http";
 import { spawn, spawnSync } from "node:child_process";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import path from "node:path";
 import os from "node:os";
 import fs from "node:fs";
 import crypto from "node:crypto";
 import * as inbox from "../src/inbox.mjs";
-import { register, readKey } from "../hooks/chat-mod.mjs";
+import { readKey } from "../hooks/chat-mod.mjs";
 
-const relayPath = fileURLToPath(new URL("../src/relay.mjs", import.meta.url));
-const filesScript = fileURLToPath(new URL("../scripts/files.mjs", import.meta.url));
+// MYNA_TEST_ROOT=<another checkout> runs the relay, the chat mod and /myna:files of that code (0.21.1 → the
+// file checks fail; the pure parts above them always test this checkout's helpers)
+const HERE = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const ROOT = process.env.MYNA_TEST_ROOT ? path.resolve(process.env.MYNA_TEST_ROOT) : HERE;
+const relayPath = path.join(ROOT, "src", "relay.mjs");
+const filesScript = path.join(ROOT, "scripts", "files.mjs");
+const { register } = await import(pathToFileURL(path.join(ROOT, "hooks", "chat-mod.mjs")).href);
 let failed = 0;
 const ok = (c, m) => { console.log(`${c ? "✅" : "❌"} ${m}`); if (!c) failed++; };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -57,6 +62,7 @@ const stub = http.createServer((req, res) => {
     const f = [...files.values()].find((x) => u.pathname === wantPrefix + x.file_path);
     if (!f) { res.writeHead(404); return res.end("no"); }
     if (f.mode === "500") { res.writeHead(500); return res.end("boom"); }
+    if (f.mode === "short") { res.writeHead(200); res.write(f.bytes.subarray(0, Math.floor(f.bytes.length / 2))); return res.end(); } // chunked, ends early, cleanly
     if (f.mode === "cut") { res.writeHead(200, { "content-length": String(f.bytes.length) }); res.write(f.bytes.subarray(0, 10)); return setTimeout(() => res.destroy(), 50); }
     if (f.mode === "huge") {
       res.writeHead(200); // chunked, no length: the relay has to count
@@ -65,7 +71,7 @@ const stub = http.createServer((req, res) => {
       res.on("error", () => {}); return pump();
     }
     const send = () => { res.writeHead(200, { "content-length": String(f.bytes.length) }); res.end(f.bytes); };
-    return f.mode === "slow" ? setTimeout(send, 2000) : send();
+    return f.mode === "slow" ? setTimeout(send, 2000) : f.mode === "slower" ? setTimeout(send, 2500) : send();
   }
   let body = ""; req.on("data", (c) => (body += c));
   req.on("end", () => {
@@ -96,6 +102,7 @@ const LOG = path.join(tmp, "relay.log");
 const KEEP = path.join(tmp, "inbox-keep");
 const CHAT_FILE = path.join(tmp, "chat-sessions.json");
 let relay;
+async function stopRelay() { relay.kill(); await new Promise((r) => relay.once("exit", r)); }
 async function startRelay() {
   const out = fs.openSync(LOG, "a");
   relay = spawn(process.execPath, [relayPath], {
@@ -226,6 +233,27 @@ let firstPath;
   const ra = repliesTo(a.id)[0]?.text || "", rb = repliesTo(b.id)[0]?.text || "";
   const fixed = /\((Telegram 拒絕|逾時|連不上 Telegram|超過 20 MB|寫檔失敗)\)/;
   ok(fixed.test(ra) && fixed.test(rb), `download 500 → "${ra}"; cut mid-way → "${rb}"`);
+  const c = sendDoc({ thread: tA, name: "short.pdf", extra: { mode: "short" } });
+  await until(() => repliesTo(c.id).length, 8000);
+  ok(fixed.test(repliesTo(c.id)[0]?.text || "") && !fs.readdirSync(sdirA).some((f) => f.endsWith(".part")), `a body that ends early without a length → "${repliesTo(c.id)[0]?.text}", nothing kept`);
+  const t = await api("/chat/take", { max: 20 }, A.token);
+  ok(!t.messages?.some((m) => /short\.pdf|f1\.pdf|f2\.pdf/.test(m.text)), "…none of the failed files reached the session");
+}
+
+// 8b) the relay stops while a file is downloading → picked up again at start, delivered once
+{
+  const d = sendDoc({ thread: tA, name: "restart.pdf", extra: { mode: "slower" } });
+  await until(() => of("download").some((x) => x.path.includes(files.get(d.file_id).file_path)), 5000);
+  await stopRelay();
+  ok(fs.existsSync(path.join(tmp, "inbox-pending.json")) && JSON.parse(fs.readFileSync(path.join(tmp, "inbox-pending.json"), "utf8")).some((x) => x.msg?.message_id === d.id), "a file message being downloaded is journaled (inbox-pending.json)");
+  await startRelay();
+  const A2 = await api("/chat/register", { session_id: "s-a", nick: "egret", label: "app" }, SECRET());
+  A.token = A2.token;
+  const got = await takeAll(A.token, 1, 10000);
+  await sleep(800);
+  const more = await api("/chat/take", { max: 20 }, A.token);
+  ok(got.filter((m) => m.text.includes("restart.pdf")).length === 1 && !more.messages?.length && got[0]?.file_path && fs.readFileSync(got[0].file_path).equals(d.bytes), "…the relay restarted mid-download delivers it once, whole");
+  ok(JSON.parse(fs.readFileSync(path.join(tmp, "inbox-pending.json"), "utf8")).length === 0, "…and the journal is empty again");
 }
 
 // 9) retention: /myna:files keep, pruned before the next file; a pruned file shows as unavailable
@@ -240,6 +268,10 @@ let firstPath;
   fs.writeFileSync(KEEP, "days=999\n");
   ok(inbox.readKeep(KEEP).days === 7 && inbox.readKeep(KEEP).bad && /讀不懂/.test(run().stdout), "an unreadable setting counts as the default 7 days, and status says so");
   ok(run("keep", "default").status === 0 && !fs.existsSync(KEEP), "keep default → the file is removed");
+  fs.mkdirSync(KEEP); // something that cannot be removed like a file
+  const stuck = run("keep", "default");
+  ok(stuck.status === 1 && fs.existsSync(KEEP) && /刪不掉/.test(stuck.stderr), `keep default when the setting cannot be removed → exit 1, says so (${stuck.stderr.trim()})`);
+  fs.rmSync(KEEP, { recursive: true, force: true });
   // a delivered message whose file is pruned before it is taken → "unavailable", no file_path
   sendDoc({ thread: tA, name: "late.pdf" });
   await until(async () => (JSON.parse(fs.readFileSync(CHAT_FILE, "utf8")).sessions["s-a"].inbox || []).some((m) => m.file?.name === "late.pdf"), 6000);
@@ -294,7 +326,7 @@ let firstPath;
     fs: {
       read: async (p) => fs.readFileSync(p, "utf8"),
       // like the engine: lstat (isLink), realPath with { resolve: true }
-      stat: async (p, o = {}) => { const s = fs.lstatSync(p); return { kind: s.isFile() ? "file" : s.isDirectory() ? "directory" : "other", size: s.size, mtimeMs: s.mtimeMs, isLink: s.isSymbolicLink(), ...(o.resolve ? { realPath: fs.realpathSync.native(p) } : {}) }; },
+      stat: async (p, o = {}) => { const s = fs.lstatSync(p); return { kind: s.isFile() ? "file" : s.isDirectory() ? "dir" : "other", size: s.size, mtimeMs: s.mtimeMs, isLink: s.isSymbolicLink(), ...(o.resolve ? { realPath: fs.realpathSync.native(p) } : {}) }; },
     },
     settings: { read: async () => settings },
     session: { id: async () => S.sid, root: async () => "/work/app", cwd: async () => "/work/app" },
@@ -339,6 +371,14 @@ let firstPath;
   else console.log("⏭ symlink test skipped (no symlink rights here)");
   try { fs.rmSync(p); } catch {} fs.writeFileSync(p, keep);
   ok((await check(p)).decision === "allow", "…restored → allow again");
+  fs.rmSync(p); fs.mkdirSync(p);
+  ok((await check(p)).decision === "ask", "the delivered path replaced by a folder → ask");
+  fs.rmSync(p, { recursive: true }); fs.writeFileSync(p, keep);
+  // another session in the same process (/clear, /resume): what the old one was handed is not its
+  S.sid = "s-m2";
+  await fire("session.end", { reason: "clear", sessionId: "s-m" });
+  await fire("session.start", { cwd: "/work/app", surface: "terminal", isInteractive: true });
+  ok((await check(p)).decision === "ask", "after a switch to another session → the old session's file is ask again");
   await fire("session.end", { reason: "prompt_input_exit", sessionId: "s-m" });
   for (const h of S.timers) clearInterval(h);
 }
