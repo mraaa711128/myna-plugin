@@ -624,9 +624,15 @@ export function create(cfg, ctx) {
     try {
       fs.mkdirSync(DIR, { recursive: true });
       const tmp = `${PENDING_FILES}.${process.pid}.tmp`;
+      const buf = Buffer.from(JSON.stringify(pendingFiles));
       const fd = fs.openSync(tmp, "w", 0o600);
-      try { fs.writeSync(fd, JSON.stringify(pendingFiles)); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+      try {
+        for (let off = 0; off < buf.length;) { const w = fs.writeSync(fd, buf, off, buf.length - off); if (!(w > 0)) throw new Error("no progress writing"); off += w; }
+        fs.fsyncSync(fd);
+      } finally { fs.closeSync(fd); }
       fs.renameSync(tmp, PENDING_FILES);
+      // the rename itself survives a power cut once the folder is synced (POSIX; Windows cannot open a folder for it)
+      if (process.platform !== "win32") { try { const dfd = fs.openSync(DIR, "r"); try { fs.fsyncSync(dfd); } finally { fs.closeSync(dfd); } } catch {} }
       return true;
     } catch (e) { log("inbox: could not persist", PENDING_FILES, e.message); return false; }
   };
@@ -636,11 +642,14 @@ export function create(cfg, ctx) {
     const key = pendingKey(msg);
     if (inFlight.has(key)) return inFlight.get(key);
     const run = (async () => {
-      try { await fileIncomingNow(msg); }
+      let keep = false;
+      try { keep = (await fileIncomingNow(msg)) === "keep"; }
       finally {
         inFlight.delete(key);
         const i = pendingFiles.findIndex((x) => pendingKey(x.msg) === key);
-        if (i >= 0) { pendingFiles.splice(i, 1); savePending(); }
+        // kept: the file did not come and the human could not be told — the next relay start tries again
+        if (keep) log(`inbox: file message ${key} kept in ${PENDING_FILES} — not delivered and the human could not be told; tried again at the next start`);
+        else if (i >= 0) { pendingFiles.splice(i, 1); savePending(); }
       }
     })();
     inFlight.set(key, run);
@@ -689,8 +698,8 @@ export function create(cfg, ctx) {
     catch (e) {
       const why = failReason(e);
       log(`chat: a file for ${nick} was not saved (${why}): ${redact(e?.message || e)}`);
-      await back(`⚠️ 檔案沒有下載成功(${why}),沒有交給 ${nick},請再傳一次。`);
-      return;
+      const told = await back(`⚠️ 檔案沒有下載成功(${why}),沒有交給 ${nick},請再傳一次。`);
+      return told?.ok ? undefined : "keep";
     }
     const from = [msg.from?.first_name, msg.from?.last_name].filter(Boolean).join(" ") || msg.from?.username || "";
     const to = msg.reply_to_message;

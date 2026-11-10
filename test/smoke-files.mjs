@@ -52,6 +52,7 @@ const WIN = process.platform === "win32";
 // --- Telegram API stub (with getFile and file downloads) --------------------------------------------
 const calls = [];
 let updates = [], nextUpdateId = 1, mid = 100, nextTopic = 900;
+const failReplyTo = new Set(); // message ids whose reply sendMessage fails (Telegram unreachable for it)
 const files = new Map(); // file_id -> {file_path, bytes, size?, mode?: "500"|"cut"|"slow"|"huge"|"getfail"}
 const stub = http.createServer((req, res) => {
   const u = new URL(req.url, "http://x");
@@ -79,6 +80,7 @@ const stub = http.createServer((req, res) => {
     const method = u.pathname.split("/").pop();
     if (method === "getUpdates") { const deliver = () => { const out = updates; updates = []; json({ ok: true, result: out }); }; return updates.length ? deliver() : setTimeout(deliver, 100); }
     calls.push({ method, b, at: Date.now() });
+    if (method === "sendMessage" && failReplyTo.has(b.reply_parameters?.message_id)) return json({ ok: false, error_code: 500, description: "Internal Server Error" });
     if (method === "sendMessage") { b._id = ++mid; return json({ ok: true, result: { message_id: b._id } }); }
     if (method === "getMe") return json({ ok: true, result: { id: 1, is_bot: true, username: "MynaTestBot", has_topics_enabled: true } });
     if (method === "createForumTopic") return json({ ok: true, result: { message_thread_id: ++nextTopic, name: b.name } });
@@ -276,6 +278,18 @@ let firstPath;
   sendDoc({ thread: tA, name: "journal-back.pdf" });
   const [jb] = await takeAll(A.token, 1, 6000);
   ok(jb?.file_path && jb.text.includes("journal-back.pdf"), "…once the journal can be written again, files are taken again");
+  // a download that fails AND whose explanation cannot be sent → the journal keeps it; the next start tries again
+  const lost = sendDoc({ thread: tA, name: "untold.pdf", extra: { mode: "500" } });
+  failReplyTo.add(lost.id);
+  await until(() => /kept in .*inbox-pending\.json/.test(fs.readFileSync(LOG, "utf8")), 8000);
+  const kept = JSON.parse(fs.readFileSync(J, "utf8"));
+  const triedReplies = repliesTo(lost.id).length; // the reply that failed (the stub records it, answers 500)
+  ok(kept.some((x) => x.msg?.message_id === lost.id) && triedReplies === 1, "download failed and the reply could not be sent → kept in the journal");
+  failReplyTo.delete(lost.id);
+  await stopRelay(); await startRelay();
+  A.token = (await api("/chat/register", { session_id: "s-a", nick: "egret", label: "app" }, SECRET())).token;
+  await until(() => repliesTo(lost.id).length > triedReplies, 8000);
+  ok(repliesTo(lost.id).length > triedReplies && /沒有下載成功/.test(repliesTo(lost.id).at(-1)?.text || "") && !(await until(() => JSON.parse(fs.readFileSync(J, "utf8")).some((x) => x.msg?.message_id === lost.id) ? null : true, 3000) === null), `…the next start tries again and the human is told ("${repliesTo(lost.id).at(-1)?.text}")`);
 }
 
 // 9) retention: /myna:files keep, pruned before the next file; a pruned file shows as unavailable

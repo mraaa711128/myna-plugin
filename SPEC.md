@@ -500,7 +500,7 @@ sequenceDiagram
 - 下載網址 `${TELEGRAM_API_BASE}/file/bot<token>/<file_path>` 只在下載函式裡組;bot token 不進 log(寫 log 前遮成 `***`)、不進回覆、不進 inbox、不交給 session。失敗時回手機的原因只用固定說法(`逾時`、`Telegram 拒絕`、`連不上 Telegram`、`超過 20 MB`、`寫檔失敗`),不放底層錯誤訊息。
 - 同時最多 2 個下載(album 最多 10 個);文字和按鈕的處理本來就不等它(`handleUpdate` 沒有被 await)。
 - 下載的大小要等於 `getFile` 的 `file_size`(沒有就用訊息的):有 `content-length` 先比,串流完再比;沒有長度、提早結束的不收。
-- `getUpdates` 在檔案下載完之前就確認了那個 update,所以處理中的附檔訊息記在 `inbox-pending.json`(0600;先寫暫存檔、fsync、再 rename),交付或回覆之後移除;relay 啟動時把裡面的再處理一次,目標 session 的 inbox 或還沒 ack 的那批已經有同一個 chat + message_id 就跳過。同一則訊息同時只有一個在跑(重送的 update 和 journal 重跑共用同一個)。讀不懂的 journal 改名成 `.bad-<時間>` 留著、寫 log,不默默蓋掉。紀錄寫不進去時(資料夾不能寫、磁碟滿)**不收**這個檔、不下載,回一句 `⚠️ 附檔「<原檔名>」寫檔失敗(處理紀錄寫不進去),沒有收下,請再傳一次。`:否則 relay 中途停掉時這個檔會無聲遺失。
+- `getUpdates` 在檔案下載完之前就確認了那個 update,所以處理中的附檔訊息記在 `inbox-pending.json`(0600;先寫暫存檔、fsync、再 rename),交付或回覆之後移除;relay 啟動時把裡面的再處理一次,目標 session 的 inbox 或還沒 ack 的那批已經有同一個 chat + message_id 就跳過。同一則訊息同時只有一個在跑(重送的 update 和 journal 重跑共用同一個)。讀不懂的 journal 改名成 `.bad-<時間>` 留著、寫 log,不默默蓋掉。紀錄寫不進去時(資料夾不能寫、磁碟滿)**不收**這個檔、不下載,回一句 `⚠️ 附檔「<原檔名>」寫檔失敗(處理紀錄寫不進去),沒有收下,請再傳一次。`:否則 relay 中途停掉時這個檔會無聲遺失。下載失敗、說明也送不出去(連不上 Telegram)時,紀錄留著,下一次 relay 啟動再試一次;紀錄寫入時寫完每個 byte、fsync,rename 後在 POSIX 上也 fsync 資料夾。
 - 存好才 `deliver`:inbox 訊息多 `file: {fid, name, ext, mime, size, sha256, path}`(`ext` 是存檔用的副檔名,轉給別台時照用,不從截短的顯示名稱重推),`text` 是 caption。
 
 ### 檔案怎麼存(`src/inbox.mjs`,跟 provider 無關)
