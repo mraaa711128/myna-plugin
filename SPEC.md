@@ -499,14 +499,16 @@ sequenceDiagram
 - 大小:`file_size` > 20 MB → 回一句,不呼叫 `getFile`;下載時再數 byte,超過就中止、刪掉半個檔。
 - 下載網址 `${TELEGRAM_API_BASE}/file/bot<token>/<file_path>` 只在下載函式裡組;bot token 不進 log(寫 log 前遮成 `***`)、不進回覆、不進 inbox、不交給 session。失敗時回手機的原因只用固定說法(`逾時`、`Telegram 拒絕`、`連不上 Telegram`、`超過 20 MB`、`寫檔失敗`),不放底層錯誤訊息。
 - 同時最多 2 個下載(album 最多 10 個);文字和按鈕的處理本來就不等它(`handleUpdate` 沒有被 await)。
-- 存好才 `deliver`:inbox 訊息多 `file: {fid, name, mime, size, sha256, path}`,`text` 是 caption。
+- 下載的大小要等於 `getFile` 的 `file_size`(沒有就用訊息的):有 `content-length` 先比,串流完再比;沒有長度、提早結束的不收。
+- `getUpdates` 在檔案下載完之前就確認了那個 update,所以處理中的附檔訊息記在 `inbox-pending.json`(0600;先寫暫存檔、fsync、再 rename),交付或回覆之後移除;relay 啟動時把裡面的再處理一次,目標 session 的 inbox 或還沒 ack 的那批已經有同一個 chat + message_id 就跳過。同一則訊息同時只有一個在跑(重送的 update 和 journal 重跑共用同一個)。讀不懂的 journal 改名成 `.bad-<時間>` 留著、寫 log,不默默蓋掉。
+- 存好才 `deliver`:inbox 訊息多 `file: {fid, name, ext, mime, size, sha256, path}`(`ext` 是存檔用的副檔名,轉給別台時照用,不從截短的顯示名稱重推),`text` 是 caption。
 
 ### 檔案怎麼存(`src/inbox.mjs`,跟 provider 無關)
 
 - 位置:`<relay 資料目錄>/inbox/<sha256(session id) 前 16 hex>/`(目錄 0700、檔案 0600)。
 - 檔名只用受控欄位:`<UTC 時間 YYYYMMDD-HHmmss>-<fid>.<副檔名>`;`fid` 是 16 個 hex 的亂數;副檔名取原檔名的(轉小寫後符合 `^[a-z0-9]{1,8}$`),否則依 MIME,都沒有就 `bin`。原檔名只顯示(拿掉控制字元和看不見的字元、限 80 字),不當路徑。
-- 先寫 `<名字>.part`(重試時截斷重寫),邊寫邊數 byte、算 sha256,完整才 rename;任何失敗刪掉 `.part`。正式檔已存在 → 不覆寫,size 和 sha256 對得上就沿用(重送不重抓),對不上就失敗。交給 session 的路徑是 `realpath` 過的。
-- 保留:收檔後 N 天(預設 7,`/myna:files keep <1～90>`,設定檔 `~/.myna/inbox-keep` 的 `days=<n>`,`MYNA_INBOX_KEEP_FILE` 改路徑),每次存新檔前清掉更舊的(best effort,失敗不影響這次傳檔)。讀不懂的設定檔當成 7 天。每台機器各自清各自的 inbox。
+- 先寫 `<名字>.part`(重試時截斷重寫),邊寫邊數 byte、算 sha256(寫到每個 chunk 都寫完、rename 前用 fstat 核對大小),完整才 rename;任何失敗刪掉 `.part`。正式檔已存在 → 不覆寫,size 和 sha256 對得上就沿用(重送不重抓),對不上就失敗。交給 session 的路徑是 `realpath` 過的。
+- 保留:收檔後 N 天(預設 7,`/myna:files keep <1～90>`,設定檔 `~/.myna/inbox-keep` 的 `days=<n>`,`MYNA_INBOX_KEEP_FILE` 改路徑),每次存新檔時非同步清掉更舊的(best effort,失敗不影響這次傳檔,不擋 relay 其他的事)。讀不懂的設定檔當成 7 天,relay log 記一次。每台機器各自清各自的 inbox。
 
 ### 交給 session
 
@@ -517,13 +519,14 @@ sequenceDiagram
 
 | 項目 | 內容 |
 |---|---|
-| `POST /chat/take` 的 `files: true`(選填) | 送的那台會自己抓檔。有附檔的那則回 `file: {fid, name, mime, size, sha256}`,**不回 `path`**。沒帶 → 不回 `file`,`text` 前面加一行 `📎 有附檔沒有送到:這台機器的 Myna 要升級到 0.22.0 以上。` |
+| `POST /chat/take` 的 `files: true`(選填) | 送的那台會自己抓檔。有附檔的那則回 `file: {fid, name, ext, mime, size, sha256}`,**不回 `path`**。沒帶 → 不回 `file`,`text` 前面加一行 `📎 有附檔沒有送到:這台機器的 Myna 要升級到 0.22.0 以上。` |
 | `GET /chat/file/<fid>` | §5.1 的驗證順序照舊(protocol → machine token),再驗 `X-Myna-Chat-Token`:不是這台機器的 session 或已關閉 → `401 {reregister: true}`(跟 `/chat/*` 一樣)。`fid` 不是 16 hex、不是這個 session 的(在它的 inbox 或還沒 ack 的那批)、檔案已不在或不是一般檔案 → `404 {error: "file unavailable"}`。成功 → `200`,`application/octet-stream`,`content-length`。本機 port 沒有這個 endpoint |
 
 ### 轉送聊天那台(edge,`src/edge-chat.mjs`)
 
 - 背景 long-poll 的 take 帶 `files: true`。拿到的一批照順序處理:有 `file` 的那則先 `GET /chat/file/<fid>`(跟其他轉送同一組標頭,含 Cloudflare Access)存進自己的 inbox,`path` 換成自己的,才放進本機 inbox;`ack` 只帶處理完的那幾則,遇到第一則還沒好的就停,主節點下一次會再交(既有的 ack 機制)。所以不會掉檔,也不會亂序。
-- 失敗:連不上、逾時、3xx/401/403/426(跟 §5.1 一樣算主節點連不上)→ 下一輪再來,不計次;`401 {reregister}` → 重新註冊;5xx、`content-length` 或內容的 size／sha256 跟 `file` 不符 → 同一個 `fid` 記一次(存在 `edge-state.json`),連續 3 次就放棄;`404` 或放棄 → 那則照樣交付,檔案那行是 `（這個附檔無法取得）`,後面的訊息不會被擋住。
+- 抓之前先看自己的 inbox:同名的正式檔已經在、size 和 sha256 對得上(抓好了但重啟前還沒 ack)→ 直接用,不再 GET。
+- 失敗:連不上、逾時、3xx/401/403/426(跟 §5.1 一樣算主節點連不上)、這台自己寫檔失敗(磁碟滿、權限)→ 下一輪再來,不計次;`401 {reregister}` → 重新註冊;5xx、`content-length` 或內容的 size／sha256 跟 `file` 不符 → 同一個 `fid` 記一次(存在 `edge-state.json`),連續 3 次就放棄;`404` 或放棄 → 那則照樣交付,檔案那行是 `（這個附檔無法取得）`,後面的訊息不會被擋住。
 - 主節點斷線、重啟:訊息和檔案留在主節點(`chat-sessions.json`、`inbox/`),恢復後照常拉。聊天不走 `/myna:hold` 排隊。
 - 這台的聊天在自己的 bot 上(`MYNA_CHAT_FORWARD=off`,或主節點不支援轉送聊天)時,就是單機的路徑:這台自己的 Telegram provider 下載。
 
@@ -532,8 +535,8 @@ sequenceDiagram
 人決定(讀檔權限選 A2):session 讀**交給它的那幾個附檔**不跳權限確認。Claude Code 的 Read 在工作目錄和 `additionalDirectories` 以外要核准;mod 的 `tool.check` 在 `PreToolUse` hook 之後、權限確認之前決定,`await next(e)` 是 Claude Code 自己的決定,沒有 managed settings 的機器上 mod 的 `allow` 連 deny 規則都蓋得過。所以:
 
 - 只處理 `Read`(`on("tool.check", { tool: "Read" }, …)`),只把 `ask` 改成 `allow`;`deny`、本來就 `allow` 的、子 agent 的呼叫(`e.agentId`)、`permissions.blockReadsOutsideWorkingDirectories: true` 都原樣回傳。
-- 路徑要跟 take 回來的 `file_path` **整串相等**(比對前:Windows 路徑把 `/` 當 `\`、不分大小寫;相對路徑、`~`、UNC／`\\?\`、`.`／`..`／空的段落、NUL 一律不比)。允許清單只在 mod 的記憶體裡,mod 重新載入或 `--resume` 後是空的(多問一次,不會多放行),最多 500 筆。
-- 還要 `$.fs.stat(path, { resolve: true })` 是一般檔案:`isLink === false`,而且 `realPath` 跟原路徑一樣;沒有 `realPath`(舊 CLI)時,上兩層資料夾也不能是 link。任何一步拿不到資料或丟錯 → Claude Code 原本的決定(問)。
+- 先用 take 回來的 `file_path` 篩:Read 的路徑正規化後要在允許清單裡(Windows 路徑把 `/` 當 `\`、不分大小寫;相對路徑、`~`、UNC／`\\?\`、`.`／`..`／空的段落、NUL 一律不比)。允許清單只屬於這個 session:mod 重新載入、`session.start`、`/clear`、`/resume`、session id 改變都會清空(多問一次,不會多放行),最多 500 筆。
+- 再對 **Read 要讀的那個路徑** `$.fs.stat(path, { resolve: true })`:要是 `kind: "file"`、`isLink === false`,而且 `realPath` 跟交付的路徑**一字不差**(連大小寫,因為 Windows 也有分大小寫的資料夾);沒有 `realPath`(舊 CLI)時,Read 的路徑要跟交付的一字不差,上兩層要是 `kind: "dir"` 且不是 link。任何一步拿不到資料或丟錯 → Claude Code 原本的決定(問)。
 - 極限:跟 AI 同一個 OS 帳號的程式本來就能改 `~/.myna`;檢查完到 Read 真正讀檔之間,若同帳號的程式把那個檔換掉,讀到的是換過的內容(只限那個確切路徑)。跟 §5「安全模型與極限」一樣,不是安全邊界。
 
 ### `/myna:files`
@@ -544,7 +547,8 @@ sequenceDiagram
 
 - `test/smoke-files.mjs`(單機;真 relay、Telegram stub 含 `getFile` 和檔案網址、chat mod 跑在 stub `$` 上、`/myna:files`):document 和 caption、照片取最大、album、惡意檔名、宣告 > 20 MB 不呼叫 `getFile`、沒宣告但串流 > 20 MB 中止且不留檔、找不到 session／`@暱稱`／`!指令`、不支援的類型、下載 500／中途斷線的固定原因、`/myna:files` 四種用法、存新檔前清掉舊檔、被清掉的附檔顯示無法取得、慢下載不擋文字、已結束的 session、chat mod 的 `tool.check`(交付過的檔 → allow;deny／allow 不變;Windows 的 `/` 和大小寫;同資料夾別的檔、`..`、相對路徑、UNC、子 agent、`blockReadsOutsideWorkingDirectories`、`Edit`、換成 link 都是 ask)、bot token 不在 log／回覆／chat 紀錄／inbox。
 - `test/smoke-edge-files.mjs`(主節點 + tunnel stub + edge,暫存目錄、隨機 port):別台 session 拿到別台的路徑且內容一致、主節點的路徑不外流、抓檔中途斷線和 500 一次後重抓且只交付一次、順序不變、一直拿到壞的內容 3 次後放棄而後面的訊息照到、主節點斷線並重啟後照樣送到、主節點上已清掉 → 無法取得、`GET /chat/file` 的 machine／session 範圍(401、404)、本機 port 沒有這個 endpoint、take 沒帶 `files:true` 的升級提示、`MYNA_CHAT_FORWARD=off` 的 edge 自己下載、token 不在 log。
-- `test/chat-mod-read.test.ts`:同一個 `tool.check` 在 Claude Code 自己的 mod 測試工具(`claude plugin test`)裡跑;需要 Claude Code CLI,不在 CI。
+- `test/chat-mod-read.test.ts`:同一個 `tool.check` 在 Claude Code 自己的 mod 測試工具(`claude plugin test`)裡跑(大小寫不同但其實是另一個檔、舊 CLI 沒有 `realPath` 的退路、上層是 link、stat 被拒);需要 Claude Code CLI,不在 CI。
+- 兩支 smoke 都支援 `MYNA_TEST_ROOT=<另一份 checkout>`:指 0.21.1 時都會失敗。
 
 
 ## 6. Telegram UX

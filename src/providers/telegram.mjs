@@ -601,28 +601,54 @@ export function create(cfg, ctx) {
     if (cl && want !== undefined && Number(cl) !== want) { await res.body.cancel().catch(() => {}); throw Object.assign(new Error(`download: ${cl} bytes, expected ${want}`), { code: "refused" }); }
     const fid = inbox.newFid();
     let saved;
-    try { saved = await inbox.save({ dir: DIR, sid, name: inbox.fileName({ fid, original: m.name, mime: m.mime, at }), body: res.body, size: want }); }
+    const ext = inbox.extOf(m.photo ? "photo.jpg" : m.name, m.mime);
+    try { saved = await inbox.save({ dir: DIR, sid, name: inbox.fileName({ fid, ext, at }), body: res.body, size: want }); }
     catch (e) { if (e?.code === "mismatch") e.code = "refused"; throw e; }
-    return { fid, name: m.photo ? "photo.jpg" : inbox.displayName(m.name), mime: m.mime, size: saved.size, sha256: saved.sha256, path: saved.path };
+    return { fid, name: m.photo ? "photo.jpg" : inbox.displayName(m.name), ext, mime: m.mime, size: saved.size, sha256: saved.sha256, path: saved.path };
   }
   // getUpdates confirms an update before its file is down: a file message being handled is journaled
   // (inbox-pending.json, 0600) until it is delivered or answered, and a relay that stopped mid-way picks
   // it up again at start — skipped when the session already has that message
   const PENDING_FILES = path.join(DIR, "inbox-pending.json");
-  const pendingFiles = (() => { try { const j = JSON.parse(fs.readFileSync(PENDING_FILES, "utf8")); return Array.isArray(j) ? j.filter((x) => x?.msg?.chat) : []; } catch { return []; } })();
+  const pendingFiles = (() => {
+    let text;
+    try { text = fs.readFileSync(PENDING_FILES, "utf8"); } catch { return []; }
+    try { const j = JSON.parse(text); if (Array.isArray(j)) return j.filter((x) => x?.msg?.chat); } catch {}
+    // unreadable: kept aside for a human to look at, never silently overwritten
+    try { fs.renameSync(PENDING_FILES, `${PENDING_FILES}.bad-${Date.now()}`); } catch {}
+    log(`inbox: ${PENDING_FILES} could not be read — kept aside as .bad-*; file messages in it are not picked up again`);
+    return [];
+  })();
+  // written whole to a temp file, then renamed over the journal (a crash mid-write leaves the old one)
   const savePending = () => {
-    try { fs.mkdirSync(DIR, { recursive: true }); fs.writeFileSync(PENDING_FILES, JSON.stringify(pendingFiles), { mode: 0o600 }); }
-    catch (e) { log("inbox: could not persist", PENDING_FILES, e.message); }
+    try {
+      fs.mkdirSync(DIR, { recursive: true });
+      const tmp = `${PENDING_FILES}.${process.pid}.tmp`;
+      const fd = fs.openSync(tmp, "w", 0o600);
+      try { fs.writeSync(fd, JSON.stringify(pendingFiles)); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+      fs.renameSync(tmp, PENDING_FILES);
+      return true;
+    } catch (e) { log("inbox: could not persist", PENDING_FILES, e.message); return false; }
   };
   const pendingKey = (msg) => `${msg.chat.id}:${msg.message_id}`;
-  async function fileIncoming(msg) {
+  const inFlight = new Map(); // pendingKey -> the run handling it (a replay and a re-sent update share it)
+  function fileIncoming(msg) {
     const key = pendingKey(msg);
-    if (!pendingFiles.some((x) => pendingKey(x.msg) === key)) { pendingFiles.push({ msg, at: new Date().toISOString() }); savePending(); }
-    try { await fileIncomingNow(msg); }
-    finally {
-      const i = pendingFiles.findIndex((x) => pendingKey(x.msg) === key);
-      if (i >= 0) { pendingFiles.splice(i, 1); savePending(); }
+    if (inFlight.has(key)) return inFlight.get(key);
+    if (!pendingFiles.some((x) => pendingKey(x.msg) === key)) {
+      pendingFiles.push({ msg, at: new Date().toISOString() });
+      if (!savePending()) log(`inbox: file message ${key} is handled without a journal entry (a relay stop mid-way would lose it)`);
     }
+    const run = (async () => {
+      try { await fileIncomingNow(msg); }
+      finally {
+        inFlight.delete(key);
+        const i = pendingFiles.findIndex((x) => pendingKey(x.msg) === key);
+        if (i >= 0) { pendingFiles.splice(i, 1); savePending(); }
+      }
+    })();
+    inFlight.set(key, run);
+    return run;
   }
   async function fileIncomingNow(msg) {
     const chatId = String(msg.chat.id);
@@ -646,7 +672,7 @@ export function create(cfg, ctx) {
     const cs = ctx.chat?.get(sid);
     if ([...(cs?.inbox || []), ...(cs?.unacked || [])].some((x) => String(x.chat) === chatId && x.message_id === msg.message_id)) return;
     talkTo(sid);
-    try { inbox.prune(DIR, inbox.readKeep(inbox.keepFile(DIR, cfg)).days, log); } catch (e) { log("inbox prune err", e.message); }
+    inbox.prune(DIR, cfg, log).catch((e) => log("inbox prune err", e.message));
     const when = new Date().toISOString();
     let file;
     try { file = await inSlot(() => download(sid, m, when)); }

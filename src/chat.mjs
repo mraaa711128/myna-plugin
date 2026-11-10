@@ -75,8 +75,8 @@ export const OLD_EDGE_FILE = "📎 有附檔沒有送到:這台機器的 Myna �
 const takeRemote = (m, files) => {
   if (!m.file) return takeView(m);
   if (!files) return { ...takeView(m), text: `${OLD_EDGE_FILE}${m.text ? `\n${m.text}` : ""}` };
-  const { fid, name, mime, size, sha256 } = m.file;
-  return { ...takeView(m), file: { fid, name, mime, size, sha256 } };
+  const { fid, name, ext, mime, size, sha256 } = m.file;
+  return { ...takeView(m), file: { fid, name, ...(ext ? { ext } : {}), mime, size, sha256 } };
 };
 
 // topicMachine(scope): the machine-name prefix of a session's topic ("" = none; see MYNA_TOPIC_MACHINE)

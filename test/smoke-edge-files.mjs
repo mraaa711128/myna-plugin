@@ -186,6 +186,16 @@ let fidFirst;
   ok(tunnel.log.some((e) => e.url === `/chat/file/${fidFirst}`), "11: …fetched with GET /chat/file/<fid> through the tunnel");
 }
 
+// === 11b. a long file name with a generic MIME type keeps its extension on the other machine ======================
+{
+  const long = `${"報告".repeat(60)}.xlsx`;
+  const file_id = `F${++hubTg.seq}`, bytes = crypto.randomBytes(1500);
+  hubTg.files.set(file_id, { file_path: `documents/f${hubTg.seq}.bin`, bytes });
+  hubTg.push({ message_thread_id: topicA, document: { file_id, file_unique_id: `u${file_id}`, file_name: long, mime_type: "application/octet-stream", file_size: bytes.length } });
+  const [m] = await takeN(mbpChat, A.json.token, 1);
+  ok(m?.file_path?.endsWith(".xlsx") && fs.readFileSync(m.file_path).equals(bytes), `11b: a 120-character name, MIME octet-stream → still .xlsx on the edge (${path.basename(m?.file_path || "?")})`);
+}
+
 // === 12. a fetch cut mid-way / a 500 once → retried, delivered once ===========================================
 {
   // the next fetch through the tunnel is cut mid-way, the one after answers 500

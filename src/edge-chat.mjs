@@ -131,7 +131,7 @@ export function createEdgeChat({ hub, log, secretOk, save, dir, cfg = {} }) {
       return null;
     };
     const drop = (r) => r.body?.cancel().catch(() => {});
-    const name = inbox.fileName({ fid: f.fid, original: f.name, mime: f.mime, at: m.at });
+    const name = inbox.fileName({ fid: f.fid, ext: f.ext, original: f.name, mime: f.mime, at: m.at });
     // fetched before (and the edge restarted before it was acked): not fetched again
     const have = inbox.existing({ dir, sid, name, sha256: f.sha256, size: Number.isFinite(f.size) ? f.size : undefined });
     if (have) { if (s.fileFails[f.fid]) { delete s.fileFails[f.fid]; changed(); } return have; }
@@ -154,7 +154,7 @@ export function createEdgeChat({ hub, log, secretOk, save, dir, cfg = {} }) {
     const cl = r.headers.get("content-length"), len = Number(cl);
     if (cl && (len > inbox.MAX_FILE_BYTES || (Number.isFinite(f.size) && len !== f.size))) { await drop(r); return strike("wrong size"); }
     try {
-      try { inbox.prune(dir, inbox.readKeep(inbox.keepFile(dir, cfg)).days, log); } catch {}
+      inbox.prune(dir, cfg, log).catch(() => {});
       const saved = await inbox.save({ dir, sid, name, body: r.body, sha256: f.sha256, size: Number.isFinite(f.size) ? f.size : undefined });
       if (s.fileFails[f.fid]) { delete s.fileFails[f.fid]; changed(); }
       return saved.path;

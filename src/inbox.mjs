@@ -27,7 +27,8 @@ export const FID_RE = /^[a-f0-9]{16}$/;
 export const keepFile = (dir, cfg = {}) => cfg.MYNA_INBOX_KEEP_FILE || process.env.MYNA_INBOX_KEEP_FILE || path.join(dir || path.join(os.homedir(), ".myna"), "inbox-keep");
 export function readKeep(file) {
   let text;
-  try { text = fs.readFileSync(file, "utf8"); } catch { return { days: KEEP_DEFAULT_DAYS, source: "default" }; }
+  try { text = fs.readFileSync(file, "utf8"); }
+  catch (e) { return { days: KEEP_DEFAULT_DAYS, source: "default", ...(e.code === "ENOENT" ? {} : { bad: true }) }; }
   const m = /^\s*days=(\d+)\s*$/.exec(text.split(/\r?\n/)[0] || "");
   const n = m ? Number(m[1]) : NaN;
   if (!Number.isInteger(n) || n < KEEP_MIN_DAYS || n > KEEP_MAX_DAYS) return { days: KEEP_DEFAULT_DAYS, source: "default", bad: true };
@@ -54,9 +55,11 @@ const stamp = (at) => {
   return `${t.getUTCFullYear()}${p(t.getUTCMonth() + 1)}${p(t.getUTCDate())}-${p(t.getUTCHours())}${p(t.getUTCMinutes())}${p(t.getUTCSeconds())}`;
 };
 // the name on disk — the same for the same file id and time, so a retry finds what it wrote before
-export function fileName({ fid, original, mime, at }) {
+// ext: an extension decided already (the relay that downloaded passes it on), used when it is plain
+export function fileName({ fid, original, mime, at, ext }) {
   if (!FID_RE.test(String(fid))) throw new Error("bad file id");
-  return `${stamp(at)}-${fid}.${extOf(original, mime)}`;
+  const e = /^[a-z0-9]{1,8}$/.test(String(ext ?? "")) ? ext : extOf(original, mime);
+  return `${stamp(at)}-${fid}.${e}`;
 }
 // the sender's file name, for showing only: no invisible or control characters, one line, ≤ 80 characters
 export function displayName(original) {
@@ -137,24 +140,29 @@ export function existing({ dir, sid, name, sha256, size }) {
   } catch { return null; }
 }
 
-// drop files (and .part leftovers) received more than `days` ago, then empty session folders. Best effort.
-export function prune(dir, days, log = () => {}) {
-  const root = inboxDir(dir), cut = Date.now() - days * 86400000;
+// drop files (and .part leftovers) received more than `days` ago, then empty session folders. Best effort,
+// asynchronous (a big inbox never holds up the relay's other work); the keep setting is read here, an
+// unreadable one is logged (once per relay) and counts as the default
+let keepWarned = false;
+export async function prune(dir, cfg = {}, log = () => {}) {
+  const k = readKeep(keepFile(dir, cfg));
+  if (k.bad && !keepWarned) { keepWarned = true; log(`inbox: ${keepFile(dir, cfg)} is not days=${KEEP_MIN_DAYS}..${KEEP_MAX_DAYS} — keeping files ${KEEP_DEFAULT_DAYS} days`); }
+  const root = inboxDir(dir), cut = Date.now() - k.days * 86400000, fsp = fs.promises;
   let removed = 0;
   let subs = [];
-  try { subs = fs.readdirSync(root, { withFileTypes: true }); } catch { return 0; }
+  try { subs = await fsp.readdir(root, { withFileTypes: true }); } catch { return 0; }
   for (const d of subs) {
     if (!d.isDirectory()) continue;
     const sd = path.join(root, d.name);
     try {
-      for (const f of fs.readdirSync(sd, { withFileTypes: true })) {
-        const p = path.join(sd, f.name);
-        try { if (fs.lstatSync(p).mtimeMs < cut) { fs.rmSync(p, { force: true }); removed++; } } catch (e) { log(`inbox: could not remove ${p}: ${e.message}`); }
+      for (const f of await fsp.readdir(sd)) {
+        const p = path.join(sd, f);
+        try { if ((await fsp.lstat(p)).mtimeMs < cut) { await fsp.rm(p, { force: true }); removed++; } } catch (e) { log(`inbox: could not remove ${p}: ${e.message}`); }
       }
-      if (!fs.readdirSync(sd).length) fs.rmdirSync(sd);
+      if (!(await fsp.readdir(sd)).length) await fsp.rmdir(sd).catch(() => {});
     } catch (e) { log(`inbox: could not clean ${sd}: ${e.message}`); }
   }
-  if (removed) log(`inbox: removed ${removed} file(s) received more than ${days} day(s) ago`);
+  if (removed) log(`inbox: removed ${removed} file(s) received more than ${k.days} day(s) ago`);
   return removed;
 }
 // what /myna:files status shows

@@ -247,6 +247,8 @@ let firstPath;
   await stopRelay();
   ok(fs.existsSync(path.join(tmp, "inbox-pending.json")) && JSON.parse(fs.readFileSync(path.join(tmp, "inbox-pending.json"), "utf8")).some((x) => x.msg?.message_id === d.id), "a file message being downloaded is journaled (inbox-pending.json)");
   await startRelay();
+  // Telegram hands the same, unconfirmed update out again: it joins the run picking up the journal
+  updates.push({ update_id: nextUpdateId++, message: { message_id: d.id, chat: { id: 42, type: "private" }, from: { id: 7, first_name: "Alice" }, message_thread_id: tA, document: { file_id: d.file_id, file_unique_id: `u${d.file_id}`, file_name: "restart.pdf", mime_type: "application/pdf", file_size: d.bytes.length } } });
   const A2 = await api("/chat/register", { session_id: "s-a", nick: "egret", label: "app" }, SECRET());
   A.token = A2.token;
   const got = await takeAll(A.token, 1, 10000);
@@ -254,6 +256,11 @@ let firstPath;
   const more = await api("/chat/take", { max: 20 }, A.token);
   ok(got.filter((m) => m.text.includes("restart.pdf")).length === 1 && !more.messages?.length && got[0]?.file_path && fs.readFileSync(got[0].file_path).equals(d.bytes), "…the relay restarted mid-download delivers it once, whole");
   ok(JSON.parse(fs.readFileSync(path.join(tmp, "inbox-pending.json"), "utf8")).length === 0, "…and the journal is empty again");
+  await stopRelay();
+  fs.writeFileSync(path.join(tmp, "inbox-pending.json"), "{not json");
+  await startRelay();
+  A.token = (await api("/chat/register", { session_id: "s-a", nick: "egret", label: "app" }, SECRET())).token;
+  ok(fs.readdirSync(tmp).some((f) => f.startsWith("inbox-pending.json.bad-")) && /could not be read/.test(fs.readFileSync(LOG, "utf8")), "an unreadable journal is kept aside (.bad-*) and logged, not overwritten silently");
 }
 
 // 9) retention: /myna:files keep, pruned before the next file; a pruned file shows as unavailable
@@ -290,7 +297,11 @@ let firstPath;
   fs.writeFileSync(KEEP, "days=1\n");
   sendDoc({ thread: tA, name: "after-keep1.pdf" });
   await takeAll(A.token);
-  ok(!fs.existsSync(old2), "keep 1 → the 2-day-old file goes at the next file");
+  ok(!!(await until(() => !fs.existsSync(old2))), "keep 1 → the 2-day-old file goes at the next file");
+  fs.writeFileSync(KEEP, "days=999\n");
+  sendDoc({ thread: tA, name: "bad-keep.pdf" });
+  await takeAll(A.token);
+  ok(!!(await until(() => /inbox-keep is not days=1\.\.90/.test(fs.readFileSync(LOG, "utf8")))), "an unreadable /myna:files setting is logged by the relay (and counts as 7 days)");
   fs.rmSync(KEEP, { force: true });
 }
 

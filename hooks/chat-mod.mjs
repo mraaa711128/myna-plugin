@@ -497,11 +497,15 @@ export const register = (on) => {
     try {
       const s = await $.settings.read();
       if (s?.permissions?.blockReadsOutsideWorkingDirectories === true) return d;
-      const st = await $.fs.stat(p, { resolve: true });
+      // the path Read will read, resolved: it must be the very file handed over — same string, case
+      // included (a case-sensitive folder on Windows can hold File.pdf and file.pdf)
+      const asked = e.input.file_path;
+      const st = await $.fs.stat(asked, { resolve: true });
       if (!st || st.kind !== "file" || st.isLink !== false) return d;
-      if (typeof st.realPath === "string") { if (readKey(st.realPath) !== key) return d; }
+      if (typeof st.realPath === "string") { if (st.realPath !== p) return d; }
       else {
-        // no realPath (an older CLI): the two folders above it must not be links either
+        // no realPath (an older CLI): the path exactly as handed over, and the two folders above it no links
+        if (asked !== p) return d;
         const a = await $.fs.stat(parentOf(p));
         const b = await $.fs.stat(parentOf(parentOf(p)));
         if (!a || a.kind !== "dir" || a.isLink !== false || !b || b.kind !== "dir" || b.isLink !== false) return d;
