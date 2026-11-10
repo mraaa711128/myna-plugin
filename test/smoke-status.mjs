@@ -11,6 +11,8 @@
 //   13 the environment wins over .env       14 /pair/status wins over telegram-chat.json
 //   15 another provider in use, MYNA_ENV elsewhere, not a myna relay on the port, an edge's own bot
 //      taking over, an unreadable .env, a huge log line through a pipe, MYNA_PERMISSION_DELAY set
+//   16 an edge's own bot unpaired, an old edge relay without hold, unreadable .env without a token,
+//      the relay's provider / role vs the config, per-setting sources, the token's second half alone
 import http from "node:http";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
@@ -190,9 +192,10 @@ ok(/比 plugin v[\d.]+ 新/.test(r.out) && /\/plugin update/.test(nextOf(r.out))
 // 6 — every switch reads like its own script
 {
   h = home({ env: "MYNA_ROLE=edge\nMYNA_UPSTREAM=https://hub.example.com\n" });
-  health = { ...hubHealth(iso(-60000)), role: "edge", provider: "none", upstream: { url: "https://hub.example.com", reachable: true, version: VERSION }, own_bot: { on: false } };
+  // no upstream in /health: the hold is read from the config, like hold.mjs does
+  health = { ...hubHealth(iso(-60000)), role: "edge", provider: "none", own_bot: { on: false } };
   pair = null;
-  const S = (name, ...args) => run(h, { args }, { script: path.join(ROOT, "scripts", name) });
+  const S =(name, ...args) => run(h, { args }, { script: path.join(ROOT, "scripts", name) });
   const pairs = [["intercept.mjs", "off", /intercept is OFF/, /intercept 關/], ["autopilot.mjs", "on", /autopilot is ON/, /autopilot 開/],
     ["murmur.mjs", "off", /murmur is OFF/, /murmur 關/], ["perm.mjs", "off", /forwarding is OFF/, /perm 關/], ["brief.mjs", "off", /gate-brief is OFF/, /brief 關/],
     ["stopcatch.mjs", "off", /stop-catch is OFF/, /stopcatch 關/], ["hold.mjs", "off", /斷線排隊：關/, /hold 關/]];
@@ -353,6 +356,48 @@ ok(r.out.length > 200000 && /建議的下一步\n  (1\.|沒有)/.test(r.out) && 
 h = home({ env: `TELEGRAM_BOT_TOKEN=${TOKEN}\nMYNA_PERMISSION_DELAY=5\n` });
 r = await run(h);
 ok(/perm 開（預設，5 秒，MYNA_PERMISSION_DELAY）/.test(r.out), "15 X7 MYNA_PERMISSION_DELAY=5 → the delay is marked as set");
+
+// 16 — review round 2
+// edge with its own Telegram bot, not paired → /myna:pair
+h = home({ env: `MYNA_ROLE=edge\nMYNA_UPSTREAM=https://hub.example.com\nTELEGRAM_BOT_TOKEN=${TOKEN}\n`, log: [startLine(iso(-59000))] });
+health = { ...hubHealth(iso(-60000)), role: "edge", upstream: { url: "https://hub.example.com", reachable: true, version: VERSION, hold: { on: true, max_s: 86400, source: "default", queued: 0, waiting: 0 } }, own_bot: { on: true, id: "telegram:7012345678" } };
+pair = { chat: null, pairing: false };
+tgAnswers = { getMe: { ok: true, result: { id: 7012345678, username: "x_bot", has_topics_enabled: true } } };
+r = await run(h);
+ok(/配對聊天室：\/myna:pair/.test(nextOf(r.out)), "16 edge + own Telegram bot, not paired → /myna:pair suggested");
+// edge, a relay older than 0.21.0 (upstream without hold), hub away, own bot on → its own bot takes over
+health = { ...health, version: "0.20.4", upstream: { url: "https://hub.example.com", reachable: false, reason: "timeout", version: VERSION } };
+pair = { chat: { id: "123456", type: "private", title: "Alex" }, pairing: false };
+r = await run(h);
+ok(/新題目現在由這台自己的 bot 發/.test(nextOf(r.out)) && !/先排著/.test(r.out) && /hold：這版 relay 不支援斷線排隊/.test(r.out), "16 old edge relay without hold → own bot takes over, not 'held'; hold cell says unsupported");
+// unreadable .env, no IM in the environment → the file first, no /myna:setup
+h = home({ envDir: true });
+health = hubHealth(iso(-60000));
+r = await run(h);
+{ const nx = nextOf(r.out); ok(/  1\. 設定檔 .* 讀不到/.test(nx) && !/\/myna:setup/.test(nx), "16 unreadable .env and no token → step 1 is the file, no /myna:setup"); }
+// the running relay's provider / role differ from what the config would make it (no .env change)
+h = home({ env: `DISCORD_BOT_TOKEN=d.fake.tok\nDISCORD_CHANNEL_ID=42\n` });
+health = { ...hubHealth(iso(-60000)), provider: "discord" };
+pair = null;
+r = await run(h, { TELEGRAM_BOT_TOKEN: TOKEN, TELEGRAM_CHAT_ID: "123456" });
+ok(/⚠ provider：relay 用的是 discord，照設定檔／這個 session 會是 telegram/.test(r.out) && /relay 用的設定跟設定檔不同/.test(nextOf(r.out)), "16 relay on discord, this session's config picks telegram → shown, restart");
+health = { ...hubHealth(iso(-60000)), provider: "discord", role: "edge" };
+r = await run(h);
+ok(/⚠ 角色：relay 用的是 edge，照設定檔／這個 session 會是 hub/.test(r.out) && /relay 用的設定跟設定檔不同/.test(nextOf(r.out)), "16 relay an edge, config a hub → shown, restart");
+// each topic setting's own source
+h = home({ env: `TELEGRAM_BOT_TOKEN=${TOKEN}\nTELEGRAM_TOPIC_SCOPE=session\n`, log: [startLine(iso(-59000))] });
+health = hubHealth(iso(-60000));
+pair = { chat: { id: "123456", type: "private", title: "Alex" }, pairing: false };
+r = await run(h, { TELEGRAM_TOPIC_ON_END: "keep" });
+ok(/設定檔 session（~\/\.myna\/\.env）／keep（環境變數）／600s（預設）/.test(r.out), "16 scope from .env, on_end from the environment, grace default → each with its source");
+// only the token's second half in relay.log and a Telegram error → still redacted
+{
+  const half = TOKEN.split(":")[1];
+  h = home({ env: `TELEGRAM_BOT_TOKEN=${TOKEN}\n`, log: [`[relay ${iso(-30000)}] chat: no topic for n1 (Bad Request: ${half}) — it talks in the main chat until a later registration gets one`, startLine(iso(-59000))] });
+  tgAnswers = { getMe: { ok: false, description: `Unauthorized ${half}` } };
+  r = await run(h);
+  ok(!r.out.includes(half) && /\*\*\*/.test(r.out), "16 the token's second half alone (log, Telegram error) → redacted");
+}
 
 relay.closeAllConnections?.(); tg.closeAllConnections?.();
 await Promise.all([new Promise((x) => relay.close(x)), new Promise((x) => tg.close(x))]);

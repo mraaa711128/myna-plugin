@@ -38,7 +38,8 @@ if (r.other) {
   const cmp = r.compare === 0 ? "跟 plugin 同版" : r.compare < 0 ? `比 plugin v${d.plugin_version} 舊` : r.compare > 0 ? `比 plugin v${d.plugin_version} 新` : "版本看不懂";
   L.push(`  在跑：v${r.version}（${cmp}）${r.started_at ? `，${when(r.started_at)} 啟動` : ""}`);
   L.push(`  角色：${r.role === "edge" ? "子節點（edge）" : "主節點（hub）"}；provider：${r.provider ?? "這版 relay 沒回報"}；等待中的題目 ${r.pending ?? "?"}`);
-  if (r.role !== d.role_config) L.push(`  ⚠ 設定檔的角色是 ${d.role_config}，relay 用的是 ${r.role}：/myna:relay restart 後才會照設定檔`);
+  if (d.relay_differs?.role) L.push(`  ⚠ 角色：relay 用的是 ${r.role}，照設定檔／這個 session 會是 ${d.role_config}：/myna:relay restart 後才會照設定`);
+  if (d.relay_differs?.provider) L.push(`  ⚠ provider：relay 用的是 ${r.provider}，照設定檔／這個 session 會是 ${d.expected_provider}：/myna:relay restart 後才會照設定`);
 }
 if (d.env_changed_since_start) L.push(`  ⚠ ${p(d.env_file.path)} 在 relay 啟動之後改過：/myna:relay restart 後才會生效`);
 
@@ -77,8 +78,11 @@ if (t?.unused) {
   const fileSrc = ts.file_source.TELEGRAM_TOPICS;
   L.push(`  TELEGRAM_TOPICS：${ts.relay ? `relay 在用 ${ts.relay.topics}` : `relay 實際在用的：${ts.relay_why}`}；設定檔 ${ts.file.topics}（${SRC[fileSrc]}）`);
   const rest = (s) => `${s.scope}／${s.on_end}／${s.round_grace}s`;
-  const restSrc = ["TELEGRAM_TOPIC_SCOPE", "TELEGRAM_TOPIC_ON_END", "TELEGRAM_TOPIC_ROUND_GRACE"].map((k) => ts.file_source[k]).every((s) => s === "default") ? "預設" : "有改";
-  L.push(`  scope／on_end／round_grace：${ts.relay ? `relay 在用 ${rest(ts.relay)}；` : ""}設定檔 ${rest(ts.file)}（${restSrc}）`);
+  // each value's source; one source for all three → said once
+  const srcs = ["TELEGRAM_TOPIC_SCOPE", "TELEGRAM_TOPIC_ON_END", "TELEGRAM_TOPIC_ROUND_GRACE"].map((k) => SRC[ts.file_source[k]]);
+  const fileRest = srcs.every((x) => x === srcs[0]) ? `${rest(ts.file)}（${srcs[0]}）`
+    : `${ts.file.scope}（${srcs[0]}）／${ts.file.on_end}（${srcs[1]}）／${ts.file.round_grace}s（${srcs[2]}）`;
+  L.push(`  scope／on_end／round_grace：${ts.relay ? `relay 在用 ${rest(ts.relay)}；` : ""}設定檔 ${fileRest}`);
   if (ts.differs) L.push("  ⚠ relay 用的跟設定檔不同，/myna:relay restart 後才會照設定檔");
   const group = t.chat && (t.chat.type === "group" || t.chat.type === "supergroup");
   if (t.bot) {
@@ -115,6 +119,7 @@ const dflt = (s) => (s.isDefault ? "（預設）" : "");
 const cell = (s) => {
   if (s.key === "files") return `files 保留 ${s.days} 天${dflt(s)}${s.bad ? "（設定檔讀不懂）" : ""}`;
   if (s.key === "perm") return `perm ${s.on ? "開" : "關"}（${s.isDefault ? "預設，" : ""}${s.delay_s} 秒${s.delayDefault ? "" : "，MYNA_PERMISSION_DELAY"}）`;
+  if (s.key === "hold" && s.unsupported) return "hold：這版 relay 不支援斷線排隊（0.21.0 起），主節點連不上時由這台自己的 bot 接手";
   if (s.key === "hold") return `hold ${s.on ? "開" : "關"}，上限 ${human(s.max_s)}（${s.isDefault ? "預設；" : ""}${s.from === "relay" ? "relay 在用的" : "設定檔／這個 session"}）`;
   return `${s.label} ${s.on ? "開" : "關"}${dflt(s)}`;
 };

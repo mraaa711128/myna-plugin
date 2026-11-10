@@ -53,7 +53,7 @@ export function makeRedactor(...sources) {
     if (!v) continue;
     if (CREDENTIAL_KEYS.includes(k)) {
       vals.add(v);
-      const half = v.split(":").slice(1).join(":"); if (half.length >= 8) vals.add(half);
+      const half = v.split(":").slice(1).join(":"); if (half) vals.add(half); // a Telegram token's secret half
     } else if (SECRET_NAME_RE.test(k) && v.length >= 4) vals.add(v);
   }
   const list = [...vals].sort((a, b) => b.length - a.length);
@@ -272,9 +272,16 @@ export async function collect(cfg, opts = {}) {
   // the provider in use: the relay's own word, else what it would pick from the config
   const provider = relay.running && !relay.legacy && relay.provider && relay.provider !== "none" ? relay.provider : expected;
   data.provider = provider;
+  data.expected_provider = expected;
   if (token && provider === "telegram" && !meP) meP = tg("getMe");
   const relayRole = relay.running && !relay.legacy ? relay.role : null;
   data.role = relayRole || role;
+  // the running relay against what the config (with this session's environment) would make it
+  const rp = relay.running && !relay.legacy && relay.provider && relay.provider !== "none" ? relay.provider : null;
+  data.relay_differs = {
+    role: !!relayRole && relayRole !== role,
+    provider: !!rp && !!expected && rp !== expected,
+  };
   data.im_configured = has("TELEGRAM_BOT_TOKEN") || (has("DISCORD_BOT_TOKEN") && has("DISCORD_CHANNEL_ID")) || (has("SLACK_BOT_TOKEN") && has("SLACK_APP_TOKEN") && has("SLACK_CHANNEL_ID"));
   const pairP = relay.running && !relay.legacy ? getJSON(`${relayBase}/pair/status`).catch(() => null) : null;
 
@@ -288,7 +295,10 @@ export async function collect(cfg, opts = {}) {
       reason: u?.reason ?? null,
       hub_version: u?.version ?? null,
       own_bot: ob ? !!ob.on : null,
-      hold_on: u?.hold ? !!u.hold.on : null,
+      // the hold in force: the relay's (0.21.0+); a relay that reports upstream without hold is older and
+      // fails over to its own bot (0.20.x) = not holding; not reported at all (relay not running) = unknown
+      hold_on: u?.hold ? !!u.hold.on : u ? false : null,
+      hold_supported: u ? !!u.hold : null,
     };
   }
 
@@ -369,7 +379,7 @@ export async function collect(cfg, opts = {}) {
     if (s.key === "hold") {
       const rh = health.h?.upstream?.hold;
       if (rh) return { key: s.key, label: s.label, on: !!rh.on, max_s: rh.max_s, isDefault: rh.source === "default", source: rh.source, from: "relay" };
-      return { key: s.key, label: s.label, ...st, from: "config" };
+      return { key: s.key, label: s.label, ...st, from: "config", ...(health.h?.upstream ? { unsupported: true } : {}) };
     }
     return { key: s.key, label: s.label, ...st };
   });
@@ -418,17 +428,20 @@ export function topicVerdict(t) {
 // --- what to do next: a fixed table, one rule per field, in order -------------------------------------
 export function nextSteps(d) {
   const out = [], t = d.telegram, r = d.relay;
-  if (!d.im_configured && d.role !== "edge") out.push("設定 IM：/myna:setup <bot token>（Telegram；Discord／Slack 見 README）。");
   const envPath = tildePath(d.env_file.path);
-  if (d.env_file.error) out.push(`設定檔 ${envPath} 讀不到（${d.env_file.error}），先檢查檔案權限。`);
+  // an unreadable config comes first; what depends on its contents (no IM set up) is not guessed then
+  if (d.env_file.error) out.push(`設定檔 ${envPath} 讀不到（${d.env_file.error}），先檢查它是不是檔案、權限對不對，修好再跑一次 /myna:status。`);
+  else if (!d.im_configured && d.role !== "edge") out.push("設定 IM：/myna:setup <bot token>（Telegram；Discord／Slack 見 README）。");
   if (r.other) out.push(`127.0.0.1:${r.port} 被別的程式占用（不是 myna relay）：關掉它，或在 ${envPath} 設 RELAY_PORT 換一個 port。`);
   if (!r.running && !r.other && r.autostart) out.push(`啟動 relay：/myna:relay start；還是起不來就看 ${tildePath(d.relay_log)}。`);
   const old = r.running && (r.legacy || r.compare === -1);
   if (old) out.push("relay 比這個 plugin 舊：/myna:relay restart。");
   if (r.running && r.compare === 1) out.push("relay 比這個 plugin 新：/plugin update 更新 plugin。");
-  if (!old && (t?.topic_settings?.differs || d.env_changed_since_start)) out.push(`relay 用的設定跟設定檔不同（或 ${envPath} 在 relay 啟動後改過）：/myna:relay restart 後才會照設定檔。`);
+  const differs = t?.topic_settings?.differs || d.relay_differs?.role || d.relay_differs?.provider;
+  if (!old && (differs || d.env_changed_since_start)) out.push(`relay 用的設定跟設定檔不同（或 ${envPath} 在 relay 啟動後改過）：/myna:relay restart 後才會照設定檔。`);
   else if (!old && t?.bot_maybe_other) out.push("（推測）Telegram 這幾項是用這個 session 的 bot token 查的，relay 可能用別支；要確定就 /myna:relay restart 再跑一次 /myna:status。");
-  if (t && !t.unused && t.token_set && !t.chat && d.role !== "edge") out.push("配對聊天室：/myna:pair。");
+  // an edge's own bot pairs like a hub's (only the edge without a bot pairs on the hub)
+  if (t && !t.unused && t.token_set && !t.chat && d.provider === "telegram") out.push("配對聊天室：/myna:pair。");
   if (t?.chat && !t.unused) {
     const g = t.group;
     if (t.chat.type === "private" && t.bot?.ok && t.bot.has_topics_enabled === false)
@@ -448,7 +461,7 @@ export function nextSteps(d) {
     // the own bot takes new questions only while the hub is away and holding is off (SPEC §5.2)
     const ownTakes = d.edge.own_bot === true && d.edge.reachable === false && d.edge.hold_on === false;
     if (ownTakes) out.push("主節點連不上、斷線排隊關著，新題目現在由這台自己的 bot 發：topic 看上面 Telegram 那段；經主節點的題目，topic 的原因要在主節點跑 /myna:status。");
-    else if (d.edge.reachable === false && d.edge.hold_on !== false) out.push("主節點連不上時新題目先排著（還沒送到手機），恢復後才會開 topic；topic 的原因要在主節點跑 /myna:status。");
+    else if (d.edge.reachable === false && d.edge.hold_on === true) out.push("主節點連不上時新題目先排著（還沒送到手機），恢復後才會開 topic；topic 的原因要在主節點跑 /myna:status。");
     else out.push("這台的題目用主節點的 bot；topic 的原因要在主節點跑 /myna:status。");
   }
   if (out.length) out.push("改完再跑一次 /myna:status 確認。");
