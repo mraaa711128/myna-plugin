@@ -273,7 +273,8 @@ function cancelPermissions(sid, why) {
   let kept = 0;
   for (const [id, p] of pending) {
     if (p.session_id !== sid || p.result !== undefined || p.meta?.kind !== "permission") continue;
-    if (why === "round end" && p.meta.agent_id && attended(p)) { kept++; continue; }
+    // still being sent counts as waited for: its hook polls only once /ask has answered
+    if (why === "round end" && p.meta.agent_id && (p.inFlight || attended(p))) { kept++; continue; }
     log(`request ${id}: permission prompt still open at ${why} — cancelling`);
     Promise.resolve(provider.cancelQuestion?.(id)).catch((e) => log("cancelQuestion err", e.message));
     resolveRequest(id, { kind: "cancelled", reason: why });
@@ -733,7 +734,9 @@ async function handleAsk(req, res, scope, pre) {
   if (label) args.machine_label = label;
   request_id ||= crypto.randomBytes(5).toString("hex");
   const entry = newEntry(Date.now(), args.session_id, metaOf(args), scope.id);
-  if (args.session_id) roundEndDue.delete(String(args.session_id)); // a new round under way: its own round end decides
+  // a new question of the main thread: a new round is under way, its own round end decides (a subagent's
+  // next permission prompt is not one — the main thread's round may well be over)
+  if (args.session_id && !args.agent_id) roundEndDue.delete(String(args.session_id));
   // runtime only (persist() never writes it): the command a ✅ tap on THIS question approves
   // and the one ✅ option whose tap approves it (validateAskArgs allows exactly one)
   if (typeof args.approves === "string") { entry.approves = normalizeCommand(args.approves); entry.approveOption = approveOptionOf(args.options); }
@@ -747,6 +750,7 @@ async function handleAsk(req, res, scope, pre) {
   // client has something to poll and collect the unreachable verdict.
   // a remote machine's /cancel waits for this send to finish (entry.sending): an edge that gave the
   // question up may cancel it while Telegram is still sending it, and only a sent message can be retracted
+  entry.inFlight = true; // runtime only: see cancelPermissions
   try {
     const sending = provider.sendQuestion(request_id, args);
     // a remote /cancel, or an edge giving its own bot up (hub.onBot), waits for the send to finish
@@ -757,6 +761,7 @@ async function handleAsk(req, res, scope, pre) {
     log("sendQuestion delivery failed — resolving unreachable:", e.message);
     resolveRequest(request_id, { kind: "unreachable", error: `question delivery failed: ${e.message}` });
   }
+  finally { delete entry.inFlight; entry.lastPoll = Date.now(); } // its asker starts polling now
   send(res, 200, { request_id });
 }
 

@@ -20,12 +20,12 @@ const hookPath = fileURLToPath(new URL("../scripts/permission-request.mjs", impo
 let failed = 0;
 const ok = (c, m) => { console.log(`${c ? "✅" : "❌"} ${m}`); if (!c) failed++; };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const watchdog = setTimeout(() => { console.error("❌ TIMEOUT — smoke did not finish in 120s"); process.exit(1); }, 120000);
+const watchdog = setTimeout(() => { console.error("❌ TIMEOUT — smoke did not finish in 180s"); process.exit(1); }, 180000);
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "myna-perm-test-"));
 
 // --- Telegram API stub -------------------------------------------------------------------------
 const sent = [], markupEdits = [], renamed = [], created = [], deletedTopics = [];
-let updates = [], nextUpdateId = 1, mid = 100, nextTopic = 700;
+let updates = [], nextUpdateId = 1, mid = 100, nextTopic = 700, sendDelayMs = 0; // sendDelayMs: a slow Telegram
 const stub = http.createServer((req, res) => {
   const u = new URL(req.url, "http://x");
   const json = (o) => { res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify(o)); };
@@ -33,7 +33,7 @@ const stub = http.createServer((req, res) => {
   req.on("end", () => {
     const b = JSON.parse(body || "{}");
     if (/\/getUpdates$/.test(u.pathname)) { const deliver = () => { const out = updates; updates = []; json({ ok: true, result: out }); }; return updates.length ? deliver() : setTimeout(deliver, 150); }
-    if (/\/sendMessage$/.test(u.pathname)) { b.message_id = ++mid; sent.push(b); return json({ ok: true, result: { message_id: b.message_id } }); }
+    if (/\/sendMessage$/.test(u.pathname)) { b.message_id = ++mid; sent.push(b); return setTimeout(() => json({ ok: true, result: { message_id: b.message_id } }), b.reply_markup ? sendDelayMs : 0); }
     if (/\/createForumTopic$/.test(u.pathname)) { created.push(b); return json({ ok: true, result: { message_thread_id: ++nextTopic, name: b.name } }); }
     if (/\/editForumTopic$/.test(u.pathname)) { renamed.push(b); return json({ ok: true, result: true }); }
     if (/\/deleteForumTopic$/.test(u.pathname)) { deletedTopics.push(b.message_thread_id); return json({ ok: true, result: true }); }
@@ -319,6 +319,7 @@ const lastAskId = async (cmd) => { for (let i = 0; i < 40; i++) { const j = awai
 // (a second relay with a short MYNA_ATTENDED_GRACE_MS / MYNA_ORPHAN_TTL; same stub)
 {
   sent.length = 0; markupEdits.length = 0;
+  relay.kill(); // from here on only the second relay polls the stub (a tap must reach the relay that asked)
   const PORT2 = PORT + 1;
   const relay2 = spawn(process.execPath, [relayPath], {
     env: {
@@ -352,6 +353,34 @@ const lastAskId = async (cmd) => { for (let i = 0; i < 40; i++) { const j = awai
   for (let i = 0; i < 60 && !(markupEdits.some((e) => e.message_id === kk?.message_id) && deletedTopics.includes(kk?.message_thread_id)); i++) await sleep(100);
   ok(markupEdits.some((e) => e.message_id === kk?.message_id) && deletedTopics.includes(kk?.message_thread_id),
     `…once nobody polls, the sweep finishes that round end: prompt retracted, topic ${kk?.message_thread_id} ended (no second round end, no orphan TTL)`);
+  // the same worker's next prompt after that round end does not drop the pending round end: once neither
+  // is polled for, both are retracted and the round ends
+  {
+    const a = runHook({ session_id: "s-worker5", agent_id: AGENT, tool_name: "Bash", tool_input: cmdInput("echo worker17d") }, { port: PORT2 });
+    const ka = await keyboardFor("echo worker17d");
+    const r5 = await roundEnd2("s-worker5");
+    const b = runHook({ session_id: "s-worker5", agent_id: AGENT, tool_name: "Bash", tool_input: cmdInput("echo worker17e") }, { port: PORT2 });
+    const kb5 = await keyboardFor("echo worker17e");
+    a.c.kill("SIGKILL"); b.c.kill("SIGKILL"); await a.done; await b.done;
+    const gone = (k) => markupEdits.some((e) => e.message_id === k?.message_id);
+    for (let i = 0; i < 60 && !(gone(ka) && gone(kb5) && deletedTopics.includes(ka?.message_thread_id)); i++) await sleep(100);
+    ok(r5.ended === false && gone(ka) && gone(kb5) && deletedTopics.includes(ka?.message_thread_id),
+      `a round end that left a worker's prompt open survives that worker's next prompt: both retracted once nobody polls, the round ends (${JSON.stringify(r5)})`);
+  }
+  // a worker's prompt still being sent (a slow Telegram, longer than MYNA_ATTENDED_GRACE_MS) at the round
+  // end is not taken for a dead one: it stays, and the phone's ✅ reaches the hook once it is on the phone
+  {
+    sendDelayMs = 1500;
+    const w = runHook({ session_id: "s-worker6", agent_id: AGENT, tool_name: "Bash", tool_input: cmdInput("echo worker17f") }, { port: PORT2 });
+    const kw = await keyboardFor("echo worker17f");
+    await sleep(700); // still sending; past the grace since it was created
+    const r6 = await roundEnd2("s-worker6");
+    await sleep(1200); sendDelayMs = 0;
+    const early = markupEdits.some((e) => e.message_id === kw?.message_id);
+    tap(kw, 0, 0);
+    const d = await w.done;
+    ok(r6.ended === false && !early && d.decision?.behavior === "allow", `a worker's prompt still being sent at the round end stays (${JSON.stringify(r6)}), and the phone's ✅ then reaches the hook → ${JSON.stringify(d.decision)}`);
+  }
   const h = runHook({ session_id: "s-worker2", agent_id: AGENT, tool_name: "Bash", tool_input: cmdInput("echo worker17b") }, { port: PORT2 });
   const kb = await keyboardFor("echo worker17b");
   h.c.kill("SIGKILL"); await h.done;
