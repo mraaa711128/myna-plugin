@@ -21,3 +21,5 @@ Gate-brief is **ON by default**. When an `AskUserQuestion` is intercepted (needs
 Note: brief only fires while interception is on (`/myna:intercept`). Publishing an Artifact sends the brief content to claude.ai; turn brief `off` for sensitive gates. If the model can't publish, it safely skips the artifact and still asks on Telegram.
 
 After running, tell the user the new state in one line.
+
+Then add one more line, exactly: `提示：/myna:brief 之後會移除，請改用 /myna:config brief on|off`

@@ -11,3 +11,5 @@ Run: `node "${CLAUDE_PLUGIN_ROOT}/scripts/autopilot.mjs" $ARGUMENTS`
 - no argument → report the current state.
 
 After running, tell the user the new state in one line.
+
+Then add one more line, exactly: `提示：/myna:autopilot 之後會移除，請改用 /myna:config autopilot on|off`

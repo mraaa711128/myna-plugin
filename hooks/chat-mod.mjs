@@ -15,7 +15,8 @@
 //                          session, off for -p / SDK)
 //   MYNA_CHAT_NICK=<name>  the nickname to ask for instead of a bird
 //   RELAY_PORT / MYNA_RELAY_URL / MYNA_RELAY_SECRET_FILE   where the relay and its secret are
-// Per session (kept across a resume, in $.store): /myna:chat on|off, /myna:nick <name>.
+// Per session (kept across a resume, in $.store): /myna:config chat on|off (or its alias /myna:chat),
+// /myna:nick <name>.
 //
 // The engine only takes `$` spelled out at each call site (never stored or passed), so session.start
 // builds `io`, a set of closures over its `$`, and everything else goes through those.
@@ -48,6 +49,13 @@ const USAGE_NAMES = new Set(["usage", "cost", "context", "status", "用量"]);
 const BUILTIN_BARE_OK = new Set(["compact", "clear", "exit"]);
 // a command that printed nothing and started no turn within this long: the phone is told so
 const CMD_QUIET_MS = 5000;
+// /myna:chat is kept as an alias of /myna:config chat for a while (until 0.25.0 and at least 30 days)
+const CHAT_ALIAS_HINT = "提示：/myna:chat 之後會移除，請改用 /myna:config chat on|off";
+// the arguments of /myna:config → what follows "chat" (lowercased, "" = the state), or null: not chat
+export function configChatArgs(args) {
+  const m = /^\s*chat(?:\s+([\s\S]*?))?\s*$/i.exec(String(args ?? ""));
+  return m ? (m[1] || "").toLowerCase() : null;
+}
 const LIMIT_NAMES = { five_hour: "5 小時額度", seven_day: "7 天額度", spend_limit: "花費上限" };
 const kTokens = (n) => (n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : n >= 1000 ? `${Math.round(n / 1000)}k` : String(n));
 const pad2 = (n) => String(n).padStart(2, "0");
@@ -334,6 +342,11 @@ export const register = (on) => {
       if (args.toLowerCase() === "off") { replyToPhone("💬 聊天已關閉:這個 session 不再收 Telegram 訊息。要重新開啟,請在終端機執行 /myna:chat on。"); await chatCommand(args); return; }
       return replyToPhone(await chatCommand(args, "!"));
     }
+    // !myna:config chat …: as !myna:chat (our own $.command.run would skip our command.run hook and reach
+    // config.mjs, which has no session); any other item runs as a command below
+    const cc = name === "myna:config" ? configChatArgs(args) : null;
+    if (cc === "off") { replyToPhone("💬 聊天已關閉:這個 session 不再收 Telegram 訊息。要重新開啟,請在終端機執行 /myna:config chat on。"); await chatCommand(cc); return; }
+    if (cc !== null) return replyToPhone(await configChat(cc, "!"));
     if (name === "myna:nick") return replyToPhone(await nickCommand(args));
     let info = null;
     try { info = (await io.list()).find((c) => c.name === name) || null; } catch {}
@@ -515,10 +528,24 @@ export const register = (on) => {
   });
 
   // /myna:chat and /myna:nick: answered here; the markdown files are the fallback for an old CLI
-  on("command.run", { command: "myna:chat" }, async ($, e) => ({ text: await chatCommand(e.args) }))
+  on("command.run", { command: "myna:chat" }, async ($, e) => ({ text: `${await chatCommand(e.args)}\n${CHAT_ALIAS_HINT}` }))
     .catch(() => ({ text: "💬 /myna:chat 執行失敗,請再試一次。" })); // never fall through to the old-CLI text
+  // /myna:config chat [on|off]: the same as /myna:chat, answered here (chat is this session's); any other
+  // item goes on to commands/config.md → scripts/config.mjs
+  on("command.run", { command: "myna:config" }, async ($, e, next) => {
+    const c = configChatArgs(e.args);
+    // args is always set in a session ("" when bare); a plugin's own $.command.run may leave it out
+    return c === null ? next(e.args === undefined ? { ...e, args: "" } : e) : { text: await configChat(c) };
+  }).catch(($, e, next) => (configChatArgs(e.args) !== null && !next.called ? { text: "💬 /myna:config chat 執行失敗,請再試一次。" } : next(e)));
   on("command.run", { command: "myna:nick" }, async ($, e) => ({ text: await nickCommand(e.args) }))
     .catch(() => ({ text: "💬 /myna:nick 執行失敗,請再試一次。" }));
+
+  // "/myna:config chat <value>": on | off | "" (the state); anything else is refused (config.mjs refuses
+  // a bad value for every other item too)
+  async function configChat(arg, p = "/") {
+    if (arg !== "" && arg !== "on" && arg !== "off") return `💬 chat 只接受 on 或 off(你給的是「${arg}」),沒有改。`;
+    return chatCommand(arg, p);
+  }
 
   // p: how the human types a command where the reply goes ("/" at the terminal, "!" on the phone)
   async function chatCommand(args, p = "/") {
