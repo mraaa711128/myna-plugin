@@ -22,7 +22,7 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import {
   PROTOCOL, PROTOCOL_HEADER, ENROLL_SECRET_HEADER, NAME_RE, loadEnv, mynaDir, roleOf, cfHeaders, upstreamUrl, tokenFile,
-  newJoinCode, sha256hex, writePrivate,
+  newJoinCode, sha256hex, writePrivate, updateEnvFile,
 } from "../src/remote.mjs";
 
 const argv = process.argv.slice(2);
@@ -101,11 +101,13 @@ async function finish(st) {
   try {
     writePrivate(tokenFile(cfg), st.token + "\n");
     // .env: this machine is an edge now, forwarding to that hub
-    let env = fs.existsSync(cfg.MYNA_ENV) ? fs.readFileSync(cfg.MYNA_ENV, "utf8") : "";
-    const set = (k, v) => { const re = new RegExp(`^${k}=.*$`, "m"); env = re.test(env) ? env.replace(re, `${k}=${v}`) : env + (env && !env.endsWith("\n") ? "\n" : "") + `${k}=${v}\n`; };
-    set("MYNA_ROLE", "edge"); set("MYNA_UPSTREAM", st.upstream);
-    fs.mkdirSync(path.dirname(cfg.MYNA_ENV), { recursive: true });
-    fs.writeFileSync(cfg.MYNA_ENV, env);
+    // read again and written under the file's lock (updateEnvFile): another program's change at the same time is kept
+    updateEnvFile(cfg.MYNA_ENV, (text) => {
+      let env = text;
+      const set = (k, v) => { const re = new RegExp(`^${k}=.*$`, "m"); env = re.test(env) ? env.replace(re, `${k}=${v}`) : env + (env && !env.endsWith("\n") ? "\n" : "") + `${k}=${v}\n`; };
+      set("MYNA_ROLE", "edge"); set("MYNA_UPSTREAM", st.upstream);
+      return env;
+    });
     // an earlier hub's bot id and question ids mean nothing to this one (the relay also ignores files
     // written for another hub — this covers files from before they said which hub)
     for (const f of [path.join(mynaDir(cfg), "upstream.json"), cfg.MYNA_EDGE_STATE_FILE || path.join(mynaDir(cfg), "edge-state.json")]) fs.rmSync(f, { force: true });
