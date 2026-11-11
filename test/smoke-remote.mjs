@@ -430,6 +430,23 @@ ok(topicsCreated.some((t) => t.name === "pc2 · b session"), "pc2's question ope
 ok(!botB.sent.some((m) => m.reply_markup), "hub up: pc2's own bot sends no question (it went to the hub)");
 r = await req(`${EDGE_A}/session/round-end`, { method: "POST", body: { session_id: "same-sid" } });
 ok(r.json?.ended === true, `mbp's round-end for "same-sid" is not held up by pc2's open question in its "same-sid" (ended=${r.json?.ended})`);
+// a background subagent's permission prompt (agent_id) asked through an edge stays open on the hub at the
+// session's round end while it is polled (one ask only: mbp's ask budget is counted in section 8; the
+// main thread's prompt at round end is test/smoke-permission.mjs)
+{
+  const PERM = ["✅ 允許", "❌ 拒絕"];
+  const pw = await ask(EDGE_A, { kind: "permission", question: "mbp worker 權限", options: PERM, session_id: "perm-sid", agent_id: "a0123456789abcdef" });
+  const kw = await keyboardWith(/mbp worker 權限/);
+  let polling = true; // the worker's hook, polling through the edge
+  const poll = (async () => { for (;;) { const x = await req(`${EDGE_A}/answer/${pw.json?.request_id}`); if (!polling || (x.json && x.json.kind !== "pending")) return x; } })();
+  await sleep(300);
+  r = await req(`${EDGE_A}/session/round-end`, { method: "POST", body: { session_id: "perm-sid" } });
+  const open = (await req(`${HUB}/requests`)).json?.requests?.find((x) => x.request_id === pw.json?.request_id);
+  ok(r.json?.ended === false && open?.answered === false && open?.agent_id === "a0123456789abcdef", `edge → hub round end: a worker's permission prompt (agent_id kept on the hub) stays open and the round stays open (ended=${r.json?.ended})`);
+  if (kw) tap(kw, 0, 0);
+  const w = await Promise.race([poll, sleep(10000).then(() => null)]); polling = false;
+  ok(w?.json?.kind === "selection" && w.json.value === "✅ 允許", `…the phone's ✅ after that round end reaches the worker through the edge → ${JSON.stringify(w?.json)}`);
+}
 const aQ = await ask(EDGE_A, { question: "mbp 第二題", session_id: "same-sid" });
 const AQ = aQ.json?.request_id, BQ = bQ.json?.request_id;
 r = await req(`${HUB}/requests`);

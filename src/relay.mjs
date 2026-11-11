@@ -223,7 +223,8 @@ const approvals = new Map();
 // kind: "permission" marks a Claude Code permission prompt forwarded by the PermissionRequest hook
 // approves: the command a ✅ option of this ask approves — informational only (journal, /requests,
 // detach info); an approval is recorded from the runtime-only entry.approves, never from meta
-const META_KEYS = ["gate", "thread_id", "header", "question", "options", "kind", "questionNumber", "questionTotal", "approves"];
+// agent_id: set by the PermissionRequest hook when the prompt is a background subagent's (see cancelPermissions)
+const META_KEYS = ["gate", "thread_id", "header", "question", "options", "kind", "questionNumber", "questionTotal", "approves", "agent_id"];
 const metaOf = (args) => Object.fromEntries(META_KEYS.filter((k) => args[k] !== undefined).map((k) => [k, args[k]]));
 
 // --- journal (handoff across restarts / upgrades) ---------------------------------------------
@@ -261,12 +262,17 @@ function armExpiry(id, p) {
   p.expiry = setTimeout(() => expireDetached(id), Math.max(0, p.detached.until - Date.now()));
   p.expiry.unref?.();
 }
-// A forwarded permission prompt is over once its session's turn ends or the session does: no dialog
-// outlives either. Its hook retracts it itself (terminal answered, or the hook was stopped), so this
-// is the safety net for one that could not — it must never hold a topic or a deferred close open.
+// A forwarded permission prompt is over once its session ends: no dialog outlives it. The main
+// thread's is also over at its round end; a background subagent's (meta.agent_id) is not — its dialog
+// can outlive the main thread's turn — so round end leaves it open while its hook still polls for the
+// answer, and cancels it once nobody does (the subagent was stopped: on Windows its hook is killed
+// without a signal and cannot retract it itself). Its hook retracts it itself (terminal answered, or
+// the hook was stopped), so this is the safety net for one that could not — it must never hold a
+// deferred close open.
 function cancelPermissions(sid, why) {
   for (const [id, p] of pending) {
     if (p.session_id !== sid || p.result !== undefined || p.meta?.kind !== "permission") continue;
+    if (why === "round end" && p.meta.agent_id && attended(p)) continue;
     log(`request ${id}: permission prompt still open at ${why} — cancelling`);
     Promise.resolve(provider.cancelQuestion?.(id)).catch((e) => log("cancelQuestion err", e.message));
     resolveRequest(id, { kind: "cancelled", reason: why });
