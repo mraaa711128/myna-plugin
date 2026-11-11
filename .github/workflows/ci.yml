@@ -119,3 +119,6 @@ jobs:
         env:
           MYNA_SERVER: dist/ask-human.mjs
         run: node test/smoke-autopilot.mjs
+
+      - name: Smoke — manual live tests refuse to run without MYNA_RELAY_URL; smoke-daemon isolation check (network blocked, synthetic paths, never :7800)
+        run: node test/smoke-live-guard.mjs

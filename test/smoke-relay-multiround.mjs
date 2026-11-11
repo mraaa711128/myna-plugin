@@ -1,4 +1,6 @@
 #!/usr/bin/env node
+// MANUAL live test — not part of the automated suite: it reaches your phone through the running relay.
+// Runs only with MYNA_RELAY_URL set explicitly: MYNA_RELAY_URL=http://127.0.0.1:7800 node test/smoke-relay-multiround.mjs
 // Interactive multi-round + abort live-test. The harness plays the ORCHESTRATOR: it drives
 // the conversational loop THROUGH the ask_human MCP tool. Requires `node src/relay.mjs` + phone.
 //   tap a number  -> selection (ends)
@@ -10,6 +12,10 @@ import { fileURLToPath } from "node:url";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { liveTestOptedIn, liveTestRefusal } from "./helpers/live-guard.mjs";
+
+// before anything touches the network or spawns the MCP server
+if (!liveTestOptedIn(process.env)) { console.error(liveTestRefusal("smoke-relay-multiround.mjs")); process.exit(2); }
 
 const serverPath = fileURLToPath(new URL("../src/mcp/ask-human.mjs", import.meta.url));
 const scratch = path.join(os.tmpdir(), "myna-multiround");

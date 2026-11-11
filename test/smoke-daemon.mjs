@@ -4,13 +4,30 @@
 // a relay of another plugin version (or a pre-0.7.2 one without /health) holding the port gets
 // replaced by ensure-relay; one with an open gate is left alone unless --force; --force restarts
 // even a same-version relay; a relay NEWER than this plugin is never downgraded unless --force;
-// stop → ensure back-to-back leaves a running relay. Uses the real .env
-// (point MYNA_ENV / RELAY_PORT / HOME elsewhere to keep it off the live relay).
+// stop → ensure back-to-back leaves a running relay. Refuses to run (exit 2) unless it is isolated
+// from the live relay: RELAY_PORT other than 7800, and MYNA_ENV (or HOME) pointing away from the real
+// ~/.myna — see test/helpers/live-guard.mjs. CI: MYNA_ENV=<temp>/myna.env RELAY_PORT=17899.
 import { spawn, spawnSync } from "node:child_process";
 import http from "node:http";
 import { setTimeout as sleep } from "node:timers/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import os from "node:os";
+import { daemonIsolationProblem, portInUse } from "./helpers/live-guard.mjs";
+
+// before any network call or spawn: never stop / replace the relay that is serving the phone
+let userHomedir;
+try { userHomedir = os.userInfo().homedir; } catch { userHomedir = os.homedir(); } // no passwd entry → fail closed on HOME
+const isolation = daemonIsolationProblem({ env: process.env, homedir: os.homedir(), userHomedir, platform: process.platform });
+if (isolation) { console.error(isolation); process.exit(2); }
+{
+  const p = Number(process.env.RELAY_PORT || 7800);
+  if (await portInUse(p)) {
+    console.error(`smoke-daemon refuses to run: something is already listening on 127.0.0.1:${p}, and the test would stop it.
+If it is a leftover test relay, stop it (RELAY_PORT=${p} node scripts/stop-relay.mjs); otherwise pick a free RELAY_PORT.`);
+    process.exit(2);
+  }
+}
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const node = process.execPath;
