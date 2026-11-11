@@ -232,7 +232,7 @@ ok(configChatArgs("chat") === "" && configChatArgs(" Chat  ON ") === "on" && con
 // dir: the stub's Myna folder (MYNA_ENV is <dir>/.env, so the chat mod's state files go to <dir>/chat-state);
 // S.sid: the session id the engine reports (a /clear or a resume changes it)
 function engine({ dir = path.join(TMP, "eng0"), root = "/w", sid = "s-1" } = {}) {
-  const hooks = [], store = new Map(), S = { sid };
+  const hooks = [], store = new Map(), S = { sid, delays: [] }; // delays: ms for the next writes, in order
   register((event, a, b) => {
     const [match, hook] = b ? [a, b] : [null, a];
     const h = { event, match, hook, onError: null };
@@ -242,7 +242,7 @@ function engine({ dir = path.join(TMP, "eng0"), root = "/w", sid = "s-1" } = {})
   const $ = {
     http: { fetch: async () => { throw new Error("no network in this test"); } },
     // like the engine's $.fs.write: creates the folders, writes the whole text
-    fs: { read: async () => { throw new Error("ENOENT"); }, write: async (p, text) => { fs.mkdirSync(path.dirname(p), { recursive: true }); fs.writeFileSync(p, text); } },
+    fs: { read: async () => { throw new Error("ENOENT"); }, write: async (p, text) => { const d = S.delays.shift(); if (d) await new Promise((res) => setTimeout(res, d)); fs.mkdirSync(path.dirname(p), { recursive: true }); fs.writeFileSync(p, text); } },
     session: { id: async () => S.sid, root: async () => root, cwd: async () => root, usage: async () => null },
     ui: { status: () => {} },
     prompt: { submit: async ({ text }) => ({ text }) },
@@ -318,6 +318,39 @@ function engine({ dir = path.join(TMP, "eng0"), root = "/w", sid = "s-1" } = {})
   // no records at all
   const empty = await cfg([], newHome());
   ok(/還沒有 session 的紀錄/.test(empty.out), "no state files → says there is no record yet");
+  // writes land in the order asked (Codex review of be0da2e, Y2): a prompt's refresh whose write is slow,
+  // then chat off right after — the file must end up off
+  const C = engine({ dir, root: "/work/c", sid: "sess-c" });
+  await C.fire("session.start", { cwd: "/work/c", surface: "terminal", isInteractive: true });
+  C.S.sid = "sess-c2"; // a /clear: the next prompt's refresh writes the new id
+  C.S.delays = [300, 0];
+  C.fire("prompt.submit", { text: "hi", origin: { kind: "composer" } });
+  await C.cmd("myna:config", "chat off");
+  await new Promise((res) => setTimeout(res, 400));
+  ok(state("sess-c2")?.on === false, `a slow refresh asked before chat off does not land after it (${JSON.stringify(state("sess-c2"))})`);
+}
+
+// 8) more from the review of be0da2e: a new .env is 0600 and stays so; hub on checks the role again under the lock
+{
+  if (process.platform !== "win32") {
+    const h = newHome(), E = path.join(h, ".myna", ".env");
+    await cfg(["topics", "off"], h);
+    const m1 = fs.statSync(E).mode & 0o777;
+    await run("configure.mjs", ["telegram", "123:abc"], h);
+    ok(m1 === 0o600 && (fs.statSync(E).mode & 0o777) === 0o600, `a .env created by /myna:config is 0600, still 0600 after configure writes a token (${m1.toString(8)})`);
+  }
+  // hub on starts while the lock is held; meanwhile .env becomes an edge's (a join finished): hub refuses
+  const h = newHome(), E = path.join(h, ".myna", ".env");
+  fs.writeFileSync(E, "TELEGRAM_BOT_TOKEN=123:abc\nTELEGRAM_CHAT_ID=1\n");
+  const holder = spawn(process.execPath, ["-e", "setTimeout(() => {}, 20000)"]);
+  fs.writeFileSync(`${E}.lock`, `${holder.pid} test\n`);
+  const hubP = run("hub.mjs", ["on"], h);
+  await new Promise((res) => setTimeout(res, 1500));
+  fs.writeFileSync(E, "TELEGRAM_BOT_TOKEN=123:abc\nTELEGRAM_CHAT_ID=1\nMYNA_ROLE=edge\nMYNA_UPSTREAM=https://hub.example.com\n");
+  fs.rmSync(`${E}.lock`, { force: true }); holder.kill();
+  const hr = await hubP;
+  ok(hr.rc === 1 && /這台是 edge/.test(hr.err) && !fs.readFileSync(E, "utf8").includes("MYNA_REMOTE_PORT") && !fs.existsSync(`${E}.lock`),
+    `hub on, the .env turned into an edge's while it waited for the lock → refused, nothing written, the lock gone ("${hr.err.trim().slice(0, 60)}…")`);
 }
 
 srv.close();

@@ -38,9 +38,11 @@ const set = (k, v) => {
 const unset = (k) => { env = env.replace(new RegExp(`^${k}=.*\\n?`, "m"), ""); };
 // a change: read .env again under its lock, decide and edit on that (change() returns whether to write),
 // so a change another program makes to it at the same time is not lost
+// change() may throw a refusal (refuse()): nothing is written and its message is what the user sees
+const refuse = (m) => Object.assign(new Error(m), { refusal: true });
 const edit = (change) => {
   try { updateEnvFile(envPath, (text) => { env = text; return change() ? env : undefined; }); }
-  catch (e) { fail(`${envPath} 寫不進去（${e.message}）。`); }
+  catch (e) { fail(e.refusal ? e.message : `${envPath} 寫不進去（${e.message}）。`); }
 };
 
 async function health() {
@@ -89,6 +91,8 @@ if (cmd === "on") {
 
   let had;
   edit(() => {
+    // the edge check again, on the file as it is now: a join may have finished since this started
+    if (!String(process.env.MYNA_ROLE ?? "").trim() && fileValue("MYNA_ROLE").toLowerCase() === "edge") throw refuse(`這台是 edge（MYNA_ROLE=edge，已加入 ${fileValue("MYNA_UPSTREAM") || "另一台主節點"}），不能同時當主節點。沒有改任何設定。要改回主節點，先從 ${envPath} 拿掉 MYNA_ROLE 和 MYNA_UPSTREAM。`);
     had = fileValue("MYNA_REMOTE_PORT");
     if (!had) set("MYNA_REMOTE_PORT", DEFAULT_REMOTE_PORT);
     if (name) set("MYNA_MACHINE_NAME", name);

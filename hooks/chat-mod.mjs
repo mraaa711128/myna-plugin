@@ -201,26 +201,26 @@ export const register = (on) => {
     try { await io.storeSet(storeKey(id), { ...(await saved(id)), ...patch, at: now() }); } catch {}
   }
   // this session's chat on/off for /myna:config's list (see STATE_REFRESH_MS); never throws
+  // One write at a time, in the order asked, each built from the state as it is when its turn comes: a write
+  // asked earlier (a prompt's refresh) can never land after a later one (chat off, session end) with older
+  // state. refresh: only when the session id changed (after /clear or a resume) or the record is stale.
   let recorded = { sid: null, at: 0 };
-  async function recordState({ ended = false, id: given = null } = {}) {
-    try {
-      if (!io || !cfg) return;
-      const id = given || (await io.sessionId());
-      if (!id) return;
-      const root = (await io.root().catch(() => "")) || (await io.cwd().catch(() => ""));
-      const at = new Date(now()).toISOString();
-      const rec = { session_id: id, on: enabled, ...(nick && token && sid === id ? { nick } : {}), project: root || "", updated_at: at, ...(ended ? { ended_at: at } : {}) };
-      await io.write(`${cfg.stateDir}/${stateFileName(id)}`, `${JSON.stringify(rec)}\n`);
-      if (!ended) recorded = { sid: id, at: now() };
-    } catch {}
+  let stateChain = Promise.resolve();
+  function recordState(opts = {}) {
+    stateChain = stateChain.then(() => writeState(opts)).catch(() => {});
+    return stateChain;
   }
-  // on a prompt: a new session id (after /clear or a resume) or a stale record → write it again
-  async function refreshState() {
-    try {
-      if (!io || !cfg) return;
-      const id = await io.sessionId();
-      if (id !== recorded.sid || now() - recorded.at > STATE_REFRESH_MS) await recordState();
-    } catch {}
+  const refreshState = () => recordState({ refresh: true });
+  async function writeState({ ended = false, id: given = null, refresh = false }) {
+    if (!io || !cfg) return;
+    const id = given || (await io.sessionId());
+    if (!id) return;
+    if (refresh && id === recorded.sid && now() - recorded.at <= STATE_REFRESH_MS) return;
+    const root = (await io.root().catch(() => "")) || (await io.cwd().catch(() => ""));
+    const at = new Date(now()).toISOString();
+    const rec = { session_id: id, on: enabled, ...(nick && token && sid === id ? { nick } : {}), project: root || "", updated_at: at, ...(ended ? { ended_at: at } : {}) };
+    await io.write(`${cfg.stateDir}/${stateFileName(id)}`, `${JSON.stringify(rec)}\n`);
+    recorded = ended ? { sid: null, at: 0 } : { sid: id, at: now() };
   }
 
   async function prune() {
