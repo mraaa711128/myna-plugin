@@ -6,8 +6,8 @@ Show or change a Myna setting and report the result.
 
 Run: `node "${CLAUDE_PLUGIN_ROOT}/scripts/config.mjs" $ARGUMENTS`
 
-- no argument → every item, one line each: its value and where it comes from (預設, the setting's file, `~/.myna/.env`, or an environment variable); under `chat`, one line per Claude Code session on this machine with its chat on/off, this session marked.
-- `<item>` → that item only.
+- no argument → every item in two lines: its value, where it comes from (預設, the setting's file, `~/.myna/.env`, or an environment variable) and the values it takes (`可設：…`), then one line on what it is for; under `chat`, one line per Claude Code session on this machine with its chat on/off, this session marked.
+- `<item>` → that item only, in full: its value, then `用途`, `可設` (for `hold`, the forms and range of `max`) and `存放` (where it is kept, and when a change takes effect).
 - `<item> <value>` → change it:
 
 | item | values | stored in | takes effect |
@@ -25,4 +25,4 @@ Run: `node "${CLAUDE_PLUGIN_ROOT}/scripts/config.mjs" $ARGUMENTS`
 
 A switch is changed by the same script as its own command (`/myna:autopilot` and so on), so both read and write the same setting. `chat` is answered by Myna's chat mod before this text is used; if the script says the chat mod is not loaded, pass that on as is.
 
-Show the script's output to the user, in Traditional Chinese, in one or two lines (the whole list as is when there was no argument). When `topics` changed, say the relay has to be restarted for it to apply (`/myna:relay restart`) — do not restart it yourself. If the script refused the value, say what it accepts; do not retry with another value.
+Show the script's output to the user, in Traditional Chinese, in one or two lines (the whole list, or the single item's lines, as is when no value was given). When `topics` changed, say the relay has to be restarted for it to apply (`/myna:relay restart`) — do not restart it yourself. If the script refused the value, say what it accepts; do not retry with another value.

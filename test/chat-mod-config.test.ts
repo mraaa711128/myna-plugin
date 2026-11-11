@@ -56,7 +56,11 @@ test('/myna:config chat on|off is the chat mod\'s, the same as /myna:chat', asyn
   await s.clock.settle()
   const off = (await $.command.run({ command: 'myna:config', args: 'chat off' })).text
   expect(off).toContain('聊天已關閉')
-  expect((await $.command.run({ command: 'myna:config', args: 'chat' })).text).toBe('💬 聊天目前關閉。用 /myna:config chat on 開啟。')
+  // the state, then what the item is for and what it takes (as /myna:config shows every other item)
+  const state = (await $.command.run({ command: 'myna:config', args: 'chat' })).text
+  expect(state.split('\n')[0]).toBe('💬 聊天目前關閉。用 /myna:config chat on 開啟。')
+  expect(state).toContain('\n用途：在 Telegram 跟這個 session 聊天')
+  expect(state).toContain('\n可設：on / off（只改目前這個 session）')
   const on1 = (await $.command.run({ command: 'myna:config', args: 'chat on' })).text
   expect(on1).toContain('聊天已開啟')
   const viaChat = (await $.command.run({ command: 'myna:chat', args: 'off' })).text

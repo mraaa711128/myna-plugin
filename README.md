@@ -523,7 +523,7 @@ session 取走你的訊息時,那則訊息會被標上 👀。session 正在忙�
 **建不了 topic 時(0.18.1):** session 連上時 topic 沒建成(例如那時 relay 連不上 Telegram,或當時 `TELEGRAM_TOPICS=off`),它會先在主聊天室以 `[egret]` 發言。這不是永久的:之後每次重新連上(session 重開、`/resume`、relay 重啟後自動重新註冊),只要 topics 沒關,relay 都會再建一次,建成就搬進自己的 topic,並在那裡說「已連線」。還是建不成時就留在主聊天室,不會每次都再發一次「已連線」(只有重新連線時說一句「重新連線了」)。
 
 ```
-/myna:config chat       # 查目前狀態(暱稱、待處理的訊息)
+/myna:config chat       # 查目前狀態(暱稱、待處理的訊息),附用途和可設的值
 /myna:config chat off   # 這個 session 不再收 Telegram 訊息,也不回報進度
 /myna:config chat on    # 重新開啟(舊的 /myna:chat on|off 是別名,之後會移除)
 /myna:nick heron     # 改暱稱(topic 跟著改名)
@@ -693,7 +693,7 @@ MYNA_MACHINE_NAME=win        # 選填,topic 前面的短名稱(預設 hostname)
 | 指令 | 作用 |
 |---|---|
 | `/myna:status` | 一頁看這台 Myna 的狀態(只讀):relay 版本和角色、配對的聊天室、Telegram topic 會不會開(卡在哪一項)、各開關、主要設定,最後列出建議的下一步。不含 token;有聊天室 id、名稱和 bot 名稱(v0.23.0) |
-| `/myna:config [項目] [值]` | 看和改所有開關和常用設定:不帶參數 = 每項一行(值和來源);項目有 `autopilot`、`intercept`、`stopcatch`、`brief`、`perm`、`murmur`、`hold`(`on`/`off`,`hold` 另有 `max <時間>`、`status`)、`chat`(這個 session;清單會列出這台每個 session 的開關)、`topics`(`auto`/`off`,寫 `.env` 的 `TELEGRAM_TOPICS`,要 `/myna:relay restart`)、`perm-delay`(秒數,寫 `.env` 的 `MYNA_PERMISSION_DELAY`)。下面標「別名」的舊指令照常可用,之後會移除(v0.24.0) |
+| `/myna:config [項目] [值]` | 看和改所有開關和常用設定:不帶參數 = 每項兩行(值、來源、`可設:` 哪些值,下一行是一句用途);只帶項目 = 那一項的完整說明(用途、可設的值、存在哪裡、改了什麼時候生效);項目有 `autopilot`、`intercept`、`stopcatch`、`brief`、`perm`、`murmur`、`hold`(`on`/`off`,`hold` 另有 `max <時間>`、`status`)、`chat`(這個 session;清單會列出這台每個 session 的開關)、`topics`(`auto`/`off`,寫 `.env` 的 `TELEGRAM_TOPICS`,要 `/myna:relay restart`)、`perm-delay`(秒數,寫 `.env` 的 `MYNA_PERMISSION_DELAY`)。下面標「別名」的舊指令照常可用,之後會移除(v0.24.0) |
 | `/myna:setup <token>` | 一鍵(Telegram):存 token → 配對 chat id → 起 relay |
 | `/myna:setup discord\|slack …` | 一鍵(Discord / Slack):存憑證 → 起 relay |
 | `/myna:configure <token> [chat_id]` | 只設/換 Telegram bot token(+可選 chat id) |

@@ -2,7 +2,8 @@
 // /myna:config (scripts/config.mjs + the chat mod's "myna:config" hook). Temp HOMEs, a fake relay on a random
 // port (never :7800), no real ~/.myna.
 //   - every switch on / off: the same files as running its own script; the output is that script's
-//   - <item> / no argument: one line per item with its source; writes nothing
+//   - no argument: per item its value and source, 可設 <values>, and a purpose line; <item>: also 用途 / 可設 /
+//     存放 in full; writes nothing
 //   - hold max 6h / status go to hold.mjs; bad values refused before anything runs
 //   - topics / perm-delay → ~/.myna/.env: validated (a bad value leaves the file as it was), the key's line
 //     replaced (CRLF kept, duplicates too, comments untouched) or added; an environment variable that wins is named
@@ -15,7 +16,7 @@ import { fileURLToPath } from "node:url";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { register, configChatArgs } from "../hooks/chat-mod.mjs";
+import { register, configChatArgs, CHAT_CONFIG_PURPOSE, CHAT_CONFIG_VALUES } from "../hooks/chat-mod.mjs";
 
 const HERE = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const ROOT = process.env.MYNA_TEST_ROOT ? path.resolve(process.env.MYNA_TEST_ROOT) : HERE;
@@ -101,13 +102,33 @@ for (const args of [["autopilot", "yes"], ["intercept", "status"], ["brief", "on
   const items = ["autopilot", "intercept", "stopcatch", "brief", "perm", "murmur", "hold", "chat", "topics", "perm-delay"];
   ok(r.rc === 0 && items.every((k) => new RegExp(`^  ${k} `, "m").test(r.out)) && same(snap(a), {}), "no argument → one line per item (all 10), nothing written");
   ok(/autopilot\s+off（預設）/.test(r.out) && /intercept\s+on（預設）/.test(r.out) && /topics\s+auto（預設）/.test(r.out) && /perm-delay\s+30 秒（預設）/.test(r.out), "defaults: autopilot off, intercept on, topics auto, perm-delay 30 s");
+  // every item: "可設：…" on its line and a purpose line under it (Stanley 2026-11-11, after trying it)
+  const VALUES = { autopilot: "on / off", intercept: "on / off", stopcatch: "on / off", brief: "on / off", perm: "on / off", murmur: "on / off",
+    hold: "on / off / max <時間> / status", chat: "on / off（只改目前這個 session）", topics: "auto / off", "perm-delay": "0 以上的整數（秒）" };
+  const ls = r.out.trimEnd().split("\n");
+  const missing = items.filter((k) => {
+    const i = ls.findIndex((l) => l.startsWith(`  ${k} `));
+    return !(i >= 0 && ls[i].endsWith(`　可設：${VALUES[k]}`) && /^ {4}\S/.test(ls[i + 1] ?? "") && ls[i + 1].trim().length >= 10);
+  });
+  ok(missing.length === 0, `no argument → every item ends with 可設：<values> and has a purpose line under it (missing: ${missing.join(", ") || "none"})`);
+  ok(/^ {4}手機上的題目自動採用建議選項/m.test(r.out) && /^ {4}權限確認框在終端機等幾秒沒人回答/m.test(r.out) && /^ {4}Telegram 每個 gate/m.test(r.out), "…the purposes read as written (autopilot, perm-delay, topics)");
+  ok(ls.length === 1 + items.length * 2 + 1, `…two lines per item, plus the heading and chat's "no record" line (${ls.length} lines)`);
   await cfg(["stopcatch", "off"], a);
   fs.writeFileSync(path.join(a, ".myna", ".env"), "TELEGRAM_TOPICS=off\n");
   const r2 = await cfg([], a, { MYNA_PERMISSION_DELAY: "45" });
   ok(/stopcatch\s+off（設定檔 .*stopcatch）/.test(r2.out) && /topics\s+off（.*\.env）/.test(r2.out) && /perm-delay\s+45 秒（環境變數）/.test(r2.out),
     "sources: the flag file, ~/.myna/.env, the environment");
   const one = await cfg(["topics"], a);
-  ok(one.rc === 0 && one.out.trim().split("\n").length === 1 && /^topics\s+off/.test(one.out), `one item → that line only ("${one.out.trim()}")`);
+  const ol = one.out.trim().split("\n");
+  ok(one.rc === 0 && ol.length === 4 && /^topics\s+off/.test(ol[0]) && /^  用途：Telegram 每個 gate.*Threaded Mode/.test(ol[1]) && ol[2] === "  可設：auto / off" && /^  存放：.*\.env 的 TELEGRAM_TOPICS；relay 啟動時才讀/.test(ol[3]),
+    `one item → its line, then 用途 / 可設 / 存放 (${JSON.stringify(ol)})`);
+  const holdOne = (await cfg(["hold"], a)).out.trim().split("\n");
+  ok(/^  可設：on \/ off \/ max <30m\|6h\|1d\|秒數\|default>（10 分鐘～7 天，預設 1 天）\/ status/.test(holdOne[2]) && /^  存放：.*upstream-hold；馬上生效/.test(holdOne[3]),
+    `hold alone → the full values (max's forms and range) and its file (${JSON.stringify(holdOne.slice(2))})`);
+  for (const k of ["autopilot", "intercept", "stopcatch", "brief", "perm", "murmur", "perm-delay"]) {
+    const o = (await cfg([k], a)).out.trim().split("\n");
+    ok(o.length === 4 && /^  用途：\S/.test(o[1]) && /^  可設：\S/.test(o[2]) && /^  存放：\S/.test(o[3]), `${k} alone → 用途 / 可設 / 存放 (${JSON.stringify(o[2])})`);
+  }
   fs.writeFileSync(path.join(a, ".myna", ".env"), "MYNA_PERMISSION_DELAY=soon\n");
   const odd = await cfg(["perm-delay"], a);
   ok(/30 秒.*看不懂/.test(odd.out), `an unreadable perm-delay in .env → 30 s and says so ("${odd.out.trim()}")`);
@@ -222,6 +243,11 @@ for (const args of [["autopilot", "yes"], ["intercept", "status"], ["brief", "on
   ok(r.rc === 1 && /不認得的項目「nope」/.test(r.err) && /autopilot、intercept/.test(r.err) && same(snap(a), {}), "unknown item → error with the item list, nothing written");
   r = await cfg(["chat", "on"], a);
   ok(r.rc === 1 && /沒有載入聊天模組/.test(r.out) && same(snap(a), {}), "chat reaching config.mjs (no chat mod) → says the mod is not loaded, nothing written");
+  r = await cfg(["chat"], a);
+  ok(r.rc === 1 && r.out.includes(`  用途：${CHAT_CONFIG_PURPOSE}\n`) && r.out.includes(`  可設：${CHAT_CONFIG_VALUES}\n`), "chat alone without the chat mod → still says what it is for and what it takes");
+  // the list's chat texts are the chat mod's own (the mod answers "/myna:config chat" with them)
+  r = await cfg([], a);
+  ok(r.out.includes(`　可設：${CHAT_CONFIG_VALUES}\n    ${CHAT_CONFIG_PURPOSE}\n`), "the list's chat 可設 and purpose = the chat mod's CHAT_CONFIG_VALUES / CHAT_CONFIG_PURPOSE");
   r = await cfg(["files"], a);
   ok(r.rc === 1, "files is not a /myna:config item (it stays /myna:files)");
 }
@@ -272,7 +298,9 @@ function engine({ dir = path.join(TMP, "eng0"), root = "/w", sid = "s-1" } = {})
   ok(x.passed === null && /聊天已關閉/.test(x.r.text) && E.store.get("chat:s-1")?.on === false, `/myna:config chat off → answered by the mod, stored off ("${x.r.text}")`);
   const viaChat = await E.cmd("myna:chat", "");
   x = await E.cmd("myna:config", "chat");
-  ok(x.passed === null && x.r.text === "💬 聊天目前關閉。用 /myna:config chat on 開啟。" && viaChat.r.text.startsWith(x.r.text), `/myna:config chat → the state, as /myna:chat says it ("${x.r.text}")`);
+  const state0 = "💬 聊天目前關閉。用 /myna:config chat on 開啟。";
+  ok(x.passed === null && x.r.text === `${state0}\n用途：${CHAT_CONFIG_PURPOSE}（需要 Claude Code 2.1.287 以上，只支援 Telegram）\n可設：${CHAT_CONFIG_VALUES}` && viaChat.r.text.startsWith(`${state0}\n提示：`),
+    `/myna:config chat → the state as /myna:chat says it, then 用途 / 可設 (${JSON.stringify(x.r.text)})`);
   ok(/\n提示：\/myna:chat 之後會移除，請改用 \/myna:config chat on\|off$/.test(viaChat.r.text), "/myna:chat's answer ends with the hint line");
   x = await E.cmd("myna:config", "chat on");
   ok(x.passed === null && /聊天已開啟/.test(x.r.text) && E.store.get("chat:s-1")?.on === true, `/myna:config chat on → on, stored ("${x.r.text}")`);

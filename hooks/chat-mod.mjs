@@ -52,6 +52,11 @@ const CMD_QUIET_MS = 5000;
 // /myna:chat is kept as an alias of /myna:config chat for a while (until 0.25.0 and at least 30 days)
 const CHAT_ALIAS_HINT = "提示：/myna:chat 之後會移除，請改用 /myna:config chat on|off";
 const CHAT_ALIAS_HINT_PHONE = "提示：!myna:chat 之後會移除，請改用 !myna:config chat on|off";
+// what "/myna:config chat" (the state) adds below it: the purpose and the values, as scripts/config.mjs shows
+// them for every other item (its INFO.chat holds the same two texts; test/smoke-config.mjs checks they match)
+export const CHAT_CONFIG_PURPOSE = "在 Telegram 跟這個 session 聊天：手機上打的字交給它，它做了什麼、怎麼回答都回到手機";
+export const CHAT_CONFIG_VALUES = "on / off（只改目前這個 session）";
+const CHAT_CONFIG_INFO = `用途：${CHAT_CONFIG_PURPOSE}（需要 Claude Code 2.1.287 以上，只支援 Telegram）\n可設：${CHAT_CONFIG_VALUES}`;
 // Each session's chat on/off, for /myna:config's list (scripts/config.mjs reads them): one small JSON file
 // per session in <myna dir>/chat-state/ — {session_id, on, nick?, project, updated_at, ended_at?}. Written on
 // session start, /myna:config chat on|off (and /myna:chat), a registration or a new nick, a new session id
@@ -584,7 +589,8 @@ export const register = (on) => {
   // a bad value for every other item too)
   async function configChat(arg, p = "/") {
     if (arg !== "" && arg !== "on" && arg !== "off") return `💬 chat 只接受 on 或 off(你給的是「${arg}」),沒有改。`;
-    return chatCommand(arg, p);
+    // the state comes with what the item is for and what it takes, like every other /myna:config <item>
+    return arg === "" ? `${await chatCommand(arg, p)}\n${CHAT_CONFIG_INFO}` : chatCommand(arg, p);
   }
 
   // p: how the human types a command where the reply goes ("/" at the terminal, "!" on the phone)

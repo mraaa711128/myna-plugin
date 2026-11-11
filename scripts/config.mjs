@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 // /myna:config — the switches and the common ~/.myna/.env settings in one command.
-//   config.mjs                   every item: its value and where it comes from, one line each
-//   config.mjs <item>            that item only
+//   config.mjs                   every item: its value, where it comes from and the values it takes, then a
+//                                line on what it is for
+//   config.mjs <item>            that item only, in full: also where it is kept and when a change applies
 //   config.mjs <item> <value>    change it:
 //     a switch (autopilot, intercept, stopcatch, brief, perm, murmur, hold) → its own script
 //       (scripts/<item>.mjs) with the value, its output as is: same flag files, same reading
@@ -75,6 +76,72 @@ function chatSessions() {
   return rows.sort((a, b) => b.current - a.current || Date.parse(b.updated_at) - Date.parse(a.updated_at));
 }
 
+// --- what each item is for and what it takes (Stanley 2026-11-11, after trying it: every item shows its
+// values and a short purpose). The texts follow each item's own command md (commands/<item>.md) and the
+// README; chat's two come from the chat mod, which answers "/myna:config chat" with the same ones.
+//   values: the list's "可設：…"; valuesFull: the single item's, when it says more
+//   purpose: one line, in the list and the single item; more: the single item only
+//   applies: when a change takes effect (the single item only; topics / perm-delay: ENV_ITEMS[item].applies)
+const INFO = {
+  autopilot: {
+    values: "on / off",
+    purpose: "手機上的題目自動採用建議選項，不再問你（每個決定都會記錄）",
+    more: "題目要有建議選項（recommendedIndex），沒有就照常送到手機；決定記在專案的 MYNA-DECISIONS.jsonl / .md",
+    applies: "馬上生效",
+  },
+  intercept: {
+    values: "on / off",
+    purpose: "AI 用 AskUserQuestion 問的選擇題改送到手機（relay 連不上時照常在終端機選）",
+    more: "跟 autopilot 是分開的開關；autopilot 也開著時，轉過去的題目直接採用建議選項",
+    applies: "馬上生效",
+  },
+  stopcatch: {
+    values: "on / off",
+    purpose: "AI 回合結束時用純文字問你問題，改用 ask_human 送到手機",
+    more: "relay 連不上時不動作；同一次回合結束只擋一次。關掉只是不轉問句，回合結束時收 topic 照常",
+    applies: "馬上生效",
+  },
+  brief: {
+    values: "on / off",
+    purpose: "被攔截的題目另外發一頁決策輔助 Artifact（每個選項的背景、優缺點），手機上的題目附連結",
+    more: "只在 intercept 開著時作用；Artifact 的內容會送到 claude.ai，敏感的題目可以先關掉",
+    applies: "馬上生效",
+  },
+  perm: {
+    values: "on / off",
+    purpose: "終端機的權限確認框沒人回答時，等 perm-delay 秒後送到手機（✅ 允許／❌ 拒絕）",
+    more: "終端機和手機都能回答，先答的算；relay 連不上時只在終端機",
+    applies: "馬上生效",
+  },
+  murmur: {
+    values: "on / off",
+    purpose: "聊天 session 的進度訊息：on 每個工具一行累加，off 只留 💭 和最新一個工具",
+    more: "所有 session 共用",
+    applies: "下一次進度更新生效",
+  },
+  hold: {
+    values: "on / off / max <時間> / status",
+    valuesFull: "on / off / max <30m|6h|1d|秒數|default>（10 分鐘～7 天，預設 1 天）/ status（看主節點連不連得上、排著幾題）",
+    purpose: "（子節點）主節點連不上時，新題目先排著，恢復後再送到手機",
+    more: "只在加入主節點（/myna:join）的機器有作用；off = 改用這台自己的 bot，沒有就回終端機；環境變數或 .env 的 MYNA_UPSTREAM_HOLD / MYNA_UPSTREAM_HOLD_MAX 優先",
+    applies: "馬上生效，不用重啟 relay",
+  },
+  // the chat mod's texts (hooks/chat-mod.mjs CHAT_CONFIG_PURPOSE / CHAT_CONFIG_VALUES)
+  chat: {
+    values: "on / off（只改目前這個 session）",
+    purpose: "在 Telegram 跟這個 session 聊天：手機上打的字交給它，它做了什麼、怎麼回答都回到手機",
+  },
+  topics: {
+    values: "auto / off",
+    purpose: "Telegram 每個 gate（和每個聊天 session）各開一個 topic；off = 全部在主聊天室",
+    more: "bot 要在 BotFather 開 Threaded Mode；auto 時建不了 topic 也會退回主聊天室",
+  },
+  "perm-delay": {
+    values: "0 以上的整數（秒）",
+    purpose: "權限確認框在終端機等幾秒沒人回答，才送到手機；0 = 立刻送",
+  },
+};
+
 // --- one line per item ----------------------------------------------------------------------------------
 const ORDER = ["autopilot", "intercept", "stopcatch", "brief", "perm", "murmur", "hold", "chat", "topics", "perm-delay"];
 const pad = (k) => k.padEnd(11);
@@ -83,7 +150,7 @@ function line(item) {
     const d = String(cfg.MYNA_CHAT || "").trim().toLowerCase();
     const def = d === "on" ? `開（MYNA_CHAT=on，${envSource("MYNA_CHAT", readEnvFile(ENV_PATH))}）` : d === "off" ? `關（MYNA_CHAT=off，${envSource("MYNA_CHAT", readEnvFile(ENV_PATH))}）` : "開（終端機 session）";
     const rows = chatSessions();
-    const head = `${pad("chat")}每個 session 各自設定（改這個 session：/myna:config chat on|off）；新 session 預設${def}`;
+    const head = `${pad("chat")}每個 session 各自設定；新 session 預設${def}`;
     if (!rows.length) return `${head}\n${" ".repeat(13)}（還沒有 session 的紀錄：載入聊天模組的 Claude Code session 開始後才會有）`;
     const proj = (p) => (p ? path.basename(String(p).replace(/[\\/]+$/, "")) || p : "?");
     return [head, ...rows.map((s) => `${" ".repeat(13)}${s.on ? "on " : "off"}  ${proj(s.project)}${s.nick ? `（${s.nick}）` : ""}　最後更新 ${when(s.updated_at)}${s.current ? "　← 這個 session" : ""}`)].join("\n");
@@ -109,6 +176,19 @@ function line(item) {
   return `${pad(item)}${st.on ? "on" : "off"}（${src}）`;
 }
 
+// the list: the value line with "可設：…", the purpose under it, then (chat) one line per session
+function listEntry(item) {
+  const [head, ...below] = line(item).split("\n");
+  return [`  ${head}　可設：${INFO[item].values}`, `    ${INFO[item].purpose}`, ...below].join("\n");
+}
+// one item: the value line, then what it is for, what it takes, where it is kept and when a change applies
+function itemEntry(item) {
+  const info = INFO[item], out = [line(item), `  用途：${info.purpose}${info.more ? `。${info.more}` : ""}`, `  可設：${info.valuesFull || info.values}`];
+  if (ENV_ITEMS[item]) out.push(`  存放：${tildePath(ENV_PATH)} 的 ${ENV_ITEMS[item].key}；${ENV_ITEMS[item].applies}`);
+  else if (item !== "chat") out.push(`  存放：${tildePath(sw(item).file(cfg, env))}；${info.applies}`);
+  return out.join("\n");
+}
+
 const ITEMS_TEXT = ORDER.join("、");
 const usageError = (msg) => { console.error(msg); process.exit(1); };
 const [item0, ...rest] = process.argv.slice(2);
@@ -116,7 +196,7 @@ const [item0, ...rest] = process.argv.slice(2);
 const warn = envError ? [`注意：${tildePath(ENV_PATH)} 讀不到（${envError}），下面只看環境變數和各開關的檔案`] : [];
 
 if (!item0) {
-  console.log(["Myna 設定（改：/myna:config <項目> <值>）", ...warn, ...ORDER.map((k) => `  ${line(k)}`)].join("\n"));
+  console.log(["Myna 設定（改：/myna:config <項目> <值>；單項的詳細：/myna:config <項目>）", ...warn, ...ORDER.map(listEntry)].join("\n"));
   process.exit(0);
 }
 const item = item0.toLowerCase();
@@ -124,10 +204,13 @@ if (!ORDER.includes(item)) usageError(`不認得的項目「${item0}」。可以
 
 if (item === "chat") {
   // the chat mod answers "/myna:config chat …"; reaching here means it is not loaded in this session
-  console.log("chat 是每個 session 各自的開關，由聊天模組處理；這個 session 沒有載入聊天模組（需要 Claude Code 2.1.287 以上）。升級後重開 session 就會自動啟用（終端機 session 預設開啟）。");
+  console.log([
+    "chat 是每個 session 各自的開關，由聊天模組處理；這個 session 沒有載入聊天模組（需要 Claude Code 2.1.287 以上）。升級後重開 session 就會自動啟用（終端機 session 預設開啟）。",
+    `  用途：${INFO.chat.purpose}`, `  可設：${INFO.chat.values}`,
+  ].join("\n"));
   process.exit(1);
 }
-if (!rest.length) { console.log([...warn, line(item)].join("\n")); process.exit(0); }
+if (!rest.length) { console.log([...warn, itemEntry(item)].join("\n")); process.exit(0); }
 
 // --- a switch: its own script, its output as is -----------------------------------------------------------
 if (!ENV_ITEMS[item]) {
