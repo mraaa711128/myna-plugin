@@ -258,6 +258,48 @@ export function withFileLock(file, fn) {
   try { return fn(); } finally { if (readLock(lock) === mine) { try { fs.rmSync(lock, { force: true }); } catch {} } }
 }
 
+// ~/.myna/.env read-modify-write, for every program that changes it (configure, hub, join, config): under
+// <.env>.lock (withFileLock) the file is read again, fn(text) returns the new text (anything else: leave
+// it as it is), and that is written to a temp file next to the file and renamed over it — two writers at
+// once each keep the other's change. The rename is tried a few times (Windows: a scanner holding the file);
+// only if it still fails is the file written in place, as these writers always did, and only then can a
+// crash in the middle leave it partly written. The file's mode is kept; a new one is 0600 (it holds the bot
+// tokens); a link keeps pointing where it did (its target is written; a target not there yet is created
+// through the link, as a plain write would). fn may throw to refuse: nothing is written, the lock is
+// released, the error goes to the caller. → what fn returned.
+// The lock sits next to the file actually written: a link is resolved first, so one program going through
+// the link and another through the real path take the same lock (a dangling link: next to the file it names,
+// which a program writing that path directly locks too).
+export function updateEnvFile(envPath, fn) {
+  let lockOn = envPath;
+  try {
+    if (fs.lstatSync(envPath).isSymbolicLink()) {
+      try { lockOn = fs.realpathSync(envPath); }
+      catch { lockOn = path.resolve(path.dirname(envPath), fs.readlinkSync(envPath)); }
+    }
+  } catch {}
+  return withFileLock(lockOn, () => {
+    let text = "";
+    try { text = fs.readFileSync(envPath, "utf8"); } catch (e) { if (e.code !== "ENOENT") throw e; }
+    const out = fn(text);
+    if (typeof out !== "string") return out;
+    let target = envPath, mode = 0o600, dangling = false;
+    try { if (fs.lstatSync(envPath).isSymbolicLink()) { try { target = fs.realpathSync(envPath); } catch { dangling = true; } } } catch {}
+    if (dangling) { fs.writeFileSync(envPath, out, { mode }); return out; }
+    try { mode = fs.statSync(target).mode & 0o777; } catch {}
+    const tmp = `${target}.${process.pid}.tmp`;
+    try {
+      fs.writeFileSync(tmp, out, { mode });
+      fs.chmodSync(tmp, mode); // the umask may have narrowed it
+      for (let i = 0; ; i++) {
+        try { fs.renameSync(tmp, target); break; }
+        catch (e) { if (i >= 4) { fs.writeFileSync(target, out); break; } sleepSync(50); }
+      }
+    } finally { try { fs.rmSync(tmp, { force: true }); } catch {} }
+    return out;
+  });
+}
+
 // --- request helpers -------------------------------------------------------------------------------
 // read a request body, at most `max` bytes: past it → {tooLarge:true} at once — the rest is neither
 // buffered nor waited for (a body that never ends must not hold the request); answer with refuseTooLarge

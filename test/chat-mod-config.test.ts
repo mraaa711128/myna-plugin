@@ -1,0 +1,124 @@
+// /myna:config in Claude Code's own mod test kit (`claude plugin test` from the repo root; needs the Claude Code
+// CLI, so it is not in CI — test/smoke-config.mjs covers the same on a stub `$`). The test's own command.run hook
+// sits beneath the chat mod and stands for the engine running commands/config.md (scripts/config.mjs):
+//   - /myna:config <any item but chat> → the mod passes it on (next) with the arguments untouched
+//   - /myna:config chat on|off → the chat mod answers, the same as /myna:chat; the markdown never runs
+//   - /myna:chat's answer carries the hint line
+//   - "!myna:config chat off" from the phone → answered by the mod, not run as a command
+import { expect, mock, test } from 'claude-code/testing'
+
+function stubs(on, takes: any[] = [], { markdownThrows = false } = {}) {
+  const clock = mock.clock(on)
+  mock.store(on, {})
+  const posts: any[] = []
+  const markdown: any[] = []
+  on('env.get', ($, e) => ({ value: ({ HOME: '/h', MYNA_CHAT: 'on', RELAY_PORT: '7999' } as any)[e.name] }))
+  on('fs.read', ($, e) => (String(e.path).endsWith('relay-secret') ? { value: 'x'.repeat(64) } : { deny: 'no such file' }))
+  on('session.id', () => ({ value: 'kit-1' }))
+  on('session.root', () => ({ value: '/w' }))
+  on('session.cwd', () => ({ value: '/w' }))
+  on('ui.status', () => ({ value: undefined }))
+  on('prompt.submit', ($, e) => ({ text: e.text }))
+  on('http.fetch', ($, e) => {
+    const url = String(e.url)
+    posts.push({ url, body: String(e.init?.body || '') })
+    if (url.endsWith('/chat/register')) return { value: { status: 200, ok: true, headers: {}, text: JSON.stringify({ token: 't', nick: 'egret', topic: 1, queued: 0 }) } }
+    if (url.endsWith('/chat/take')) return { value: { status: 200, ok: true, headers: {}, text: JSON.stringify({ messages: takes.splice(0), queued: 0 }) } }
+    return { value: { status: 200, ok: true, headers: {}, text: '{}' } }
+  })
+  on('session.start', () => ({ cwd: '/w' }))
+  on('session.end', ($, e) => ({ sessionId: e.sessionId }))
+  const writes: any[] = []
+  on('fs.write', ($, e) => { writes.push({ path: String(e.path).split(String.fromCharCode(92)).join('/'), text: String(e.text) }); return { value: undefined } })
+  // the engine's own run of the markdown command (commands/config.md)
+  on('command.run', { command: 'myna:config' }, ($, e) => {
+    markdown.push(e.args)
+    if (markdownThrows) throw new Error('markdown command failed')
+    return { text: `markdown:${e.args}` }
+  })
+  return { clock, posts, markdown, writes }
+}
+
+test('/myna:config <not chat> goes on to the markdown command, arguments untouched', async ($, on) => {
+  const s = stubs(on)
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/w' })
+  await s.clock.settle()
+  expect((await $.command.run({ command: 'myna:config', args: 'autopilot on' })).text).toBe('markdown:autopilot on')
+  expect((await $.command.run({ command: 'myna:config', args: 'hold max 6h' })).text).toBe('markdown:hold max 6h')
+  expect((await $.command.run({ command: 'myna:config' })).text).toBe('markdown:')
+  expect((await $.command.run({ command: 'myna:config', args: 'chatty' })).text).toBe('markdown:chatty')
+  expect(s.markdown).toEqual(['autopilot on', 'hold max 6h', '', 'chatty'])
+})
+
+test('/myna:config chat on|off is the chat mod\'s, the same as /myna:chat', async ($, on) => {
+  const s = stubs(on)
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/w' })
+  await s.clock.settle()
+  const off = (await $.command.run({ command: 'myna:config', args: 'chat off' })).text
+  expect(off).toContain('聊天已關閉')
+  // the state, then what the item is for and what it takes (as /myna:config shows every other item)
+  const state = (await $.command.run({ command: 'myna:config', args: 'chat' })).text
+  expect(state.split('\n')[0]).toBe('💬 聊天目前關閉。用 /myna:config chat on 開啟。')
+  expect(state).toContain('\n用途：在 Telegram 跟這個 session 聊天')
+  expect(state).toContain('\n可設：on / off（只改目前這個 session）')
+  const on1 = (await $.command.run({ command: 'myna:config', args: 'chat on' })).text
+  expect(on1).toContain('聊天已開啟')
+  const viaChat = (await $.command.run({ command: 'myna:chat', args: 'off' })).text
+  expect(viaChat).toBe(`${off}\n提示：/myna:chat 之後會移除，請改用 /myna:config chat on|off`)
+  expect((await $.command.run({ command: 'myna:config', args: 'chat maybe' })).text).toContain('只接受 on 或 off')
+  expect(s.markdown).toEqual([])
+})
+
+test('"!myna:config chat off" from the phone is answered by the mod, not run as a command', async ($, on) => {
+  const s = stubs(on, [{ id: 'm1', text: '!myna:config chat off' }])
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/w' })
+  await s.clock.settle()
+  await s.clock.advance(2500)
+  await s.clock.settle()
+  const done = s.posts.filter((p) => p.url.endsWith('/chat/progress') && p.body.includes('"done"'))
+  expect(done.length).toBe(1)
+  expect(done[0].body).toContain('/myna:config chat on')
+  expect(done[0].body).not.toContain('之後會移除')
+  expect(s.markdown).toEqual([])
+  expect((await $.command.run({ command: 'myna:config', args: 'chat' })).text).toContain('聊天目前關閉')
+})
+
+// Codex review r2 X6: the old !myna:chat from the phone carries the hint too, pointing at the new command
+test('"!myna:chat" from the phone answers with the hint line', async ($, on) => {
+  const s = stubs(on, [{ id: 'm1', text: '!myna:chat' }])
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/w' })
+  await s.clock.settle()
+  await s.clock.advance(2500)
+  await s.clock.settle()
+  const done = s.posts.filter((p) => p.url.endsWith('/chat/progress') && p.body.includes('"done"'))
+  expect(done.length).toBe(1)
+  expect(done[0].body).toContain('提示：!myna:chat 之後會移除，請改用 !myna:config chat on|off')
+})
+
+// Codex review r1 X3: a markdown command that fails after the mod passed it on is not run a second time by the
+// mod's .catch (next(e) there replays what the first call settled to)
+test('a failing markdown command runs once', async ($, on) => {
+  const s = stubs(on, [], { markdownThrows: true })
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/w' })
+  await s.clock.settle()
+  let threw = false
+  try { await $.command.run({ command: 'myna:config', args: 'autopilot on' }) } catch { threw = true }
+  expect(threw).toBe(true)
+  expect(s.markdown).toEqual(['autopilot on'])
+})
+
+// Stanley's decision on Codex review X4: the session's chat on/off goes to <myna dir>/chat-state/<session>.json
+// (scripts/config.mjs lists those) — at session start, on /myna:config chat on|off, and at session end
+test('the chat state file: written at start, on chat off, and at the end', async ($, on) => {
+  const s = stubs(on)
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/w' })
+  await s.clock.settle()
+  const last = () => JSON.parse(s.writes.filter((w) => w.path.endsWith('/chat-state/kit-1.json')).at(-1).text)
+  expect(s.writes[0].path.endsWith('/h/.myna/chat-state/kit-1.json')).toBe(true)
+  expect(last().on).toBe(true)
+  expect(last().project).toBe('/w')
+  await $.command.run({ command: 'myna:config', args: 'chat off' })
+  expect(last().on).toBe(false)
+  await $.session.end({ reason: 'prompt_input_exit', sessionId: 'kit-1' })
+  expect(typeof last().ended_at).toBe('string')
+})

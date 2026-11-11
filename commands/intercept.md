@@ -15,3 +15,5 @@ Interception is **ON by default**: a PreToolUse hook redirects **every** `AskUse
 Note: interception is independent of `/myna:autopilot`. With autopilot also ON, the redirected `ask_human` calls auto-accept the recommended option (and log it) instead of buzzing your phone.
 
 After running, tell the user the new state in one line.
+
+Then add one more line, exactly: `提示：/myna:intercept 之後會移除，請改用 /myna:config intercept on|off`

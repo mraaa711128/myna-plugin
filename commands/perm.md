@@ -13,3 +13,5 @@ Permission forwarding is **ON by default**: when Claude Code shows a permission 
 - no argument → report the current state.
 
 After running, tell the user the new state in one line, in Traditional Chinese.
+
+Then add one more line, exactly: `提示：/myna:perm 之後會移除，請改用 /myna:config perm on|off`

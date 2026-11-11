@@ -16,3 +16,5 @@ This only matters on a machine that joined a hub (`/myna:join`, `MYNA_ROLE=edge`
 `MYNA_UPSTREAM_HOLD` / `MYNA_UPSTREAM_HOLD_MAX` (environment or `~/.myna/.env`) win over this setting; the script still writes it and says so.
 
 After running, tell the user the result in one or two lines, in Traditional Chinese.
+
+Then add one more line, exactly: `提示：/myna:hold 之後會移除，請改用 /myna:config hold …`

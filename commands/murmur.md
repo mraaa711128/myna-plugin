@@ -13,3 +13,5 @@ During each turn of a chat session (`/myna:chat`), Myna keeps one silent progres
 - no argument → report the current setting.
 
 After running, tell the user the new state in one line, in Traditional Chinese.
+
+Then add one more line, exactly: `提示：/myna:murmur 之後會移除，請改用 /myna:config murmur on|off`
