@@ -24,7 +24,7 @@ const watchdog = setTimeout(() => { console.error("❌ TIMEOUT — smoke did not
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "myna-perm-test-"));
 
 // --- Telegram API stub -------------------------------------------------------------------------
-const sent = [], markupEdits = [], renamed = [], created = [];
+const sent = [], markupEdits = [], renamed = [], created = [], deletedTopics = [];
 let updates = [], nextUpdateId = 1, mid = 100, nextTopic = 700;
 const stub = http.createServer((req, res) => {
   const u = new URL(req.url, "http://x");
@@ -36,6 +36,7 @@ const stub = http.createServer((req, res) => {
     if (/\/sendMessage$/.test(u.pathname)) { b.message_id = ++mid; sent.push(b); return json({ ok: true, result: { message_id: b.message_id } }); }
     if (/\/createForumTopic$/.test(u.pathname)) { created.push(b); return json({ ok: true, result: { message_thread_id: ++nextTopic, name: b.name } }); }
     if (/\/editForumTopic$/.test(u.pathname)) { renamed.push(b); return json({ ok: true, result: true }); }
+    if (/\/deleteForumTopic$/.test(u.pathname)) { deletedTopics.push(b.message_thread_id); return json({ ok: true, result: true }); }
     if (/\/editMessageReplyMarkup$/.test(u.pathname)) { markupEdits.push(b); return json({ ok: true, result: true }); }
     json({ ok: true, result: true });
   });
@@ -341,6 +342,16 @@ const lastAskId = async (cmd) => { for (let i = 0; i < 40; i++) { const j = awai
   const re = await roundEnd2("s-worker3");
   for (let i = 0; i < 30 && !markupEdits.some((e) => e.message_id === kg?.message_id); i++) await sleep(100);
   ok(re.ended === true && markupEdits.some((e) => e.message_id === kg?.message_id), `a stopped worker's prompt (its hook killed, nobody polling) is cancelled at the next round end, and the round ends → ${JSON.stringify(re)}`);
+  // the round end comes right after the stop, while its last poll still counts as attended → left open,
+  // then the sweep finishes that round end once nobody polls: prompt retracted, the round's topic ended
+  const k = runHook({ session_id: "s-worker4", agent_id: AGENT, tool_name: "Bash", tool_input: cmdInput("echo worker17c") }, { port: PORT2 });
+  const kk = await keyboardFor("echo worker17c");
+  k.c.kill("SIGKILL"); await k.done;
+  const re2 = await roundEnd2("s-worker4");
+  ok(re2.ended === false && !markupEdits.some((e) => e.message_id === kk?.message_id), `a round end right after the stop (its last poll still counts) leaves it open for now → ${JSON.stringify(re2)}`);
+  for (let i = 0; i < 60 && !(markupEdits.some((e) => e.message_id === kk?.message_id) && deletedTopics.includes(kk?.message_thread_id)); i++) await sleep(100);
+  ok(markupEdits.some((e) => e.message_id === kk?.message_id) && deletedTopics.includes(kk?.message_thread_id),
+    `…once nobody polls, the sweep finishes that round end: prompt retracted, topic ${kk?.message_thread_id} ended (no second round end, no orphan TTL)`);
   const h = runHook({ session_id: "s-worker2", agent_id: AGENT, tool_name: "Bash", tool_input: cmdInput("echo worker17b") }, { port: PORT2 });
   const kb = await keyboardFor("echo worker17b");
   h.c.kill("SIGKILL"); await h.done;

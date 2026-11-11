@@ -16,7 +16,7 @@
 // A background subagent's prompt (the hook input carries agent_id) is marked with that agent_id: its
 // dialog can outlive the main thread's turn, so the relay leaves it open at round end while this hook
 // still polls for the answer (a stopped subagent's hook is killed — on Windows without a signal, so
-// it cannot retract it — and the next round end after it stopped polling does), and the
+// it cannot retract it — and the relay does once it stopped polling), and the
 // terminal's answer is looked for in the subagent's own transcript (<session>/subagents/agent-<id>.jsonl)
 // — the hook's transcript_path is always the main thread's.
 // Fail-safe: relay down, flag off, a delivery failure, anything unexpected → exit 0 with no output,
