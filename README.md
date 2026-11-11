@@ -439,7 +439,7 @@ npm test
 /myna:perm         # 查目前狀態
 ```
 
-**手機上的題目什麼時候收回:** 終端機回答了(hook 從 transcript 看到這個工具呼叫有了結果)、hook 被結束(在終端機按 No、hook 逾時、session 結束),或這個 session 的回合結束 / session 結束時 relay 把還開著的權限題目一併取消。長時間執行的指令例外:在終端機按「允許」後,手機上的題目要等指令跑完、結果寫進 transcript 才會收回;這段期間在手機上按的答案不會生效。
+**手機上的題目什麼時候收回:** 終端機回答了(hook 從 transcript 看到這個工具呼叫有了結果)、hook 被結束(在終端機按 No、hook 逾時、session 結束),或這個 session 的回合結束 / session 結束時 relay 把還開著的權限題目一併取消。背景 subagent 的權限題(v0.23.1)不會因為主回合結束而收回,因為它的確認框可以比主回合活得久:它的 hook 還在等答案時,題目一直留在手機上,直到有人回答、終端機答了(看的是那個 subagent 自己的 transcript)、session 結束,或 subagent 被停掉。subagent 被停掉時 hook 會跟著結束;在 Windows 上 hook 收不到結束訊號、沒辦法自己收回,改由 relay 收:hook 停下後最多約 40 秒就不算有人在等,這之後的回合結束會收回它;回合結束如果剛好落在這 40 秒內,relay 會等到沒人在等時自己收回、補做那次回合結束(topic 照常收尾)。長時間執行的指令例外:在終端機按「允許」後,手機上的題目要等指令跑完、結果寫進 transcript 才會收回;這段期間在手機上按的答案不會生效。
 
 ---
 

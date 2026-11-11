@@ -11,7 +11,14 @@
 //   3. retract the phone's question the moment it is moot — the terminal answered (seen in the
 //      transcript: a result for this tool call), or the hook is being stopped (SIGTERM: a terminal
 //      "No" in the TUI, the hook timeout, the session ending). The relay also cancels any permission
-//      prompt of a session at its round end / session end, for a hook that could not.
+//      prompt of a session at its session end, and the main thread's at its round end, for a hook
+//      that could not.
+// A background subagent's prompt (the hook input carries agent_id) is marked with that agent_id: its
+// dialog can outlive the main thread's turn, so the relay leaves it open at round end while this hook
+// still polls for the answer (a stopped subagent's hook is killed — on Windows without a signal, so
+// it cannot retract it — and the relay does once it stopped polling), and the
+// terminal's answer is looked for in the subagent's own transcript (<session>/subagents/agent-<id>.jsonl)
+// — the hook's transcript_path is always the main thread's.
 // Fail-safe: relay down, flag off, a delivery failure, anything unexpected → exit 0 with no output,
 // i.e. the hook abstains and the terminal dialog stays exactly as it would be without Myna.
 // Toggle: /myna:perm on|off (~/.myna/permission, first line "off" = off; default on).
@@ -65,8 +72,16 @@ for (const sig of ["SIGTERM", "SIGINT", "SIGHUP"]) process.on(sig, retractAndExi
 // earlier in the session is ignored: ids already answered when the hook started don't count.
 const stable = (v) => JSON.stringify(v, (k, x) => (x && typeof x === "object" && !Array.isArray(x) ? Object.fromEntries(Object.entries(x).sort()) : x));
 const want = stable(input.tool_input ?? {});
+// a subagent's own transcript; never the main one in its place (it cannot show this subagent's
+// result, and the main thread making the same call would look like an answer). Unknown → null.
+const AGENT_ID = typeof input.agent_id === "string" && input.agent_id ? input.agent_id : null;
+const transcriptFile = () => {
+  if (!AGENT_ID) return input.transcript_path || null;
+  if (!input.transcript_path || !/^[A-Za-z0-9_-]+$/.test(AGENT_ID)) return null;
+  return path.join(input.transcript_path.replace(/\.jsonl$/, ""), "subagents", `agent-${AGENT_ID}.jsonl`);
+};
 function scanTranscript() {
-  const file = input.transcript_path;
+  const file = transcriptFile();
   if (!file) return null;
   let text;
   try {
@@ -123,6 +138,7 @@ try {
     question: `Claude 想使用 ${input.tool_name}(${dir}):\n${describe(input.tool_name, input.tool_input)}\n\n終端機的確認框也還在,哪邊先回答都可以。`,
     options: [ALLOW, DENY],
     session_id: input.session_id,
+    ...(AGENT_ID ? { agent_id: AGENT_ID } : {}),
     session_label: `${dir} ${two(d.getMonth() + 1)}/${two(d.getDate())} ${two(d.getHours())}:${two(d.getMinutes())}`,
   });
   asked = r.ok ? await r.json() : null;
