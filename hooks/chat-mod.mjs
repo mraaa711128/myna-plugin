@@ -52,6 +52,13 @@ const CMD_QUIET_MS = 5000;
 // /myna:chat is kept as an alias of /myna:config chat for a while (until 0.25.0 and at least 30 days)
 const CHAT_ALIAS_HINT = "提示：/myna:chat 之後會移除，請改用 /myna:config chat on|off";
 const CHAT_ALIAS_HINT_PHONE = "提示：!myna:chat 之後會移除，請改用 !myna:config chat on|off";
+// Each session's chat on/off, for /myna:config's list (scripts/config.mjs reads them): one small JSON file
+// per session in <myna dir>/chat-state/ — {session_id, on, nick?, project, updated_at, ended_at?}. Written on
+// session start, /myna:config chat on|off (and /myna:chat), a registration or a new nick, a new session id
+// (after /clear or a resume), every STATE_REFRESH_MS on a prompt at most, and at session end (ended_at).
+// Best effort: a write that fails changes nothing else. config.mjs removes the files of ended sessions.
+const STATE_REFRESH_MS = 10 * 60 * 1000;
+export const stateFileName = (sid) => `${String(sid).replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 128)}.json`;
 // the arguments of /myna:config → what follows "chat" (lowercased, "" = the state), or null: not chat
 export function configChatArgs(args) {
   const m = /^\s*chat(?:\s+([\s\S]*?))?\s*$/i.exec(String(args ?? ""));
@@ -193,6 +200,29 @@ export const register = (on) => {
   async function remember(id, patch) {
     try { await io.storeSet(storeKey(id), { ...(await saved(id)), ...patch, at: now() }); } catch {}
   }
+  // this session's chat on/off for /myna:config's list (see STATE_REFRESH_MS); never throws
+  let recorded = { sid: null, at: 0 };
+  async function recordState({ ended = false, id: given = null } = {}) {
+    try {
+      if (!io || !cfg) return;
+      const id = given || (await io.sessionId());
+      if (!id) return;
+      const root = (await io.root().catch(() => "")) || (await io.cwd().catch(() => ""));
+      const at = new Date(now()).toISOString();
+      const rec = { session_id: id, on: enabled, ...(nick && token && sid === id ? { nick } : {}), project: root || "", updated_at: at, ...(ended ? { ended_at: at } : {}) };
+      await io.write(`${cfg.stateDir}/${stateFileName(id)}`, `${JSON.stringify(rec)}\n`);
+      if (!ended) recorded = { sid: id, at: now() };
+    } catch {}
+  }
+  // on a prompt: a new session id (after /clear or a resume) or a stale record → write it again
+  async function refreshState() {
+    try {
+      if (!io || !cfg) return;
+      const id = await io.sessionId();
+      if (id !== recorded.sid || now() - recorded.at > STATE_REFRESH_MS) await recordState();
+    } catch {}
+  }
+
   async function prune() {
     try {
       for (const k of await io.storeKeys()) {
@@ -215,7 +245,10 @@ export const register = (on) => {
       }
     } catch {}
     const get = (k) => env[k] ?? file[k];
+    // the per-session state files sit next to the .env, like the rest of Myna's files (scripts mynaDir())
+    const mynaDir = !env.MYNA_ENV ? dir : /[\\/]/.test(env.MYNA_ENV) ? String(env.MYNA_ENV).replace(/[\\/][^\\/]*$/, "") : ".";
     return {
+      stateDir: `${mynaDir}/chat-state`,
       relay: (get("MYNA_RELAY_URL") || `http://127.0.0.1:${Number(get("RELAY_PORT") || 7800)}`).replace(/\/+$/, ""),
       secretFile: get("MYNA_RELAY_SECRET_FILE") || `${dir}/relay-secret`,
       chat: String(get("MYNA_CHAT") || "").toLowerCase(),
@@ -271,6 +304,7 @@ export const register = (on) => {
     unavailable = ""; failures = 0; retryAt = 0;
     await remember(id, { nick });
     status();
+    await recordState();
     return true;
   }
 
@@ -393,6 +427,7 @@ export const register = (on) => {
     io = {
       fetch: (url, init) => $.http.fetch(url, init),
       read: (p) => $.fs.read(p),
+      write: (p, text) => $.fs.write(p, text),
       sessionId: () => $.session.id(),
       root: () => $.session.root(),
       cwd: () => $.session.cwd(),
@@ -427,6 +462,7 @@ export const register = (on) => {
       if (typeof mine.on === "boolean") want = mine.on;
       enabled = want;
       if (enabled) start();
+      await recordState();
     } catch {}
     return r;
   });
@@ -435,6 +471,7 @@ export const register = (on) => {
     // after a /clear or an in-app /resume the process goes on under another session id: keep polling,
     // the next tick registers that one; any other reason is the process going away
     if (e.reason !== "clear" && e.reason !== "resume") stop();
+    await recordState({ ended: true, id: e.sessionId });
     mayRead.clear();
     await close();
     return next(e);
@@ -444,6 +481,7 @@ export const register = (on) => {
   // starts inside it. A prompt delivered into a running turn (turnId) starts none; a slash command's
   // turn reads otherwise (and it was typed); a dropped prompt never starts one
   on("prompt.submit", async ($, e, next) => {
+    refreshState(); // not awaited: the prompt never waits for it (it never throws)
     let entry = null;
     if (!e.turnId && !e.command && e.origin && e.text) {
       const t = now();
@@ -559,11 +597,13 @@ export const register = (on) => {
       await remember(id, { on: true });
       const okNow = token || (await registerNow());
       start();
+      await recordState();
       return okNow ? `💬 聊天已開啟:這個 session 在 Telegram 叫 ${nick}。` : `💬 聊天已開啟,但還連不上 relay(${unavailable}),會自動重試。`;
     }
     if (arg === "off") {
       enabled = false; stop(); await close(); status();
       await remember(id, { on: false });
+      await recordState();
       return "💬 聊天已關閉:這個 session 不再收 Telegram 訊息,也不回報進度。";
     }
     if (!enabled) return "💬 聊天目前關閉。用 /myna:config chat on 開啟。";
@@ -586,6 +626,7 @@ export const register = (on) => {
     nick = r.nick;
     await remember(id, { nick });
     status();
+    await recordState();
     return nick === want.toLowerCase() ? `💬 暱稱改為 ${nick}。` : `💬 暱稱改為 ${nick}(「${want}」已被用走或含不能用的字元)。`;
   }
 };

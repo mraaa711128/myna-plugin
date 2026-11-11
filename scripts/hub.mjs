@@ -16,7 +16,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { setTimeout as sleep } from "node:timers/promises";
-import { loadEnv, roleOf, machinesFile, NAME_RE } from "../src/remote.mjs";
+import { loadEnv, roleOf, machinesFile, NAME_RE, updateEnvFile } from "../src/remote.mjs";
 
 const DEFAULT_REMOTE_PORT = "7801";
 const cfg = loadEnv();
@@ -36,7 +36,12 @@ const set = (k, v) => {
   else env += (env && !env.endsWith("\n") ? "\n" : "") + `${k}=${v}\n`;
 };
 const unset = (k) => { env = env.replace(new RegExp(`^${k}=.*\\n?`, "m"), ""); };
-const save = () => { fs.mkdirSync(path.dirname(envPath), { recursive: true }); fs.writeFileSync(envPath, env); };
+// a change: read .env again under its lock, decide and edit on that (change() returns whether to write),
+// so a change another program makes to it at the same time is not lost
+const edit = (change) => {
+  try { updateEnvFile(envPath, (text) => { env = text; return change() ? env : undefined; }); }
+  catch (e) { fail(`${envPath} 寫不進去（${e.message}）。`); }
+};
 
 async function health() {
   try {
@@ -82,11 +87,13 @@ if (cmd === "on") {
     (cfg.SLACK_BOT_TOKEN && cfg.SLACK_APP_TOKEN && cfg.SLACK_CHANNEL_ID); // same test as ensure-relay
   if (!hasBot) fail(`這台沒有設定 bot，主節點一定要有 bot（其他機器的題目都送到這支 bot）。沒有改任何設定。先跑 /myna:setup。`);
 
-  const had = fileValue("MYNA_REMOTE_PORT");
-  if (!had) set("MYNA_REMOTE_PORT", DEFAULT_REMOTE_PORT);
-  if (name) set("MYNA_MACHINE_NAME", name);
-  const changed = !had || !!name;
-  if (changed) save();
+  let had;
+  edit(() => {
+    had = fileValue("MYNA_REMOTE_PORT");
+    if (!had) set("MYNA_REMOTE_PORT", DEFAULT_REMOTE_PORT);
+    if (name) set("MYNA_MACHINE_NAME", name);
+    return !had || !!name;
+  });
   const port = had || DEFAULT_REMOTE_PORT;
   console.log(`myna hub：${envPath} — MYNA_REMOTE_PORT=${port}${had ? "（保留原本的值）" : "（新增）"}${name ? `、MYNA_MACHINE_NAME=${name}` : ""}`);
   const h = await restart(true);
@@ -101,9 +108,12 @@ if (cmd === "on") {
 if (cmd === "off") {
   // an environment variable wins over .env (and the relay inherits it): removing the line would not help
   if (String(process.env.MYNA_REMOTE_PORT ?? "").trim()) fail(`MYNA_REMOTE_PORT=${process.env.MYNA_REMOTE_PORT} 是環境變數設定的，優先於 .env，拿掉 .env 那行也關不掉。先移除這個環境變數。沒有改任何設定。`);
-  const had = fileValue("MYNA_REMOTE_PORT");
-  unset("MYNA_REMOTE_PORT");
-  if (had) save();
+  let had;
+  edit(() => {
+    had = fileValue("MYNA_REMOTE_PORT");
+    unset("MYNA_REMOTE_PORT");
+    return !!had;
+  });
   console.log(`myna hub：${had ? `已從 ${envPath} 拿掉 MYNA_REMOTE_PORT=${had}` : `${envPath} 本來就沒有 MYNA_REMOTE_PORT`}。${path.basename(machinesFile(cfg))} 保留，之後再 on 時已加入的機器照舊有效。`);
   const h = await restart(false);
   if (h.remote) fail(`relay 重啟了，但遠端 listener 還開著（remote.port ${h.remote.port}）。看 ${path.join(path.dirname(envPath), "relay.log")}。`);

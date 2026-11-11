@@ -11,6 +11,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { updateEnvFile } from "../src/remote.mjs";
 
 const envPath = process.env.MYNA_ENV || path.join(os.homedir(), ".myna", ".env");
 const argv = process.argv.slice(2);
@@ -24,13 +25,16 @@ const USAGE = [
 if (!argv.length) { console.error(USAGE); process.exit(1); }
 
 fs.mkdirSync(path.dirname(envPath), { recursive: true });
-let env = fs.existsSync(envPath) ? fs.readFileSync(envPath, "utf8") : "";
-const set = (k, v) => {
+// the changes are collected here and applied to the file as it is under its lock (updateEnvFile), so a
+// change another program makes to it at the same time is not lost
+let env = "";
+const ops = [];
+const set = (k, v) => ops.push(() => {
   const re = new RegExp(`^${k}=.*$`, "m");
   if (re.test(env)) env = env.replace(re, `${k}=${v}`);
   else env += (env && !env.endsWith("\n") ? "\n" : "") + `${k}=${v}\n`;
-};
-const unset = (k) => { env = env.replace(new RegExp(`^${k}=.*\\n?`, "m"), ""); };
+});
+const unset = (k) => ops.push(() => { env = env.replace(new RegExp(`^${k}=.*\\n?`, "m"), ""); });
 
 const sub = argv[0].toLowerCase();
 let done;
@@ -64,5 +68,6 @@ if (sub === "telegram" || !["discord", "slack", "provider"].includes(sub)) {
   if (p === "auto") { unset("MYNA_PROVIDER"); done = "provider = auto (first configured of telegram → discord → slack)"; }
   else { set("MYNA_PROVIDER", p); done = `provider = ${p}`; }
 }
-fs.writeFileSync(envPath, env);
+try { updateEnvFile(envPath, (text) => { env = text; for (const op of ops) op(); return env; }); }
+catch (e) { console.error(`could not write ${envPath}: ${e.message}`); process.exit(1); }
 console.log(`wrote ${envPath} (${done}). Restart the relay to apply: /myna:relay stop then start.`);

@@ -693,7 +693,7 @@ MYNA_MACHINE_NAME=win        # 選填,topic 前面的短名稱(預設 hostname)
 | 指令 | 作用 |
 |---|---|
 | `/myna:status` | 一頁看這台 Myna 的狀態(只讀):relay 版本和角色、配對的聊天室、Telegram topic 會不會開(卡在哪一項)、各開關、主要設定,最後列出建議的下一步。不含 token;有聊天室 id、名稱和 bot 名稱(v0.23.0) |
-| `/myna:config [項目] [值]` | 看和改所有開關和常用設定:不帶參數 = 每項一行(值和來源);項目有 `autopilot`、`intercept`、`stopcatch`、`brief`、`perm`、`murmur`、`hold`(`on`/`off`,`hold` 另有 `max <時間>`、`status`)、`chat`(這個 session)、`topics`(`auto`/`off`,寫 `.env` 的 `TELEGRAM_TOPICS`,要 `/myna:relay restart`)、`perm-delay`(秒數,寫 `.env` 的 `MYNA_PERMISSION_DELAY`)。下面標「別名」的舊指令照常可用,之後會移除(v0.24.0) |
+| `/myna:config [項目] [值]` | 看和改所有開關和常用設定:不帶參數 = 每項一行(值和來源);項目有 `autopilot`、`intercept`、`stopcatch`、`brief`、`perm`、`murmur`、`hold`(`on`/`off`,`hold` 另有 `max <時間>`、`status`)、`chat`(這個 session;清單會列出這台每個 session 的開關)、`topics`(`auto`/`off`,寫 `.env` 的 `TELEGRAM_TOPICS`,要 `/myna:relay restart`)、`perm-delay`(秒數,寫 `.env` 的 `MYNA_PERMISSION_DELAY`)。下面標「別名」的舊指令照常可用,之後會移除(v0.24.0) |
 | `/myna:setup <token>` | 一鍵(Telegram):存 token → 配對 chat id → 起 relay |
 | `/myna:setup discord\|slack …` | 一鍵(Discord / Slack):存憑證 → 起 relay |
 | `/myna:configure <token> [chat_id]` | 只設/換 Telegram bot token(+可選 chat id) |
@@ -725,6 +725,7 @@ MYNA_MACHINE_NAME=win        # 選填,topic 前面的短名稱(預設 hostname)
 | 路徑 | 內容 |
 |---|---|
 | `~/.myna/.env` | IM 憑證(**gitignored**,每機一份;放 home 而非 plugin cache → 跨 `/plugin update` 存活):Telegram `TELEGRAM_BOT_TOKEN`+`TELEGRAM_CHAT_ID`;Discord `DISCORD_BOT_TOKEN`+`DISCORD_CHANNEL_ID`;Slack `SLACK_BOT_TOKEN`+`SLACK_APP_TOKEN`+`SLACK_CHANNEL_ID`;選配 `MYNA_PROVIDER` 指定 provider(見 `.env.example`) |
+| `~/.myna/chat-state/<session>.json` | 每個 session 的聊天開關(chat mod 寫,`/myna:config` 列出;已結束的 session 在列清單時刪掉)(v0.24.0) |
 | `~/.myna/autopilot` | flag 檔;存在=autopilot 開 |
 | `~/.myna/intercept` | flag 檔;**無檔(或首行≠`off`)=攔截開(預設)**,首行 `off`=關 |
 | `~/.myna/permission` | flag 檔;**無檔(或首行≠`off`)=權限確認轉手機開(預設)**,首行 `off`=關 |

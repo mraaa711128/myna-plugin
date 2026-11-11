@@ -6,7 +6,7 @@ Show or change a Myna setting and report the result.
 
 Run: `node "${CLAUDE_PLUGIN_ROOT}/scripts/config.mjs" $ARGUMENTS`
 
-- no argument → every item, one line each: its value and where it comes from (預設, the setting's file, `~/.myna/.env`, or an environment variable).
+- no argument → every item, one line each: its value and where it comes from (預設, the setting's file, `~/.myna/.env`, or an environment variable); under `chat`, one line per Claude Code session on this machine with its chat on/off, this session marked.
 - `<item>` → that item only.
 - `<item> <value>` → change it:
 

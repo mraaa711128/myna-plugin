@@ -32,7 +32,7 @@ const PORT = srv.address().port;
 
 const clean = (() => {
   const e = { ...process.env };
-  for (const k of Object.keys(e)) if (/^(MYNA_|TELEGRAM_|DISCORD_|SLACK_|RELAY_PORT$)/.test(k)) delete e[k];
+  for (const k of Object.keys(e)) if (/^(MYNA_|TELEGRAM_|DISCORD_|SLACK_|RELAY_PORT$|CLAUDE_CODE_SESSION_ID$)/.test(k)) delete e[k];
   return e;
 })();
 let homes = 0;
@@ -161,11 +161,12 @@ for (const args of [["autopilot", "yes"], ["intercept", "status"], ["brief", "on
     fs.writeFileSync(real, "OTHER=1\n"); fs.symlinkSync(real, link);
     await cfg(["topics", "off"], l);
     ok(fs.lstatSync(link).isSymbolicLink() && fs.readFileSync(real, "utf8") === "OTHER=1\nTELEGRAM_TOPICS=off\n", ".env that is a link: the file it points to is written, the link stays");
-    // a link to a file that is not there (Codex review r2 X5): refused, the link kept
+    // a link to a file that is not there (Codex review r2 X5): the file is created through the link, the
+    // link kept — as configure / hub / join always did (they write through the same updateEnvFile now)
     const d = newHome(), dl = path.join(d, ".myna", ".env"), gone = path.join(TMP, "no-such-dotfile");
     fs.symlinkSync(gone, dl);
     const dr = await cfg(["topics", "off"], d);
-    ok(dr.rc === 1 && /是連結/.test(dr.err) && fs.lstatSync(dl).isSymbolicLink() && !fs.existsSync(gone), `a dangling .env link → refused, the link kept ("${dr.err.trim()}")`);
+    ok(dr.rc === 0 && fs.lstatSync(dl).isSymbolicLink() && fs.readFileSync(gone, "utf8") === "TELEGRAM_TOPICS=off\n", `a dangling .env link → its file created, the link kept (rc ${dr.rc})`);
   }
   const dirEnv = newHome(); fs.mkdirSync(path.join(dirEnv, ".myna", ".env"));
   r = await cfg(["topics", "off"], dirEnv);
@@ -174,6 +175,44 @@ for (const args of [["autopilot", "yes"], ["intercept", "status"], ["brief", "on
   ok(r.rc === 0 && /讀不到/.test(r.out) && /topics\s+auto（預設）/.test(r.out), ".env unreadable → the list still comes, with a note");
   r = await cfg(["topics"], dirEnv);
   ok(r.rc === 0 && /讀不到/.test(r.out) && /^topics/m.test(r.out), `.env unreadable → one item comes with the note too (Codex review r2 X7): ${JSON.stringify(r.out.trim())}`);
+}
+
+// 4b) two programs writing .env at the same time (Stanley's decision on Codex review X1): every .env writer
+// reads and writes under <.env>.lock (updateEnvFile), so neither change is lost
+{
+  // the helper itself, with the race made certain: each writer sleeps between its read and its write
+  const a = newHome(), ENV = path.join(a, ".myna", ".env");
+  fs.writeFileSync(ENV, "KEEP=1\n");
+  const remoteUrl = new URL("../src/remote.mjs", import.meta.url).href;
+  const writer = (k) => new Promise((resolve) => {
+    const code = `import { updateEnvFile } from ${JSON.stringify(remoteUrl)};
+      updateEnvFile(${JSON.stringify(ENV)}, (t) => { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 400); return t + "${k}=1\\n"; });`;
+    const c = spawn(process.execPath, ["--input-type=module", "-e", code], { env: envOf(a) });
+    let err = ""; c.stderr.on("data", (d) => (err += d));
+    c.on("close", (rc) => resolve({ rc, err }));
+  });
+  const rs = await Promise.all(["K1", "K2", "K3", "K4"].map(writer));
+  const text = fs.readFileSync(ENV, "utf8");
+  ok(rs.every((x) => x.rc === 0) && ["KEEP", "K1", "K2", "K3", "K4"].every((k) => text.includes(`${k}=1\n`)) && !fs.existsSync(`${ENV}.lock`),
+    `4 writers at once, each slow between read and write → all 4 keys and the old one kept, the lock gone (${JSON.stringify(text)})`);
+  // the real scripts, five rounds: /myna:config topics + perm-delay and /myna:configure provider at the same time
+  let lost = 0;
+  for (let i = 0; i < 5; i++) {
+    const h = newHome(), E = path.join(h, ".myna", ".env");
+    fs.writeFileSync(E, "TELEGRAM_BOT_TOKEN=123:abc\n");
+    await Promise.all([cfg(["topics", "off"], h), cfg(["perm-delay", String(10 + i)], h), run("configure.mjs", ["provider", "telegram"], h)]);
+    const t = fs.readFileSync(E, "utf8");
+    if (!(t.includes("TELEGRAM_BOT_TOKEN=123:abc\n") && t.includes("TELEGRAM_TOPICS=off\n") && t.includes(`MYNA_PERMISSION_DELAY=${10 + i}\n`) && t.includes("MYNA_PROVIDER=telegram\n"))) { lost++; console.log(`   round ${i}: ${JSON.stringify(t)}`); }
+  }
+  ok(lost === 0, `config topics + config perm-delay + configure provider at once, 5 rounds → no key lost (${lost} rounds lost one)`);
+  // the lock held by someone else for too long: config says it could not write, .env unchanged
+  const b = newHome(), EB = path.join(b, ".myna", ".env");
+  fs.writeFileSync(EB, "X=1\n");
+  const holder = spawn(process.execPath, ["-e", "setTimeout(() => {}, 20000)"]);
+  fs.writeFileSync(`${EB}.lock`, `${holder.pid} test\n`);
+  const t0 = Date.now(), rb = await cfg(["topics", "off"], b);
+  holder.kill(); fs.rmSync(`${EB}.lock`, { force: true });
+  ok(rb.rc === 1 && /寫不進去/.test(rb.err) && fs.readFileSync(EB, "utf8") === "X=1\n" && Date.now() - t0 >= 9000, `a lock held by a live process → waits, then refuses, .env unchanged ("${rb.err.trim()}")`);
 }
 
 // 5) unknown item; chat without the chat mod
@@ -190,8 +229,10 @@ for (const args of [["autopilot", "yes"], ["intercept", "status"], ["brief", "on
 // 6) the chat mod's /myna:config hook (a stub engine; no relay secret → chat never reaches a relay)
 ok(configChatArgs("chat") === "" && configChatArgs(" Chat  ON ") === "on" && configChatArgs("chat on now") === "on now" && configChatArgs("chatty") === null && configChatArgs("autopilot on") === null && configChatArgs("") === null && configChatArgs(undefined) === null,
   "configChatArgs: chat / Chat ON / chat on now / chatty / autopilot on / empty");
-function engine() {
-  const hooks = [], store = new Map();
+// dir: the stub's Myna folder (MYNA_ENV is <dir>/.env, so the chat mod's state files go to <dir>/chat-state);
+// S.sid: the session id the engine reports (a /clear or a resume changes it)
+function engine({ dir = path.join(TMP, "eng0"), root = "/w", sid = "s-1" } = {}) {
+  const hooks = [], store = new Map(), S = { sid };
   register((event, a, b) => {
     const [match, hook] = b ? [a, b] : [null, a];
     const h = { event, match, hook, onError: null };
@@ -200,14 +241,15 @@ function engine() {
   });
   const $ = {
     http: { fetch: async () => { throw new Error("no network in this test"); } },
-    fs: { read: async () => { throw new Error("ENOENT"); } },
-    session: { id: async () => "s-1", root: async () => "/w", cwd: async () => "/w", usage: async () => null },
+    // like the engine's $.fs.write: creates the folders, writes the whole text
+    fs: { read: async () => { throw new Error("ENOENT"); }, write: async (p, text) => { fs.mkdirSync(path.dirname(p), { recursive: true }); fs.writeFileSync(p, text); } },
+    session: { id: async () => S.sid, root: async () => root, cwd: async () => root, usage: async () => null },
     ui: { status: () => {} },
     prompt: { submit: async ({ text }) => ({ text }) },
     command: { list: async () => [], run: async () => ({}) },
     clock: { every: () => ({ cancel() {} }) },
     store: { get: async (k) => store.get(k), set: async (k, v) => { store.set(k, v); }, delete: async (k) => { store.delete(k); }, keys: async () => [...store.keys()] },
-    env: { get: async (n) => ({ HOME: TMP, MYNA_ENV: path.join(TMP, "none.env"), RELAY_PORT: String(PORT), MYNA_RELAY_SECRET_FILE: path.join(TMP, "no-secret") })[n] },
+    env: { get: async (n) => ({ HOME: TMP, MYNA_ENV: path.join(dir, ".env"), RELAY_PORT: String(PORT), MYNA_RELAY_SECRET_FILE: path.join(TMP, "no-secret") })[n] },
   };
   const fire = async (event, e) => {
     let passed = null;
@@ -217,7 +259,7 @@ function engine() {
     }
     return { r: e, passed: e };
   };
-  return { fire, store, cmd: (command, args = "") => fire("command.run", { command, args, origin: { kind: "composer" } }) };
+  return { S, fire, store, cmd: (command, args = "") => fire("command.run", { command, args, origin: { kind: "composer" } }) };
 }
 {
   const E = engine();
@@ -238,6 +280,44 @@ function engine() {
   ok(viaChatOn.r.text.split("\n")[0] === x.r.text, "…the same answer as /myna:chat on (without the hint)");
   x = await E.cmd("myna:config", "chat maybe");
   ok(x.passed === null && /只接受 on 或 off/.test(x.r.text) && E.store.get("chat:s-1")?.on === true, `/myna:config chat maybe → refused, unchanged ("${x.r.text}")`);
+}
+
+// 7) each session's chat on/off in the list (Stanley's decision on Codex review X4): the chat mod writes
+// <myna dir>/chat-state/<session>.json; config.mjs lists them, this session marked, ended ones removed
+{
+  const home = newHome(), dir = path.join(home, ".myna"), stateDir = path.join(dir, "chat-state");
+  const state = (sid) => { try { return JSON.parse(fs.readFileSync(path.join(stateDir, `${sid}.json`), "utf8")); } catch { return null; } };
+  const A = engine({ dir, root: "/work/myna-plugin", sid: "sess-a" });
+  await A.fire("session.start", { cwd: "/work/myna-plugin", surface: "terminal", isInteractive: true });
+  ok(state("sess-a")?.on === true && state("sess-a").project === "/work/myna-plugin" && !Number.isNaN(Date.parse(state("sess-a").updated_at)), `session start (terminal) → its file says on (${JSON.stringify(state("sess-a"))})`);
+  const B = engine({ dir, root: "/work/friday-ai", sid: "sess-b" });
+  await B.fire("session.start", { cwd: "/work/friday-ai", surface: null, isInteractive: false });
+  ok(state("sess-b")?.on === false, "session start (-p / SDK) → its file says off");
+  await A.cmd("myna:config", "chat off");
+  ok(state("sess-a")?.on === false, "/myna:config chat off → the file says off");
+  await A.cmd("myna:chat", "on");
+  ok(state("sess-a")?.on === true, "/myna:chat on (the alias) → the file says on");
+  let r = await cfg([], home, { CLAUDE_CODE_SESSION_ID: "sess-b" });
+  const chatLines = r.out.split("\n").filter((l) => /^ {13}(on |off)/.test(l));
+  ok(/^  chat .*新 session 預設開（終端機 session）/m.test(r.out) && chatLines.length === 2 && /^ {13}off  friday-ai　最後更新 .*← 這個 session$/.test(chatLines[0]) && /^ {13}on   myna-plugin　最後更新 /.test(chatLines[1]),
+    `the list: the default line kept, one line per session, this one first and marked:\n${chatLines.join("\n")}`);
+  // a /clear: the old id ends, the next prompt records the new one
+  await A.fire("session.end", { reason: "clear", sessionId: "sess-a" });
+  ok(state("sess-a")?.ended_at, "session end → ended_at in its file");
+  A.S.sid = "sess-a2";
+  await A.fire("prompt.submit", { text: "hi", origin: { kind: "composer" } });
+  await new Promise((res) => setTimeout(res, 100)); // the refresh is not awaited by the prompt
+  ok(state("sess-a2")?.on === true, "after /clear, the next prompt records the new session id");
+  // an unreadable file (being written?) is skipped and kept; one not updated for 31 days is removed
+  fs.writeFileSync(path.join(stateDir, "half.json"), "{\"session_id\":");
+  fs.writeFileSync(path.join(stateDir, "old.json"), JSON.stringify({ session_id: "old", on: true, project: "/x", updated_at: new Date(Date.now() - 31 * 86400e3).toISOString() }));
+  r = await cfg([], home);
+  const names = fs.readdirSync(stateDir).sort();
+  ok(!/sess-a\b/.test(names.join(",")) && JSON.stringify(names) === JSON.stringify(["half.json", "sess-a2.json", "sess-b.json"]) && r.out.split("\n").filter((l) => /^ {13}(on |off)/.test(l)).length === 2 && !/← 這個 session/.test(r.out),
+    `listing removes the ended session and the 31-day-old one, keeps the unreadable one unlisted, marks none without CLAUDE_CODE_SESSION_ID (${JSON.stringify(names)})`);
+  // no records at all
+  const empty = await cfg([], newHome());
+  ok(/還沒有 session 的紀錄/.test(empty.out), "no state files → says there is no record yet");
 }
 
 srv.close();

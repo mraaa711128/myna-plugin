@@ -258,6 +258,32 @@ export function withFileLock(file, fn) {
   try { return fn(); } finally { if (readLock(lock) === mine) { try { fs.rmSync(lock, { force: true }); } catch {} } }
 }
 
+// ~/.myna/.env read-modify-write, for every program that changes it (configure, hub, join, config): under
+// <.env>.lock (withFileLock) the file is read again, fn(text) returns the new text (anything else: leave
+// it as it is), and that is written to a temp file next to the file and renamed over it — two writers at
+// once each keep the other's change, and a failed write leaves the old file whole. The file's mode is kept;
+// a link keeps pointing where it did (its target is written; a target not there yet is created through the
+// link, as a plain write would). → what fn returned.
+export function updateEnvFile(envPath, fn) {
+  return withFileLock(envPath, () => {
+    let text = "";
+    try { text = fs.readFileSync(envPath, "utf8"); } catch (e) { if (e.code !== "ENOENT") throw e; }
+    const out = fn(text);
+    if (typeof out !== "string") return out;
+    let target = envPath, mode = null, dangling = false;
+    try { if (fs.lstatSync(envPath).isSymbolicLink()) { try { target = fs.realpathSync(envPath); } catch { dangling = true; } } } catch {}
+    if (dangling) { fs.writeFileSync(envPath, out); return out; }
+    try { mode = fs.statSync(target).mode & 0o777; } catch {}
+    const tmp = `${target}.${process.pid}.tmp`;
+    try {
+      fs.writeFileSync(tmp, out, mode === null ? undefined : { mode });
+      if (mode !== null) fs.chmodSync(tmp, mode); // the umask may have narrowed it
+      try { fs.renameSync(tmp, target); } catch { fs.writeFileSync(target, out); } // Windows: the file held open
+    } finally { try { fs.rmSync(tmp, { force: true }); } catch {} }
+    return out;
+  });
+}
+
 // --- request helpers -------------------------------------------------------------------------------
 // read a request body, at most `max` bytes: past it → {tooLarge:true} at once — the rest is neither
 // buffered nor waited for (a body that never ends must not hold the request); answer with refuseTooLarge

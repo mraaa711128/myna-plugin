@@ -15,7 +15,7 @@ import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { loadEnv, holdSettings, readHoldFile } from "../src/remote.mjs";
+import { loadEnv, holdSettings, readHoldFile, updateEnvFile, mynaDir } from "../src/remote.mjs";
 import { SWITCHES, readEnvFile, tildePath } from "../src/status.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -48,6 +48,33 @@ const ENV_ITEMS = {
 };
 const envSource = (k, file) => (env[k] !== undefined ? "環境變數" : file.values[k] !== undefined ? tildePath(ENV_PATH) : "預設");
 
+// --- each session's chat on/off (hooks/chat-mod.mjs writes <myna dir>/chat-state/<session>.json) -----------
+// The files of sessions that ended (ended_at), and of any not updated for CHAT_STATE_KEEP_MS (a session that
+// died without ending), are removed here; the rest are listed, this session (CLAUDE_CODE_SESSION_ID) first.
+const CHAT_STATE_KEEP_MS = 30 * 24 * 3600 * 1000; // as the chat mod keeps a session's own on/off ($.store)
+const pad2 = (n) => String(n).padStart(2, "0");
+const when = (iso) => { const t = new Date(iso); return isNaN(t) ? "?" : `${t.getMonth() + 1}/${t.getDate()} ${pad2(t.getHours())}:${pad2(t.getMinutes())}`; };
+function chatSessions() {
+  const dir = path.join(mynaDir(cfg), "chat-state"), me = String(env.CLAUDE_CODE_SESSION_ID || "");
+  let names = [];
+  try { names = fs.readdirSync(dir).filter((n) => n.endsWith(".json")); } catch { return []; }
+  const rows = [];
+  for (const n of names) {
+    const f = path.join(dir, n);
+    let s = null;
+    try { s = JSON.parse(fs.readFileSync(f, "utf8")); } catch {}
+    if (!s || typeof s.session_id !== "string") {
+      // unreadable: maybe being written right now — skipped, and removed only once it is old
+      try { if (Date.now() - fs.statSync(f).mtimeMs > CHAT_STATE_KEEP_MS) fs.rmSync(f, { force: true }); } catch {}
+      continue;
+    }
+    const age = Date.now() - Date.parse(s.updated_at ?? "");
+    if (s.ended_at || !(age < CHAT_STATE_KEEP_MS)) { try { fs.rmSync(f, { force: true }); } catch {} continue; }
+    rows.push({ ...s, on: s.on === true, current: !!me && s.session_id === me });
+  }
+  return rows.sort((a, b) => b.current - a.current || Date.parse(b.updated_at) - Date.parse(a.updated_at));
+}
+
 // --- one line per item ----------------------------------------------------------------------------------
 const ORDER = ["autopilot", "intercept", "stopcatch", "brief", "perm", "murmur", "hold", "chat", "topics", "perm-delay"];
 const pad = (k) => k.padEnd(11);
@@ -55,7 +82,11 @@ function line(item) {
   if (item === "chat") {
     const d = String(cfg.MYNA_CHAT || "").trim().toLowerCase();
     const def = d === "on" ? `開（MYNA_CHAT=on，${envSource("MYNA_CHAT", readEnvFile(ENV_PATH))}）` : d === "off" ? `關（MYNA_CHAT=off，${envSource("MYNA_CHAT", readEnvFile(ENV_PATH))}）` : "開（終端機 session）";
-    return `${pad("chat")}每個 session 各自設定，這個 session 的狀態用 /myna:config chat 看；新 session 預設${def}`;
+    const rows = chatSessions();
+    const head = `${pad("chat")}每個 session 各自設定（改這個 session：/myna:config chat on|off）；新 session 預設${def}`;
+    if (!rows.length) return `${head}\n${" ".repeat(13)}（還沒有 session 的紀錄：載入聊天模組的 Claude Code session 開始後才會有）`;
+    const proj = (p) => (p ? path.basename(String(p).replace(/[\\/]+$/, "")) || p : "?");
+    return [head, ...rows.map((s) => `${" ".repeat(13)}${s.on ? "on " : "off"}  ${proj(s.project)}${s.nick ? `（${s.nick}）` : ""}　最後更新 ${when(s.updated_at)}${s.current ? "　← 這個 session" : ""}`)].join("\n");
   }
   if (ENV_ITEMS[item]) {
     const it = ENV_ITEMS[item], file = readEnvFile(ENV_PATH), v = it.read(cfg[it.key]);
@@ -119,36 +150,20 @@ const v = rest[0].toLowerCase();
 if (rest.length !== 1 || !it.ok(v)) usageError(`${item} 只接受 ${it.usage}（你給的是「${rest.join(" ")}」），沒有改。`);
 const value = item === "perm-delay" ? String(Number(v)) : v;
 // as scripts/configure.mjs writes it: the key's line replaced (every one, so a later duplicate can't win),
-// or one line added; every other line kept as it was. Written to a temp file next to it and renamed over it
-// (keeping its mode): a failed write leaves the old file whole. No lock: the other .env writers
-// (configure, hub, join) take none either, and all are run by hand.
-let tmp;
+// or one line added; every other line kept as it was. updateEnvFile (src/remote.mjs) reads the file again
+// under its lock and writes it with a rename, like every other .env writer (configure, hub, join).
 try {
-  fs.mkdirSync(path.dirname(ENV_PATH), { recursive: true });
-  let text = fs.existsSync(ENV_PATH) ? fs.readFileSync(ENV_PATH, "utf8") : "";
-  let found = false;
-  text = text.replace(/^[^\r\n]*$/gm, (l) => {
-    if (!l || l.startsWith("#") || !l.includes("=") || l.slice(0, l.indexOf("=")).trim() !== it.key) return l;
-    found = true;
-    return `${it.key}=${value}`;
+  updateEnvFile(ENV_PATH, (text) => {
+    let found = false;
+    text = text.replace(/^[^\r\n]*$/gm, (l) => {
+      if (!l || l.startsWith("#") || !l.includes("=") || l.slice(0, l.indexOf("=")).trim() !== it.key) return l;
+      found = true;
+      return `${it.key}=${value}`;
+    });
+    if (!found) text += (text && !text.endsWith("\n") ? "\n" : "") + `${it.key}=${value}\n`;
+    return text;
   });
-  if (!found) text += (text && !text.endsWith("\n") ? "\n" : "") + `${it.key}=${value}\n`;
-  // a .env that is a link: the file it points to is replaced, the link stays. A link whose file is not
-  // there is refused rather than replaced by a plain file.
-  let target = ENV_PATH, isLink = false;
-  try { isLink = fs.lstatSync(ENV_PATH).isSymbolicLink(); } catch {}
-  if (isLink) {
-    try { target = fs.realpathSync(ENV_PATH); }
-    catch { usageError(`${tildePath(ENV_PATH)} 是連結，但它指向的檔案不在（或連結繞圈），沒有改。先建好那個檔案，或把連結換成一般檔案。`); }
-  }
-  let mode = 0o600; try { mode = fs.statSync(target).mode & 0o777; } catch {}
-  tmp = `${target}.${process.pid}.tmp`;
-  fs.writeFileSync(tmp, text, { mode });
-  fs.chmodSync(tmp, mode); // the umask may have narrowed it
-  fs.renameSync(tmp, target);
-  tmp = null;
 } catch (e) {
-  if (tmp) try { fs.rmSync(tmp, { force: true }); } catch {}
   usageError(`${tildePath(ENV_PATH)} 寫不進去（${e.code || e.message}），沒有改。`);
 }
 const out = [`${item}：${it.show(it.read(value))}，寫進 ${tildePath(ENV_PATH)} 的 ${it.key}。${it.applies}。`];

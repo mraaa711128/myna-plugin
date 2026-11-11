@@ -27,13 +27,16 @@ function stubs(on, takes: any[] = [], { markdownThrows = false } = {}) {
     return { value: { status: 200, ok: true, headers: {}, text: '{}' } }
   })
   on('session.start', () => ({ cwd: '/w' }))
+  on('session.end', ($, e) => ({ sessionId: e.sessionId }))
+  const writes: any[] = []
+  on('fs.write', ($, e) => { writes.push({ path: String(e.path).split(String.fromCharCode(92)).join('/'), text: String(e.text) }); return { value: undefined } })
   // the engine's own run of the markdown command (commands/config.md)
   on('command.run', { command: 'myna:config' }, ($, e) => {
     markdown.push(e.args)
     if (markdownThrows) throw new Error('markdown command failed')
     return { text: `markdown:${e.args}` }
   })
-  return { clock, posts, markdown }
+  return { clock, posts, markdown, writes }
 }
 
 test('/myna:config <not chat> goes on to the markdown command, arguments untouched', async ($, on) => {
@@ -98,4 +101,20 @@ test('a failing markdown command runs once', async ($, on) => {
   try { await $.command.run({ command: 'myna:config', args: 'autopilot on' }) } catch { threw = true }
   expect(threw).toBe(true)
   expect(s.markdown).toEqual(['autopilot on'])
+})
+
+// Stanley's decision on Codex review X4: the session's chat on/off goes to <myna dir>/chat-state/<session>.json
+// (scripts/config.mjs lists those) — at session start, on /myna:config chat on|off, and at session end
+test('the chat state file: written at start, on chat off, and at the end', async ($, on) => {
+  const s = stubs(on)
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/w' })
+  await s.clock.settle()
+  const last = () => JSON.parse(s.writes.filter((w) => w.path.endsWith('/chat-state/kit-1.json')).at(-1).text)
+  expect(s.writes[0].path.endsWith('/h/.myna/chat-state/kit-1.json')).toBe(true)
+  expect(last().on).toBe(true)
+  expect(last().project).toBe('/w')
+  await $.command.run({ command: 'myna:config', args: 'chat off' })
+  expect(last().on).toBe(false)
+  await $.session.end({ reason: 'prompt_input_exit', sessionId: 'kit-1' })
+  expect(typeof last().ended_at).toBe('string')
 })
