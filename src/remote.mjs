@@ -268,10 +268,16 @@ export function withFileLock(file, fn) {
 // through the link, as a plain write would). fn may throw to refuse: nothing is written, the lock is
 // released, the error goes to the caller. → what fn returned.
 // The lock sits next to the file actually written: a link is resolved first, so one program going through
-// the link and another through the real path take the same lock (a dangling link: next to the link).
+// the link and another through the real path take the same lock (a dangling link: next to the file it names,
+// which a program writing that path directly locks too).
 export function updateEnvFile(envPath, fn) {
   let lockOn = envPath;
-  try { if (fs.lstatSync(envPath).isSymbolicLink()) lockOn = fs.realpathSync(envPath); } catch {}
+  try {
+    if (fs.lstatSync(envPath).isSymbolicLink()) {
+      try { lockOn = fs.realpathSync(envPath); }
+      catch { lockOn = path.resolve(path.dirname(envPath), fs.readlinkSync(envPath)); }
+    }
+  } catch {}
   return withFileLock(lockOn, () => {
     let text = "";
     try { text = fs.readFileSync(envPath, "utf8"); } catch (e) { if (e.code !== "ENOENT") throw e; }

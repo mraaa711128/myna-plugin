@@ -224,6 +224,13 @@ for (const args of [["autopilot", "yes"], ["intercept", "status"], ["brief", "on
     const t2 = fs.readFileSync(real, "utf8");
     ok(both.every((x) => x.rc === 0) && ["KEEP", "L1", "R1"].every((k) => t2.includes(`${k}=1\n`)) && fs.lstatSync(link).isSymbolicLink(),
       `a writer through the link and one through the real path at once → both keys kept (${JSON.stringify(t2)})`);
+    // the same with a link to a file not there yet (Codex review of cb94b79, X1): the lock sits next to that file
+    const gone = path.join(TMP, "not-yet.env"), g = newHome(), glink = path.join(g, ".myna", ".env");
+    fs.symlinkSync(gone, glink);
+    const both2 = await Promise.all([writer("L2", glink), writer("R2", gone)]);
+    const t3 = fs.readFileSync(gone, "utf8");
+    ok(both2.every((x) => x.rc === 0) && ["L2", "R2"].every((k) => t3.includes(`${k}=1\n`)) && fs.lstatSync(glink).isSymbolicLink(),
+      `a dangling link and its target path written at once → both keys kept (${JSON.stringify(t3)})`);
   }
   // the real scripts, five rounds: /myna:config topics + perm-delay and /myna:configure provider at the same time
   let lost = 0;

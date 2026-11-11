@@ -62,15 +62,19 @@ function chatSessions() {
   const rows = [];
   for (const n of names) {
     const f = path.join(dir, n);
-    let s = null;
-    try { s = JSON.parse(fs.readFileSync(f, "utf8")); } catch {}
+    let s = null, text = null;
+    try { text = fs.readFileSync(f, "utf8"); s = JSON.parse(text); } catch {}
     if (!s || typeof s.session_id !== "string") {
       // unreadable: maybe being written right now — skipped, and removed only once it is old
       try { if (Date.now() - fs.statSync(f).mtimeMs > CHAT_STATE_KEEP_MS) fs.rmSync(f, { force: true }); } catch {}
       continue;
     }
     const age = Date.now() - Date.parse(s.updated_at ?? "");
-    if (s.ended_at || !(age < CHAT_STATE_KEEP_MS)) { try { fs.rmSync(f, { force: true }); } catch {} continue; }
+    if (s.ended_at || !(age < CHAT_STATE_KEEP_MS)) {
+      // removed only if it still says what was read: a session resumed meanwhile has written a live record
+      try { if (fs.readFileSync(f, "utf8") === text) fs.rmSync(f, { force: true }); } catch {}
+      continue;
+    }
     rows.push({ ...s, on: s.on === true, current: !!me && s.session_id === me });
   }
   return rows.sort((a, b) => b.current - a.current || Date.parse(b.updated_at) - Date.parse(a.updated_at));
