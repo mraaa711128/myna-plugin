@@ -111,7 +111,7 @@ for (const args of [["autopilot", "yes"], ["intercept", "status"], ["brief", "on
     return !(i >= 0 && ls[i].endsWith(`　可設：${VALUES[k]}`) && /^ {4}\S/.test(ls[i + 1] ?? "") && ls[i + 1].trim().length >= 10);
   });
   ok(missing.length === 0, `no argument → every item ends with 可設：<values> and has a purpose line under it (missing: ${missing.join(", ") || "none"})`);
-  ok(/^ {4}手機上的題目自動採用建議選項/m.test(r.out) && /^ {4}權限確認框在終端機等幾秒沒人回答/m.test(r.out) && /^ {4}Telegram 每個 gate/m.test(r.out), "…the purposes read as written (autopilot, perm-delay, topics)");
+  ok(/^ {4}手機上的題目自動採用建議選項/m.test(r.out) && /^ {4}權限確認框在終端機等幾秒沒人回答/m.test(r.out) && /^ {4}Telegram 用 topic 分開：每個 gate 一個（TELEGRAM_TOPIC_SCOPE=session 時每個 session 一個）/m.test(r.out), "…the purposes read as written (autopilot, perm-delay, topics)");
   ok(ls.length === 1 + items.length * 2 + 1, `…two lines per item, plus the heading and chat's "no record" line (${ls.length} lines)`);
   await cfg(["stopcatch", "off"], a);
   fs.writeFileSync(path.join(a, ".myna", ".env"), "TELEGRAM_TOPICS=off\n");
@@ -120,7 +120,7 @@ for (const args of [["autopilot", "yes"], ["intercept", "status"], ["brief", "on
     "sources: the flag file, ~/.myna/.env, the environment");
   const one = await cfg(["topics"], a);
   const ol = one.out.trim().split("\n");
-  ok(one.rc === 0 && ol.length === 4 && /^topics\s+off/.test(ol[0]) && /^  用途：Telegram 每個 gate.*Threaded Mode/.test(ol[1]) && ol[2] === "  可設：auto / off" && /^  存放：.*\.env 的 TELEGRAM_TOPICS；relay 啟動時才讀/.test(ol[3]),
+  ok(one.rc === 0 && ol.length === 4 && /^topics\s+off/.test(ol[0]) && /^  用途：Telegram 用 topic 分開.*已經有 topic 的聊天 session 照用原本的.*Threaded Mode/.test(ol[1]) && ol[2] === "  可設：auto / off" && /^  存放：.*\.env 的 TELEGRAM_TOPICS；relay 啟動時才讀/.test(ol[3]),
     `one item → its line, then 用途 / 可設 / 存放 (${JSON.stringify(ol)})`);
   const holdOne = (await cfg(["hold"], a)).out.trim().split("\n");
   ok(/^  可設：on \/ off \/ max <30m\|6h\|1d\|秒數\|default>（10 分鐘～7 天，預設 1 天）\/ status/.test(holdOne[2]) && /^  存放：.*upstream-hold；馬上生效/.test(holdOne[3]),
@@ -205,17 +205,26 @@ for (const args of [["autopilot", "yes"], ["intercept", "status"], ["brief", "on
   const a = newHome(), ENV = path.join(a, ".myna", ".env");
   fs.writeFileSync(ENV, "KEEP=1\n");
   const remoteUrl = new URL("../src/remote.mjs", import.meta.url).href;
-  const writer = (k) => new Promise((resolve) => {
+  const writer = (k, p = ENV) => new Promise((resolve) => {
     const code = `import { updateEnvFile } from ${JSON.stringify(remoteUrl)};
-      updateEnvFile(${JSON.stringify(ENV)}, (t) => { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 400); return t + "${k}=1\\n"; });`;
+      updateEnvFile(${JSON.stringify(p)}, (t) => { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 400); return t + "${k}=1\\n"; });`;
     const c = spawn(process.execPath, ["--input-type=module", "-e", code], { env: envOf(a) });
     let err = ""; c.stderr.on("data", (d) => (err += d));
     c.on("close", (rc) => resolve({ rc, err }));
   });
-  const rs = await Promise.all(["K1", "K2", "K3", "K4"].map(writer));
+  const rs = await Promise.all(["K1", "K2", "K3", "K4"].map((k) => writer(k)));
   const text = fs.readFileSync(ENV, "utf8");
   ok(rs.every((x) => x.rc === 0) && ["KEEP", "K1", "K2", "K3", "K4"].every((k) => text.includes(`${k}=1\n`)) && !fs.existsSync(`${ENV}.lock`),
     `4 writers at once, each slow between read and write → all 4 keys and the old one kept, the lock gone (${JSON.stringify(text)})`);
+  // one writer through a link, one through the real path (Codex review of f2e0818, X4): the same lock
+  if (process.platform !== "win32") {
+    const real = path.join(TMP, "linked.env"), l = newHome(), link = path.join(l, ".myna", ".env");
+    fs.writeFileSync(real, "KEEP=1\n"); fs.symlinkSync(real, link);
+    const both = await Promise.all([writer("L1", link), writer("R1", real)]);
+    const t2 = fs.readFileSync(real, "utf8");
+    ok(both.every((x) => x.rc === 0) && ["KEEP", "L1", "R1"].every((k) => t2.includes(`${k}=1\n`)) && fs.lstatSync(link).isSymbolicLink(),
+      `a writer through the link and one through the real path at once → both keys kept (${JSON.stringify(t2)})`);
+  }
   // the real scripts, five rounds: /myna:config topics + perm-delay and /myna:configure provider at the same time
   let lost = 0;
   for (let i = 0; i < 5; i++) {
@@ -356,7 +365,13 @@ function engine({ dir = path.join(TMP, "eng0"), root = "/w", sid = "s-1" } = {})
   await C.cmd("myna:config", "chat off");
   await new Promise((res) => setTimeout(res, 400));
   ok(state("sess-c2")?.on === false, `a slow refresh asked before chat off does not land after it (${JSON.stringify(state("sess-c2"))})`);
-}
+  // a turn started from the phone has no prompt.submit (Codex review of f2e0818, X3): turn.start refreshes too
+  const D = engine({ dir, root: "/work/d", sid: "sess-d" });
+  await D.fire("session.start", { cwd: "/work/d", surface: "terminal", isInteractive: true });
+  D.S.sid = "sess-d2";
+  await D.fire("turn.start", { text: "The myna plugin sent a message: hi" });
+  await new Promise((res) => setTimeout(res, 100));
+  ok(state("sess-d2")?.on === true, `a turn with no prompt.submit (from the phone) records the new session id (${JSON.stringify(state("sess-d2"))})`);}
 
 // 8) more from the review of be0da2e: a new .env is 0600 and stays so; hub on checks the role again under the lock
 {

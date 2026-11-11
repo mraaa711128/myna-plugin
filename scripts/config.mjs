@@ -133,8 +133,8 @@ const INFO = {
   },
   topics: {
     values: "auto / off",
-    purpose: "Telegram 每個 gate（和每個聊天 session）各開一個 topic；off = 全部在主聊天室",
-    more: "bot 要在 BotFather 開 Threaded Mode；auto 時建不了 topic 也會退回主聊天室",
+    purpose: "Telegram 用 topic 分開：每個 gate 一個（TELEGRAM_TOPIC_SCOPE=session 時每個 session 一個），每個聊天 session 也各一個；off = 不再開新的 topic",
+    more: "off 之後新的題目和新的聊天 session 在主聊天室，已經有 topic 的聊天 session 照用原本的；bot 要在 BotFather 開 Threaded Mode，auto 時建不了 topic 也會退回主聊天室",
   },
   "perm-delay": {
     values: "0 以上的整數（秒）",

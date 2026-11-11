@@ -60,7 +60,8 @@ const CHAT_CONFIG_INFO = `用途：${CHAT_CONFIG_PURPOSE}（需要 Claude Code 2
 // Each session's chat on/off, for /myna:config's list (scripts/config.mjs reads them): one small JSON file
 // per session in <myna dir>/chat-state/ — {session_id, on, nick?, project, updated_at, ended_at?}. Written on
 // session start, /myna:config chat on|off (and /myna:chat), a registration or a new nick, a new session id
-// (after /clear or a resume), every STATE_REFRESH_MS on a prompt at most, and at session end (ended_at).
+// (after /clear or a resume), every STATE_REFRESH_MS at most on a prompt or a turn's start (a turn started from
+// the phone has no prompt.submit), and at session end (ended_at).
 // Best effort: a write that fails changes nothing else. config.mjs removes the files of ended sessions.
 const STATE_REFRESH_MS = 10 * 60 * 1000;
 export const stateFileName = (sid) => `${String(sid).replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 128)}.json`;
@@ -501,6 +502,9 @@ export const register = (on) => {
   on("turn.start", async ($, e, next) => {
     const r = await next(e);
     if (e.agentId) return r; // a subagent's run: one Agent line in the main loop's progress already
+    // a turn started from the phone never passes prompt.submit (our own $.prompt.submit skips our hooks):
+    // refresh here too, or a session used only from the phone would look dead after 30 days
+    refreshState();
     inTurn = true;
     const text = String(e.text || "");
     // our own prompt: the engine frames it ("The myna plugin sent a message: …"), so look for the text
