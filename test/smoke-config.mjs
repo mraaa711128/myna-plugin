@@ -113,7 +113,18 @@ for (const args of [["autopilot", "yes"], ["intercept", "status"], ["brief", "on
   ok(/30 秒.*看不懂/.test(odd.out), `an unreadable perm-delay in .env → 30 s and says so ("${odd.out.trim()}")`);
   fs.mkdirSync(path.join(a, ".myna", "x"));
   const edge = await cfg([], a, { MYNA_ROLE: "edge", MYNA_UPSTREAM_HOLD: "off" });
-  ok(/hold\s+off，上限 1 天（環境變數/.test(edge.out), "hold from MYNA_UPSTREAM_HOLD → off (環境變數)");
+  ok(/hold\s+off，上限 1 天（off：環境變數；上限：預設；/.test(edge.out), "hold from MYNA_UPSTREAM_HOLD → off (環境變數), the cap the default");
+  // each hold field from its own place (Codex review r1 X2)
+  const h = newHome();
+  await cfg(["hold", "max", "6h"], h);
+  fs.writeFileSync(path.join(h, ".myna", ".env"), "MYNA_UPSTREAM_HOLD=off\n");
+  let hr = await cfg(["hold"], h);
+  ok(/hold\s+off，上限 6 小時（off：.*\.myna\/\.env；上限：設定檔 .*upstream-hold；/.test(hr.out), `hold: off from .env, the cap from the hold file — both named ("${hr.out.trim()}")`);
+  hr = await cfg(["hold"], h, { MYNA_UPSTREAM_HOLD_MAX: "3600" });
+  ok(/off，上限 1 小時（off：.*\.myna\/\.env；上限：環境變數；/.test(hr.out), `hold: off from .env, the cap from the environment ("${hr.out.trim()}")`);
+  fs.writeFileSync(path.join(h, ".myna", ".env"), "MYNA_UPSTREAM_HOLD=off\nMYNA_UPSTREAM_HOLD_MAX=7200\n");
+  hr = await cfg(["hold"], h);
+  ok(/off，上限 2 小時（[^；）]*\.myna\/\.env；只在/.test(hr.out), `hold: both from .env → one source ("${hr.out.trim()}")`);
 }
 
 // 4) topics / perm-delay → ~/.myna/.env
@@ -140,6 +151,17 @@ for (const args of [["autopilot", "yes"], ["intercept", "status"], ["brief", "on
   ok(!r.all.includes("123:abc"), "the output never shows another .env value (the token)");
   r = await cfg(["topics", "auto"], a, { TELEGRAM_TOPICS: "off" });
   ok(r.rc === 0 && /環境變數 TELEGRAM_TOPICS=off 有設/.test(r.out) && fs.readFileSync(ENV, "utf8").includes("TELEGRAM_TOPICS=auto"), "TELEGRAM_TOPICS in the environment → still written, and it says the variable wins");
+  // written by a rename (Codex review r1 X1): no temp file left, the mode kept, a link stays a link
+  ok(!fs.readdirSync(path.join(a, ".myna")).some((f) => f.endsWith(".tmp")), "no temp file left next to .env");
+  if (process.platform !== "win32") {
+    fs.chmodSync(ENV, 0o600);
+    await cfg(["perm-delay", "5"], a);
+    ok((fs.statSync(ENV).mode & 0o777) === 0o600, ".env stays 0600 after a write");
+    const real = path.join(TMP, "dotfiles.env"), l = newHome(), link = path.join(l, ".myna", ".env");
+    fs.writeFileSync(real, "OTHER=1\n"); fs.symlinkSync(real, link);
+    await cfg(["topics", "off"], l);
+    ok(fs.lstatSync(link).isSymbolicLink() && fs.readFileSync(real, "utf8") === "OTHER=1\nTELEGRAM_TOPICS=off\n", ".env that is a link: the file it points to is written, the link stays");
+  }
   const dirEnv = newHome(); fs.mkdirSync(path.join(dirEnv, ".myna", ".env"));
   r = await cfg(["topics", "off"], dirEnv);
   ok(r.rc === 1 && /寫不進去/.test(r.err), `.env not writable (a folder) → says so, rc 1 ("${r.err.trim()}")`);

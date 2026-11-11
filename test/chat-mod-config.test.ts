@@ -7,7 +7,7 @@
 //   - "!myna:config chat off" from the phone → answered by the mod, not run as a command
 import { expect, mock, test } from 'claude-code/testing'
 
-function stubs(on, takes: any[] = []) {
+function stubs(on, takes: any[] = [], { markdownThrows = false } = {}) {
   const clock = mock.clock(on)
   mock.store(on, {})
   const posts: any[] = []
@@ -28,7 +28,11 @@ function stubs(on, takes: any[] = []) {
   })
   on('session.start', () => ({ cwd: '/w' }))
   // the engine's own run of the markdown command (commands/config.md)
-  on('command.run', { command: 'myna:config' }, ($, e) => { markdown.push(e.args); return { text: `markdown:${e.args}` } })
+  on('command.run', { command: 'myna:config' }, ($, e) => {
+    markdown.push(e.args)
+    if (markdownThrows) throw new Error('markdown command failed')
+    return { text: `markdown:${e.args}` }
+  })
   return { clock, posts, markdown }
 }
 
@@ -69,4 +73,16 @@ test('"!myna:config chat off" from the phone is answered by the mod, not run as 
   expect(done[0].body).toContain('/myna:config chat on')
   expect(s.markdown).toEqual([])
   expect((await $.command.run({ command: 'myna:config', args: 'chat' })).text).toContain('聊天目前關閉')
+})
+
+// Codex review r1 X3: a markdown command that fails after the mod passed it on is not run a second time by the
+// mod's .catch (next(e) there replays what the first call settled to)
+test('a failing markdown command runs once', async ($, on) => {
+  const s = stubs(on, [], { markdownThrows: true })
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/w' })
+  await s.clock.settle()
+  let threw = false
+  try { await $.command.run({ command: 'myna:config', args: 'autopilot on' }) } catch { threw = true }
+  expect(threw).toBe(true)
+  expect(s.markdown).toEqual(['autopilot on'])
 })

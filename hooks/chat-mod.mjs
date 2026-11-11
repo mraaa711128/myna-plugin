@@ -536,7 +536,8 @@ export const register = (on) => {
     const c = configChatArgs(e.args);
     // args is always set in a session ("" when bare); a plugin's own $.command.run may leave it out
     return c === null ? next(e.args === undefined ? { ...e, args: "" } : e) : { text: await configChat(c) };
-  }).catch(($, e, next) => (configChatArgs(e.args) !== null && !next.called ? { text: "💬 /myna:config chat 執行失敗,請再試一次。" } : next(e)));
+  // the engine's guard form: once next was called, next(e) here replays what it settled to (nothing runs twice)
+  }).catch(($, e, next) => (configChatArgs(e.args) !== null && !next.called ?{ text: "💬 /myna:config chat 執行失敗,請再試一次。" } : next(e)));
   on("command.run", { command: "myna:nick" }, async ($, e) => ({ text: await nickCommand(e.args) }))
     .catch(() => ({ text: "💬 /myna:nick 執行失敗,請再試一次。" }));
 

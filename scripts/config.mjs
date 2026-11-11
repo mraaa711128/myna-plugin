@@ -15,7 +15,7 @@ import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { loadEnv, holdSettings } from "../src/remote.mjs";
+import { loadEnv, holdSettings, readHoldFile } from "../src/remote.mjs";
 import { SWITCHES, readEnvFile, tildePath } from "../src/status.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -63,8 +63,14 @@ function line(item) {
     return `${pad(item)}${it.show(v)}（${envSource(it.key, file)}${bad}）`;
   }
   if (item === "hold") {
-    const s = holdSettings(cfg), file = sw("hold").file(cfg, env);
-    const src = { default: "預設", file: `設定檔 ${tildePath(file)}`, env: "環境變數" }[s.source];
+    // on/off and the cap each come from the first of: the environment, ~/.myna/.env, the hold file, the default
+    // (holdSettings tells only "env" for both of the first two, and one source for the two fields)
+    const s = holdSettings(cfg), file = sw("hold").file(cfg, env), f = readHoldFile(file), envFile = readEnvFile(ENV_PATH);
+    const fileSrc = `設定檔 ${tildePath(file)}`;
+    const srcOf = (key, fromEnv, inFile) => (fromEnv !== undefined ? envSource(key, envFile) : !f.bad && inFile ? fileSrc : "預設");
+    const onSrc = srcOf("MYNA_UPSTREAM_HOLD", s.env.hold, f.on !== undefined);
+    const maxSrc = srcOf("MYNA_UPSTREAM_HOLD_MAX", s.env.max, f.max_s !== undefined);
+    const src = onSrc === maxSrc ? onSrc : `${s.on ? "on" : "off"}：${onSrc}；上限：${maxSrc}`;
     return `${pad("hold")}${s.on ? "on" : "off"}，上限 ${human(s.max_s)}（${src}${s.bad ? "；檔案讀不懂，當成預設" : ""}；只在子節點有作用）`;
   }
   const st = sw(item).state(cfg, env);
@@ -112,7 +118,10 @@ const v = rest[0].toLowerCase();
 if (rest.length !== 1 || !it.ok(v)) usageError(`${item} 只接受 ${it.usage}（你給的是「${rest.join(" ")}」），沒有改。`);
 const value = item === "perm-delay" ? String(Number(v)) : v;
 // as scripts/configure.mjs writes it: the key's line replaced (every one, so a later duplicate can't win),
-// or one line added; every other line kept as it was
+// or one line added; every other line kept as it was. Written to a temp file next to it and renamed over it
+// (keeping its mode): a failed write leaves the old file whole. No lock: the other .env writers
+// (configure, hub, join) take none either, and all are run by hand.
+let tmp;
 try {
   fs.mkdirSync(path.dirname(ENV_PATH), { recursive: true });
   let text = fs.existsSync(ENV_PATH) ? fs.readFileSync(ENV_PATH, "utf8") : "";
@@ -123,8 +132,16 @@ try {
     return `${it.key}=${value}`;
   });
   if (!found) text += (text && !text.endsWith("\n") ? "\n" : "") + `${it.key}=${value}\n`;
-  fs.writeFileSync(ENV_PATH, text);
+  // a .env that is a link: the file it points to is replaced, the link stays
+  let target = ENV_PATH; try { target = fs.realpathSync(ENV_PATH); } catch {}
+  let mode = 0o600; try { mode = fs.statSync(target).mode & 0o777; } catch {}
+  tmp = `${target}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, text, { mode });
+  fs.chmodSync(tmp, mode); // the umask may have narrowed it
+  fs.renameSync(tmp, target);
+  tmp = null;
 } catch (e) {
+  if (tmp) try { fs.rmSync(tmp, { force: true }); } catch {}
   usageError(`${tildePath(ENV_PATH)} 寫不進去（${e.code || e.message}），沒有改。`);
 }
 const out = [`${item}：${it.show(it.read(value))}，寫進 ${tildePath(ENV_PATH)} 的 ${it.key}。${it.applies}。`];
