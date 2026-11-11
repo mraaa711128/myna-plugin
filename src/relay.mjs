@@ -223,7 +223,8 @@ const approvals = new Map();
 // kind: "permission" marks a Claude Code permission prompt forwarded by the PermissionRequest hook
 // approves: the command a ✅ option of this ask approves — informational only (journal, /requests,
 // detach info); an approval is recorded from the runtime-only entry.approves, never from meta
-const META_KEYS = ["gate", "thread_id", "header", "question", "options", "kind", "questionNumber", "questionTotal", "approves"];
+// agent_id: set by the PermissionRequest hook when the prompt is a background subagent's (see cancelPermissions)
+const META_KEYS = ["gate", "thread_id", "header", "question", "options", "kind", "questionNumber", "questionTotal", "approves", "agent_id"];
 const metaOf = (args) => Object.fromEntries(META_KEYS.filter((k) => args[k] !== undefined).map((k) => [k, args[k]]));
 
 // --- journal (handoff across restarts / upgrades) ---------------------------------------------
@@ -261,15 +262,37 @@ function armExpiry(id, p) {
   p.expiry = setTimeout(() => expireDetached(id), Math.max(0, p.detached.until - Date.now()));
   p.expiry.unref?.();
 }
-// A forwarded permission prompt is over once its session's turn ends or the session does: no dialog
-// outlives either. Its hook retracts it itself (terminal answered, or the hook was stopped), so this
-// is the safety net for one that could not — it must never hold a topic or a deferred close open.
+// A forwarded permission prompt is over once its session ends: no dialog outlives it. The main
+// thread's is also over at its round end; a background subagent's (meta.agent_id) is not — its dialog
+// can outlive the main thread's turn — so round end leaves it open while its hook still polls for the
+// answer, and cancels it once nobody does (the subagent was stopped: on Windows its hook is killed
+// without a signal and cannot retract it itself). Its hook retracts it itself (terminal answered, or
+// the hook was stopped), so this is the safety net for one that could not — it must never hold a
+// deferred close open. Returns how many it left open (subagents' prompts still polled for).
 function cancelPermissions(sid, why) {
+  let kept = 0;
   for (const [id, p] of pending) {
     if (p.session_id !== sid || p.result !== undefined || p.meta?.kind !== "permission") continue;
+    // still being sent counts as waited for: its hook polls only once /ask has answered
+    if (why === "round end" && p.meta.agent_id && (p.inFlight || attended(p))) { kept++; continue; }
     log(`request ${id}: permission prompt still open at ${why} — cancelling`);
     Promise.resolve(provider.cancelQuestion?.(id)).catch((e) => log("cancelQuestion err", e.message));
     resolveRequest(id, { kind: "cancelled", reason: why });
+  }
+  return kept;
+}
+// sessions whose last round end left a subagent's permission prompt open because its hook still
+// polled. A stopped subagent's hook is killed (on Windows without a signal: it cannot retract) and its
+// last poll counts as attended for up to ANSWER_HOLD_MS + ATTENDED_GRACE_MS — the main thread's round
+// end often falls inside that. The sweep finishes such a round end once nobody polls any more: the
+// prompt is cancelled and, nothing else of the session open, the round ends. A new question from the
+// session (a new round under way) or its end drops the mark.
+const roundEndDue = new Set();
+function finishRoundEnds() {
+  for (const sid of roundEndDue) {
+    if (cancelPermissions(sid, "round end")) continue;
+    roundEndDue.delete(sid);
+    if (!openFor(sid) && provider.endRound) { try { provider.endRound(sid); } catch (e) { log("endRound err", e.message); } }
   }
 }
 // nobody took the request over in time → the normal rules apply as if its owner had ended:
@@ -361,6 +384,7 @@ function sweep() {
     }
   }
   if (swept) persist();
+  finishRoundEnds();
   for (const [id, a] of approvals) if (approvalExpired(a, now)) approvals.delete(id); // used or not, past its TTL it can never attest (memory only — nothing to persist)
 }
 setInterval(sweep, Number(cfg.MYNA_SWEEP_MS || 60000)).unref();
@@ -710,6 +734,9 @@ async function handleAsk(req, res, scope, pre) {
   if (label) args.machine_label = label;
   request_id ||= crypto.randomBytes(5).toString("hex");
   const entry = newEntry(Date.now(), args.session_id, metaOf(args), scope.id);
+  // a new question of the main thread: a new round is under way, its own round end decides (a subagent's
+  // next permission prompt is not one — the main thread's round may well be over)
+  if (args.session_id && !args.agent_id) roundEndDue.delete(String(args.session_id));
   // runtime only (persist() never writes it): the command a ✅ tap on THIS question approves
   // and the one ✅ option whose tap approves it (validateAskArgs allows exactly one)
   if (typeof args.approves === "string") { entry.approves = normalizeCommand(args.approves); entry.approveOption = approveOptionOf(args.options); }
@@ -723,6 +750,7 @@ async function handleAsk(req, res, scope, pre) {
   // client has something to poll and collect the unreachable verdict.
   // a remote machine's /cancel waits for this send to finish (entry.sending): an edge that gave the
   // question up may cancel it while Telegram is still sending it, and only a sent message can be retracted
+  entry.inFlight = true; // runtime only: see cancelPermissions
   try {
     const sending = provider.sendQuestion(request_id, args);
     // a remote /cancel, or an edge giving its own bot up (hub.onBot), waits for the send to finish
@@ -733,6 +761,7 @@ async function handleAsk(req, res, scope, pre) {
     log("sendQuestion delivery failed — resolving unreachable:", e.message);
     resolveRequest(request_id, { kind: "unreachable", error: `question delivery failed: ${e.message}` });
   }
+  finally { delete entry.inFlight; entry.lastPoll = Date.now(); } // its asker starts polling now
   send(res, 200, { request_id });
 }
 
@@ -806,7 +835,7 @@ async function handleAnswer(res, id, scope) {
 async function handleSessionClose(req, res, scope, pre) {
   const { body } = pre || await readBody(req, SMALL_BODY_BYTES);
   const sid = scope.sid((jsonOf(body).v || {}).session_id);
-  if (sid) cancelPermissions(sid, "session end");
+  if (sid) { roundEndDue.delete(sid); cancelPermissions(sid, "session end"); }
   if (sid && openFor(sid)) {
     closing.add(sid); persist();
     log(`session ${sid} closed with open gate(s) — its topics stay until they are answered`);
@@ -817,7 +846,7 @@ async function handleSessionClose(req, res, scope, pre) {
 async function handleRoundEnd(req, res, scope, pre) {
   const { body } = pre || await readBody(req, SMALL_BODY_BYTES);
   const sid = scope.sid((jsonOf(body).v || {}).session_id);
-  if (sid) cancelPermissions(sid, "round end");
+  if (sid) { if (cancelPermissions(sid, "round end")) roundEndDue.add(sid); else roundEndDue.delete(sid); }
   // a gate of this session still waiting (e.g. a background subagent's) → the round is not over
   const open = sid && [...pending.values()].some((q) => q.session_id === sid && q.result === undefined);
   if (sid && !open && provider.endRound) { try { provider.endRound(sid); } catch (e) { log("endRound err", e.message); } }
