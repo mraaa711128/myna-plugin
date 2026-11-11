@@ -161,12 +161,19 @@ for (const args of [["autopilot", "yes"], ["intercept", "status"], ["brief", "on
     fs.writeFileSync(real, "OTHER=1\n"); fs.symlinkSync(real, link);
     await cfg(["topics", "off"], l);
     ok(fs.lstatSync(link).isSymbolicLink() && fs.readFileSync(real, "utf8") === "OTHER=1\nTELEGRAM_TOPICS=off\n", ".env that is a link: the file it points to is written, the link stays");
+    // a link to a file that is not there (Codex review r2 X5): refused, the link kept
+    const d = newHome(), dl = path.join(d, ".myna", ".env"), gone = path.join(TMP, "no-such-dotfile");
+    fs.symlinkSync(gone, dl);
+    const dr = await cfg(["topics", "off"], d);
+    ok(dr.rc === 1 && /是連結/.test(dr.err) && fs.lstatSync(dl).isSymbolicLink() && !fs.existsSync(gone), `a dangling .env link → refused, the link kept ("${dr.err.trim()}")`);
   }
   const dirEnv = newHome(); fs.mkdirSync(path.join(dirEnv, ".myna", ".env"));
   r = await cfg(["topics", "off"], dirEnv);
   ok(r.rc === 1 && /寫不進去/.test(r.err), `.env not writable (a folder) → says so, rc 1 ("${r.err.trim()}")`);
   r = await cfg([], dirEnv);
   ok(r.rc === 0 && /讀不到/.test(r.out) && /topics\s+auto（預設）/.test(r.out), ".env unreadable → the list still comes, with a note");
+  r = await cfg(["topics"], dirEnv);
+  ok(r.rc === 0 && /讀不到/.test(r.out) && /^topics/m.test(r.out), `.env unreadable → one item comes with the note too (Codex review r2 X7): ${JSON.stringify(r.out.trim())}`);
 }
 
 // 5) unknown item; chat without the chat mod
@@ -223,7 +230,7 @@ function engine() {
   ok(x.passed === null && /聊天已關閉/.test(x.r.text) && E.store.get("chat:s-1")?.on === false, `/myna:config chat off → answered by the mod, stored off ("${x.r.text}")`);
   const viaChat = await E.cmd("myna:chat", "");
   x = await E.cmd("myna:config", "chat");
-  ok(x.passed === null && x.r.text === "💬 聊天目前關閉。用 /myna:chat on 開啟。" && viaChat.r.text.startsWith(x.r.text), `/myna:config chat → the state, as /myna:chat says it ("${x.r.text}")`);
+  ok(x.passed === null && x.r.text === "💬 聊天目前關閉。用 /myna:config chat on 開啟。" && viaChat.r.text.startsWith(x.r.text), `/myna:config chat → the state, as /myna:chat says it ("${x.r.text}")`);
   ok(/\n提示：\/myna:chat 之後會移除，請改用 \/myna:config chat on\|off$/.test(viaChat.r.text), "/myna:chat's answer ends with the hint line");
   x = await E.cmd("myna:config", "chat on");
   ok(x.passed === null && /聊天已開啟/.test(x.r.text) && E.store.get("chat:s-1")?.on === true, `/myna:config chat on → on, stored ("${x.r.text}")`);

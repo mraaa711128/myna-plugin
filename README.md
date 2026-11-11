@@ -474,7 +474,7 @@ session 取走你的訊息時,那則訊息會被標上 👀。session 正在忙�
 - 請在 session 的 topic 裡打;在主聊天室可以寫成 `@egret !usage`(在 egret 自己的 topic 裡這樣寫也可以)。在 topic 外面打的 `!指令` 會交給你最近(30 分鐘內)對話的那個 session(relay 重啟也記得),只有一個 session 在線上時就交給它,並留一句「↪ 已交給 @egret」告訴你結果會出現在哪個 topic;判斷不出來會回問你。
 - 指令一定單獨執行,不會跟前後的文字合併;排在它前面的文字先送,接著跑指令,再處理後面的訊息。
 - 找不到這個指令時(例如 `!123`、`!好棒`),整則訊息當成一般文字送出。
-- `!myna:chat off` 從手機送出後,手機就收不到訊息了,要在終端機用 `/myna:chat on` 重新開啟。
+- `!myna:config chat off`(或舊的 `!myna:chat off`)從手機送出後,手機就收不到訊息了,要在終端機用 `/myna:config chat on` 重新開啟。
 
 **手機上會看到什麼:**
 
@@ -523,16 +523,16 @@ session 取走你的訊息時,那則訊息會被標上 👀。session 正在忙�
 **建不了 topic 時(0.18.1):** session 連上時 topic 沒建成(例如那時 relay 連不上 Telegram,或當時 `TELEGRAM_TOPICS=off`),它會先在主聊天室以 `[egret]` 發言。這不是永久的:之後每次重新連上(session 重開、`/resume`、relay 重啟後自動重新註冊),只要 topics 沒關,relay 都會再建一次,建成就搬進自己的 topic,並在那裡說「已連線」。還是建不成時就留在主聊天室,不會每次都再發一次「已連線」(只有重新連線時說一句「重新連線了」)。
 
 ```
-/myna:chat           # 查目前狀態(暱稱、待處理的訊息)
-/myna:chat off       # 這個 session 不再收 Telegram 訊息,也不回報進度
-/myna:chat on        # 重新開啟
+/myna:config chat       # 查目前狀態(暱稱、待處理的訊息)
+/myna:config chat off   # 這個 session 不再收 Telegram 訊息,也不回報進度
+/myna:config chat on    # 重新開啟(舊的 /myna:chat on|off 是別名,之後會移除)
 /myna:nick heron     # 改暱稱(topic 跟著改名)
 /myna:nick           # 查目前的暱稱
-/myna:murmur off     # 進度訊息只列 💭 和最新一個工具(所有 session)
-/myna:murmur on      # 進度訊息逐行累加(預設)
+/myna:config murmur off  # 進度訊息只列 💭 和最新一個工具(所有 session)
+/myna:config murmur on   # 進度訊息逐行累加(預設)
 ```
 
-`/myna:chat on|off` 和 `/myna:nick` 只影響目前這個 session,resume 時會記得。
+`/myna:config chat on|off` 和 `/myna:nick` 只影響目前這個 session,resume 時會記得。
 
 **哪些 session 預設開:** 終端機裡的互動 session 預設開。`claude -p`、SDK 啟動的 session 預設關。VS Code 擴充套件預設開,但**還沒實測過**。想改變預設,在 `~/.myna/.env` 或環境變數設 `MYNA_CHAT=on` 或 `MYNA_CHAT=off`;`MYNA_CHAT_NICK=<名字>` 可以指定暱稱,不用鳥名。
 

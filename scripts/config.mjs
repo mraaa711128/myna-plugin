@@ -81,9 +81,10 @@ function line(item) {
 const ITEMS_TEXT = ORDER.join("、");
 const usageError = (msg) => { console.error(msg); process.exit(1); };
 const [item0, ...rest] = process.argv.slice(2);
+// shown with every reading (the whole list or one item): an unreadable .env makes "預設" a guess
+const warn = envError ? [`注意：${tildePath(ENV_PATH)} 讀不到（${envError}），下面只看環境變數和各開關的檔案`] : [];
 
 if (!item0) {
-  const warn = envError ? [`注意：${tildePath(ENV_PATH)} 讀不到（${envError}），下面只看環境變數和各開關的檔案`] : [];
   console.log(["Myna 設定（改：/myna:config <項目> <值>）", ...warn, ...ORDER.map((k) => `  ${line(k)}`)].join("\n"));
   process.exit(0);
 }
@@ -95,7 +96,7 @@ if (item === "chat") {
   console.log("chat 是每個 session 各自的開關，由聊天模組處理；這個 session 沒有載入聊天模組（需要 Claude Code 2.1.287 以上）。升級後重開 session 就會自動啟用（終端機 session 預設開啟）。");
   process.exit(1);
 }
-if (!rest.length) { console.log(line(item)); process.exit(0); }
+if (!rest.length) { console.log([...warn, line(item)].join("\n")); process.exit(0); }
 
 // --- a switch: its own script, its output as is -----------------------------------------------------------
 if (!ENV_ITEMS[item]) {
@@ -132,8 +133,14 @@ try {
     return `${it.key}=${value}`;
   });
   if (!found) text += (text && !text.endsWith("\n") ? "\n" : "") + `${it.key}=${value}\n`;
-  // a .env that is a link: the file it points to is replaced, the link stays
-  let target = ENV_PATH; try { target = fs.realpathSync(ENV_PATH); } catch {}
+  // a .env that is a link: the file it points to is replaced, the link stays. A link whose file is not
+  // there is refused rather than replaced by a plain file.
+  let target = ENV_PATH, isLink = false;
+  try { isLink = fs.lstatSync(ENV_PATH).isSymbolicLink(); } catch {}
+  if (isLink) {
+    try { target = fs.realpathSync(ENV_PATH); }
+    catch { usageError(`${tildePath(ENV_PATH)} 是連結，但它指向的檔案不在（或連結繞圈），沒有改。先建好那個檔案，或把連結換成一般檔案。`); }
+  }
   let mode = 0o600; try { mode = fs.statSync(target).mode & 0o777; } catch {}
   tmp = `${target}.${process.pid}.tmp`;
   fs.writeFileSync(tmp, text, { mode });

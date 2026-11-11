@@ -53,7 +53,7 @@ test('/myna:config chat on|off is the chat mod\'s, the same as /myna:chat', asyn
   await s.clock.settle()
   const off = (await $.command.run({ command: 'myna:config', args: 'chat off' })).text
   expect(off).toContain('聊天已關閉')
-  expect((await $.command.run({ command: 'myna:config', args: 'chat' })).text).toBe('💬 聊天目前關閉。用 /myna:chat on 開啟。')
+  expect((await $.command.run({ command: 'myna:config', args: 'chat' })).text).toBe('💬 聊天目前關閉。用 /myna:config chat on 開啟。')
   const on1 = (await $.command.run({ command: 'myna:config', args: 'chat on' })).text
   expect(on1).toContain('聊天已開啟')
   const viaChat = (await $.command.run({ command: 'myna:chat', args: 'off' })).text
@@ -71,8 +71,21 @@ test('"!myna:config chat off" from the phone is answered by the mod, not run as 
   const done = s.posts.filter((p) => p.url.endsWith('/chat/progress') && p.body.includes('"done"'))
   expect(done.length).toBe(1)
   expect(done[0].body).toContain('/myna:config chat on')
+  expect(done[0].body).not.toContain('之後會移除')
   expect(s.markdown).toEqual([])
   expect((await $.command.run({ command: 'myna:config', args: 'chat' })).text).toContain('聊天目前關閉')
+})
+
+// Codex review r2 X6: the old !myna:chat from the phone carries the hint too, pointing at the new command
+test('"!myna:chat" from the phone answers with the hint line', async ($, on) => {
+  const s = stubs(on, [{ id: 'm1', text: '!myna:chat' }])
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/w' })
+  await s.clock.settle()
+  await s.clock.advance(2500)
+  await s.clock.settle()
+  const done = s.posts.filter((p) => p.url.endsWith('/chat/progress') && p.body.includes('"done"'))
+  expect(done.length).toBe(1)
+  expect(done[0].body).toContain('提示：!myna:chat 之後會移除，請改用 !myna:config chat on|off')
 })
 
 // Codex review r1 X3: a markdown command that fails after the mod passed it on is not run a second time by the

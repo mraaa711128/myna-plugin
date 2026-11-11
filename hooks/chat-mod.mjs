@@ -51,6 +51,7 @@ const BUILTIN_BARE_OK = new Set(["compact", "clear", "exit"]);
 const CMD_QUIET_MS = 5000;
 // /myna:chat is kept as an alias of /myna:config chat for a while (until 0.25.0 and at least 30 days)
 const CHAT_ALIAS_HINT = "提示：/myna:chat 之後會移除，請改用 /myna:config chat on|off";
+const CHAT_ALIAS_HINT_PHONE = "提示：!myna:chat 之後會移除，請改用 !myna:config chat on|off";
 // the arguments of /myna:config → what follows "chat" (lowercased, "" = the state), or null: not chat
 export function configChatArgs(args) {
   const m = /^\s*chat(?:\s+([\s\S]*?))?\s*$/i.exec(String(args ?? ""));
@@ -339,8 +340,8 @@ export const register = (on) => {
       return replyToPhone(u ? usageText(u, nick) : "📊 這個 Claude Code 版本拿不到用量資料。");
     }
     if (name === "myna:chat") {
-      if (args.toLowerCase() === "off") { replyToPhone("💬 聊天已關閉:這個 session 不再收 Telegram 訊息。要重新開啟,請在終端機執行 /myna:chat on。"); await chatCommand(args); return; }
-      return replyToPhone(await chatCommand(args, "!"));
+      if (args.toLowerCase() === "off") { replyToPhone(`💬 聊天已關閉:這個 session 不再收 Telegram 訊息。要重新開啟,請在終端機執行 /myna:config chat on。\n${CHAT_ALIAS_HINT_PHONE}`); await chatCommand(args); return; }
+      return replyToPhone(`${await chatCommand(args, "!")}\n${CHAT_ALIAS_HINT_PHONE}`);
     }
     // !myna:config chat …: as !myna:chat (our own $.command.run would skip our command.run hook and reach
     // config.mjs, which has no session); any other item runs as a command below
@@ -565,7 +566,7 @@ export const register = (on) => {
       await remember(id, { on: false });
       return "💬 聊天已關閉:這個 session 不再收 Telegram 訊息,也不回報進度。";
     }
-    if (!enabled) return "💬 聊天目前關閉。用 /myna:chat on 開啟。";
+    if (!enabled) return "💬 聊天目前關閉。用 /myna:config chat on 開啟。";
     if (!token) return `💬 聊天開啟中,但還沒連上 relay${unavailable ? `(${unavailable})` : ""}。`;
     return `💬 聊天開啟中:暱稱 ${nick}${queued ? `,${queued} 則訊息待處理` : ""}。改名用 ${p}myna:nick <名字>。`;
   }
@@ -573,7 +574,7 @@ export const register = (on) => {
   async function nickCommand(args) {
     if (!io || !cfg) return "💬 聊天模組還沒準備好,請稍後再試。";
     const want = String(args || "").trim();
-    if (!want) return nick && token ? `💬 這個 session 的暱稱是 ${nick}。` : "💬 這個 session 還沒有註冊聊天(/myna:chat on)。";
+    if (!want) return nick && token ? `💬 這個 session 的暱稱是 ${nick}。` : "💬 這個 session 還沒有註冊聊天(/myna:config chat on)。";
     const id = await io.sessionId();
     if (!token) {
       await remember(id, { nick: want });
