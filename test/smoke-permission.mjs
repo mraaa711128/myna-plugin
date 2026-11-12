@@ -4,7 +4,9 @@
 // JSON Claude Code would send on stdin, and a fake transcript stands in for the session.
 // Proves: phone ✅/❌/✍️/⏹ → the hook's decision; the terminal answering first (during the delay, or
 // after the phone was asked) → no decision and the phone's buttons retracted; earlier identical calls
-// don't count as answered; SIGTERM retracts; the relay's round end cancels a prompt whose hook died;
+// don't count as answered; SIGTERM retracts, exactly once; a hook killed without a signal (Windows) is
+// retracted by the relay that sees its poll hang up — an edge's by the edge — but a dropped poll followed
+// by a new one is not; the relay's round end cancels a prompt whose hook died;
 // relay down / flag off → the hook abstains at once; the prompt joins the session's topic unrenamed;
 // a background subagent's prompt (agent_id) outlives the main thread's round end, is cancelled at the
 // session end or by the orphan sweep, and only the subagent's own transcript counts as its answer.
@@ -14,6 +16,7 @@ import { fileURLToPath } from "node:url";
 import path from "node:path";
 import os from "node:os";
 import fs from "node:fs";
+import crypto from "node:crypto";
 
 const relayPath = fileURLToPath(new URL("../src/relay.mjs", import.meta.url));
 const hookPath = fileURLToPath(new URL("../scripts/permission-request.mjs", import.meta.url));
@@ -160,15 +163,80 @@ for (const [label, act, check] of [
   ok(r.out === "" && retracted(kb), "…the terminal then answers → no decision, the phone's buttons are retracted (\"已在終端機處理\")");
 }
 
-// 9) SIGTERM (a terminal \"No\" in the TUI, the hook timeout, the session ending) → retract
+// 9) SIGTERM (a terminal \"No\" in the TUI, the hook timeout, the session ending) → retract, exactly once.
+// macOS / Linux: the hook's own handler retracts it; Windows: kill() ends the hook without a signal, and the
+// relay retracts it once the hook's held /answer poll hung up and no new poll came (PERMISSION_GONE_MS, 3 s).
+// Both paths are live on macOS / Linux (the relay sees the hang-up after the hook's cancel): never twice.
+const retractions = (kb) => ({
+  edits: markupEdits.filter((e) => e.message_id === kb?.message_id && e.reply_markup?.inline_keyboard?.length === 0).length,
+  notes: sent.filter((s) => /已在終端機/.test(s.text || "") && s.message_thread_id === kb?.message_thread_id).length,
+});
 {
   sent.length = 0; markupEdits.length = 0;
   const h = runHook({ tool_name: "Bash", tool_input: cmdInput("echo nine") });
   const kb = await keyboardFor("echo nine");
+  await sleep(300); // the hook is in its /answer poll by now
   h.c.kill("SIGTERM");
   const r = await h.done;
-  for (let i = 0; i < 30 && !retracted(kb); i++) await sleep(100);
-  ok(r.out === "" && retracted(kb), "SIGTERM → the hook retracts the phone's question before it exits");
+  for (let i = 0; i < 60 && !retracted(kb); i++) await sleep(100);
+  ok(r.out === "" && retracted(kb), `SIGTERM → the phone's question is retracted (${process.platform === "win32" ? "by the relay: Windows has no SIGTERM handler" : "by the hook before it exits"})`);
+  await sleep(3500); // past PERMISSION_GONE_MS: the relay's own path had its chance too
+  const n = retractions(kb);
+  ok(n.edits === 1 && n.notes === 1, `…retracted exactly once (${JSON.stringify(n)})`);
+}
+
+// 9b) SIGKILL (no handler on any OS — how every stopped hook ends on Windows), no round end → the relay
+// sees the hook's poll hang up and retracts the question itself, once
+{
+  sent.length = 0; markupEdits.length = 0;
+  const h = runHook({ tool_name: "Bash", tool_input: cmdInput("echo nine-b") });
+  const kb = await keyboardFor("echo nine-b");
+  await sleep(300);
+  h.c.kill("SIGKILL"); await h.done;
+  await sleep(1000);
+  ok(!retracted(kb), "SIGKILL → right after, the relay still waits (the hook might poll again)");
+  for (let i = 0; i < 60 && !retracted(kb); i++) await sleep(100);
+  await sleep(500);
+  const n = retractions(kb);
+  ok(retracted(kb) && n.edits === 1 && n.notes === 1, `…then retracts it on its own, once, no round end needed (${JSON.stringify(n)})`);
+}
+
+// 9c) the poll's connection dropping is not the hook dying when it polls again: the question stays.
+// The same for an ask_human question (not a permission prompt): its asker's poll dropping retracts nothing.
+{
+  sent.length = 0; markupEdits.length = 0;
+  const ask = (q, extra) => fetch(`${RELAY}/ask`, { method: "POST", body: JSON.stringify({ question: q, options: ["A", "B"], session_id: "s-drop", ...extra }) }).then((r) => r.json());
+  const dropPoll = async (id) => { const ac = new AbortController(); const p = fetch(`${RELAY}/answer/${id}`, { signal: ac.signal }).catch(() => {}); await sleep(200); ac.abort(); await p; };
+  const perm = await ask("drop perm", { kind: "permission", header: "🔐 權限確認" });
+  const plain = await ask("drop plain", {});
+  const kp = await keyboardFor("drop perm"), kq = await keyboardFor("drop plain");
+  await dropPoll(perm.request_id); await dropPoll(plain.request_id);
+  await sleep(800);
+  // the permission asker comes back within the grace and keeps polling (MYNA_ANSWER_HOLD_MS=1000 here)
+  const until = Date.now() + 4000;
+  while (Date.now() < until) await fetch(`${RELAY}/answer/${perm.request_id}`).then((r) => r.json());
+  ok(!retracted(kp) && !retracted(kq), "a dropped poll followed by a new one keeps the permission prompt; a dropped ask_human poll retracts nothing");
+  // now it stops polling for good → retracted; the ask_human one still is not
+  await dropPoll(perm.request_id);
+  for (let i = 0; i < 60 && !retracted(kp); i++) await sleep(100);
+  ok(retracted(kp) && !markupEdits.some((e) => e.message_id === kq?.message_id), "…its asker gone for good → the permission prompt is retracted; the ask_human question stays");
+  await fetch(`${RELAY}/cancel/${plain.request_id}`, { method: "POST" });
+}
+
+// 9d) a hook stopped where no poll of it is open (Codex review X4): before its first poll, or between a "pending"
+// and the next poll — the relay retracts it all the same once no poll came within the grace
+{
+  sent.length = 0; markupEdits.length = 0;
+  const ask = (q) => fetch(`${RELAY}/ask`, { method: "POST", body: JSON.stringify({ question: q, options: ["A", "B"], session_id: "s-gap", kind: "permission", header: "🔐 權限確認" }) }).then((r) => r.json());
+  const never = await ask("gap never polled");
+  const kn = await keyboardFor("gap never polled");
+  const once = await ask("gap polled once");
+  const ko = await keyboardFor("gap polled once");
+  const first = await fetch(`${RELAY}/answer/${once.request_id}`).then((r) => r.json()); // held MYNA_ANSWER_HOLD_MS, then "pending"
+  const gone = (k) => markupEdits.some((e) => e.message_id === k?.message_id);
+  for (let i = 0; i < 60 && !(gone(kn) && gone(ko)); i++) await sleep(100);
+  ok(!!never.request_id && first.kind === "pending" && gone(kn) && gone(ko),
+    `no poll after /ask, or none after a "pending" → retracted within the grace (${JSON.stringify({ never: gone(kn), once: gone(ko) })})`);
 }
 
 // 10) the hook died without a word (SIGKILL) → the round end cancels its prompt; it holds nothing open
@@ -387,8 +455,88 @@ const lastAskId = async (cmd) => { for (let i = 0; i < 40; i++) { const j = awai
   await sleep(500);
   ok(!markupEdits.some((e) => e.message_id === kb?.message_id), "a worker's hook killed without a word, no round end: right after, its prompt is still there");
   for (let i = 0; i < 60 && !markupEdits.some((e) => e.message_id === kb?.message_id); i++) await sleep(100);
-  ok(markupEdits.some((e) => e.message_id === kb?.message_id), "…once older than MYNA_ORPHAN_TTL with nobody polling, the orphan sweep retracts it");
+  ok(markupEdits.some((e) => e.message_id === kb?.message_id), "…a few seconds later it is retracted with nobody polling (the relay saw the hook hang up; the orphan sweep is the net behind it, smoke-orphan)");
   relay2.kill();
+}
+
+// 18) an edge (MYNA_ROLE=edge): the hook polls this machine's edge relay, which forwards to the hub — the hub
+// only sees the edge's poll, so the edge retracts it: SIGKILL → the edge cancels it at the hub, once
+{
+  sent.length = 0; markupEdits.length = 0;
+  const HUBP = PORT + 2, REM = PORT + 3, EDGEP = PORT + 4;
+  const mid = crypto.randomBytes(6).toString("hex"), token = `myna_m_${mid}_${crypto.randomBytes(32).toString("base64url")}`;
+  const machinesFile = path.join(tmp, "machines.json");
+  fs.writeFileSync(machinesFile, JSON.stringify({ version: 1, machines: [{ id: mid, name: "edge1", sha256: crypto.createHash("sha256").update(token).digest("hex"), os: "test", hostname: "edge1", created_at: new Date().toISOString() }] }));
+  const home = path.join(tmp, "home"); fs.mkdirSync(home, { recursive: true });
+  const base = { ...process.env, HOME: home, USERPROFILE: home, MYNA_ANSWER_HOLD_MS: "1000", TELEGRAM_TOPIC_ROUND_GRACE: "0" };
+  for (const k of Object.keys(base)) if (/^(MYNA_ROLE|MYNA_UPSTREAM|MYNA_REMOTE_PORT|MYNA_MACHINE)/.test(k)) delete base[k];
+  const dir = (n) => { const d = path.join(tmp, n); fs.mkdirSync(d, { recursive: true }); return d; };
+  const hd = dir("hub"), ed = dir("edge");
+  const hubRelay = spawn(process.execPath, [relayPath], {
+    env: { ...base, MYNA_ENV: path.join(hd, ".env"), MYNA_PROVIDER: "telegram", TELEGRAM_BOT_TOKEN: "TESTTOKEN", TELEGRAM_CHAT_ID: "42", TELEGRAM_API_BASE: `http://127.0.0.1:${stub.address().port}`,
+      RELAY_PORT: String(HUBP), MYNA_REMOTE_PORT: String(REM), MYNA_MACHINES_FILE: machinesFile, MYNA_MACHINE_NAME: "hub" },
+    stdio: ["ignore", "ignore", "inherit"],
+  });
+  const edgeRelay = spawn(process.execPath, [relayPath], {
+    env: { ...base, MYNA_ENV: path.join(ed, ".env"), RELAY_PORT: String(EDGEP), MYNA_ROLE: "edge", MYNA_UPSTREAM: `http://127.0.0.1:${REM}`, MYNA_MACHINE_TOKEN: token, MYNA_UPSTREAM_CHECK_MS: "250" },
+    stdio: ["ignore", "ignore", "inherit"],
+  });
+  let active = false;
+  for (let i = 0; i < 100 && !active; i++) { try { active = !!(await (await fetch(`http://127.0.0.1:${EDGEP}/health`, { signal: AbortSignal.timeout(500) })).json())?.upstream?.active; } catch {} if (!active) await sleep(100); }
+  ok(active, "edge: the edge relay is up and forwards to the hub");
+  const h = runHook({ session_id: "s-edge", tool_name: "Bash", tool_input: cmdInput("echo edge18") }, { port: EDGEP });
+  const kb = await keyboardFor("echo edge18");
+  await sleep(300);
+  h.c.kill("SIGKILL"); await h.done;
+  await sleep(1000);
+  ok(!!kb && !retracted(kb), "edge: right after the hook is killed, the question is still on the phone (it might poll again)");
+  for (let i = 0; i < 80 && !retracted(kb); i++) await sleep(100);
+  await sleep(500);
+  const n = retractions(kb);
+  ok(retracted(kb) && n.edits === 1 && n.notes === 1, `edge: …then the edge cancels it at the hub, once (${JSON.stringify(n)})`);
+  // SIGTERM: on macOS / Linux the hook cancels it itself (through the edge), and the edge must not again
+  sent.length = 0; markupEdits.length = 0;
+  const h2 = runHook({ session_id: "s-edge", tool_name: "Bash", tool_input: cmdInput("echo edge18b") }, { port: EDGEP });
+  const kb2 = await keyboardFor("echo edge18b");
+  await sleep(300);
+  h2.c.kill("SIGTERM"); await h2.done;
+  for (let i = 0; i < 80 && !retracted(kb2); i++) await sleep(100);
+  await sleep(3500);
+  const n2 = retractions(kb2);
+  ok(retracted(kb2) && n2.edits === 1 && n2.notes === 1, `edge: SIGTERM → retracted exactly once (${JSON.stringify(n2)})`);
+  // asked through the edge, polled once to a "pending", then no more polls (Codex review X4) → retracted
+  sent.length = 0; markupEdits.length = 0;
+  const g = await fetch(`http://127.0.0.1:${EDGEP}/ask`, { method: "POST", body: JSON.stringify({ question: "edge gap", options: ["A", "B"], session_id: "s-edge", kind: "permission", header: "🔐 權限確認" }) }).then((r) => r.json());
+  const kg = await keyboardFor("edge gap");
+  const p1 = await fetch(`http://127.0.0.1:${EDGEP}/answer/${g.request_id}`).then((r) => r.json());
+  for (let i = 0; i < 80 && !markupEdits.some((e) => e.message_id === kg?.message_id); i++) await sleep(100);
+  ok(p1.kind === "pending" && markupEdits.some((e) => e.message_id === kg?.message_id), `edge: a "pending" and then no poll → the edge cancels it at the hub (${p1.kind})`);
+  hubRelay.kill(); edgeRelay.kill();
+}
+
+// 19) the relay and the hook gone at once (Codex review r2 X6): the relay restarted with the prompt in its
+// journal and no hook polling → retracted the same way, a few seconds after the start
+{
+  sent.length = 0; markupEdits.length = 0;
+  const P3 = PORT + 5, files3 = { MYNA_TOPICS_FILE: path.join(tmp, "topics3.json"), MYNA_PENDING_FILE: path.join(tmp, "pending3.json"), MYNA_TELEGRAM_CHAT_FILE: path.join(tmp, "chat3.json") };
+  const start3 = async () => {
+    const c = spawn(process.execPath, [relayPath], {
+      env: { ...process.env, MYNA_ENV: path.join(tmp, "no-such-env"), MYNA_PROVIDER: "telegram", TELEGRAM_BOT_TOKEN: "TESTTOKEN", TELEGRAM_CHAT_ID: "42",
+        TELEGRAM_API_BASE: `http://127.0.0.1:${stub.address().port}`, RELAY_PORT: String(P3), MYNA_ANSWER_HOLD_MS: "1000", TELEGRAM_TOPIC_ROUND_GRACE: "0", ...files3 },
+      stdio: ["ignore", "ignore", "inherit"],
+    });
+    for (let i = 0; i < 50; i++) { try { await fetch(`http://127.0.0.1:${P3}/health`, { signal: AbortSignal.timeout(500) }); break; } catch { await sleep(100); } }
+    return c;
+  };
+  let r3 = await start3();
+  const q = await fetch(`http://127.0.0.1:${P3}/ask`, { method: "POST", body: JSON.stringify({ question: "restart gap", options: ["A", "B"], session_id: "s-restart", kind: "permission", header: "🔐 權限確認" }) }).then((r) => r.json());
+  const kq = await keyboardFor("restart gap");
+  const dead = new Promise((r) => r3.once("exit", r));
+  r3.kill("SIGKILL"); await dead;   // gone at once with its hook: nothing polls, nothing cancels
+  r3 = await start3();
+  for (let i = 0; i < 80 && !markupEdits.some((e) => e.message_id === kq?.message_id); i++) await sleep(100);
+  ok(!!q.request_id && markupEdits.some((e) => e.message_id === kq?.message_id), "relay restarted with a permission prompt nobody polls → retracted a few seconds after the start");
+  r3.kill();
 }
 
 relay.kill(); stub.close(); clearTimeout(watchdog);

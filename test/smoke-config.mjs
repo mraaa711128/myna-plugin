@@ -16,6 +16,7 @@ import { fileURLToPath } from "node:url";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { privateProblem } from "./helpers/private-mode.mjs";
 import { register, configChatArgs, CHAT_CONFIG_PURPOSE, CHAT_CONFIG_VALUES } from "../hooks/chat-mod.mjs";
 
 const HERE = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -174,10 +175,11 @@ for (const args of [["autopilot", "yes"], ["intercept", "status"], ["brief", "on
   ok(r.rc === 0 && /環境變數 TELEGRAM_TOPICS=off 有設/.test(r.out) && fs.readFileSync(ENV, "utf8").includes("TELEGRAM_TOPICS=auto"), "TELEGRAM_TOPICS in the environment → still written, and it says the variable wins");
   // written by a rename (Codex review r1 X1): no temp file left, the mode kept, a link stays a link
   ok(!fs.readdirSync(path.join(a, ".myna")).some((f) => f.endsWith(".tmp")), "no temp file left next to .env");
+  if (process.platform !== "win32") fs.chmodSync(ENV, 0o600);
+  await cfg(["perm-delay", "5"], a);
+  { const bad = privateProblem(ENV); ok(!bad, `.env stays 0600 after a write (Windows: this user's ACL only, on every write)${bad ? ` — ${bad}` : ""}`); }
+  // links: Windows makes symbolic links only in Developer Mode or as an administrator, so not here
   if (process.platform !== "win32") {
-    fs.chmodSync(ENV, 0o600);
-    await cfg(["perm-delay", "5"], a);
-    ok((fs.statSync(ENV).mode & 0o777) === 0o600, ".env stays 0600 after a write");
     const real = path.join(TMP, "dotfiles.env"), l = newHome(), link = path.join(l, ".myna", ".env");
     fs.writeFileSync(real, "OTHER=1\n"); fs.symlinkSync(real, link);
     await cfg(["topics", "off"], l);
@@ -216,7 +218,8 @@ for (const args of [["autopilot", "yes"], ["intercept", "status"], ["brief", "on
   const text = fs.readFileSync(ENV, "utf8");
   ok(rs.every((x) => x.rc === 0) && ["KEEP", "K1", "K2", "K3", "K4"].every((k) => text.includes(`${k}=1\n`)) && !fs.existsSync(`${ENV}.lock`),
     `4 writers at once, each slow between read and write → all 4 keys and the old one kept, the lock gone (${JSON.stringify(text)})`);
-  // one writer through a link, one through the real path (Codex review of f2e0818, X4): the same lock
+  // one writer through a link, one through the real path (Codex review of f2e0818, X4): the same lock.
+  // Not on Windows: symbolic links need Developer Mode or an administrator there
   if (process.platform !== "win32") {
     const real = path.join(TMP, "linked.env"), l = newHome(), link = path.join(l, ".myna", ".env");
     fs.writeFileSync(real, "KEEP=1\n"); fs.symlinkSync(real, link);
@@ -382,12 +385,13 @@ function engine({ dir = path.join(TMP, "eng0"), root = "/w", sid = "s-1" } = {})
 
 // 8) more from the review of be0da2e: a new .env is 0600 and stays so; hub on checks the role again under the lock
 {
-  if (process.platform !== "win32") {
+  {
     const h = newHome(), E = path.join(h, ".myna", ".env");
     await cfg(["topics", "off"], h);
-    const m1 = fs.statSync(E).mode & 0o777;
+    const bad1 = privateProblem(E);
     await run("configure.mjs", ["telegram", "123:abc"], h);
-    ok(m1 === 0o600 && (fs.statSync(E).mode & 0o777) === 0o600, `a .env created by /myna:config is 0600, still 0600 after configure writes a token (${m1.toString(8)})`);
+    const bad2 = privateProblem(E);
+    ok(!bad1 && !bad2, `a .env created by /myna:config is 0600 (Windows: this user's ACL only), still so after configure writes a token${bad1 || bad2 ? ` — ${bad1 || ""} ${bad2 || ""}` : ""}`);
   }
   // hub on starts while the lock is held; meanwhile .env becomes an edge's (a join finished): hub refuses
   const h = newHome(), E = path.join(h, ".myna", ".env");

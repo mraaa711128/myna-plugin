@@ -399,6 +399,18 @@ ok(/設定檔 session（~\/\.myna\/\.env）／keep（環境變數）／600s（�
   ok(!r.out.includes(half) && /\*\*\*/.test(r.out), "16 the token's second half alone (log, Telegram error) → redacted");
 }
 
+// 17 — the relay could not make an owner-only file private (0.26.3: /health private_files; Windows icacls failing)
+h = home({ env: `TELEGRAM_BOT_TOKEN=${TOKEN}\n`, log: [startLine(iso(-59000))] });
+tgAnswers = {};
+pair = { chat: { id: "123456", type: "private", title: "Alex" }, pairing: false };
+health = hubHealth(iso(-60000), { private_files: { file: path.join(h.H, ".myna", "relay-secret"), error: "icacls: ENOENT", at: iso(-50000) } });
+r = await run(h);
+ok(/⚠ 敏感檔沒辦法設成只有你讀得到：~[\\/]\.myna[\\/]relay-secret（icacls: ENOENT）/.test(r.out) && /relay-secret 設成只有你讀得到（icacls: ENOENT）.*icacls/.test(nextOf(r.out)),
+  "17 /health private_files → a ⚠ line under relay and a next step");
+health = hubHealth(iso(-60000), { private_files: null });
+r = await run(h);
+ok(!/敏感檔/.test(r.out), "17 private_files null → nothing about it");
+
 relay.closeAllConnections?.(); tg.closeAllConnections?.();
 await Promise.all([new Promise((x) => relay.close(x)), new Promise((x) => tg.close(x))]);
 try { fs.rmSync(TMP, { recursive: true, force: true }); } catch {}

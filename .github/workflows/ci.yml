@@ -10,8 +10,21 @@ permissions:
 
 jobs:
   build-and-test:
-    runs-on: ubuntu-latest
+    # Windows too (v0.26.3): owner-only files there are an ACL (icacls), and a stopped permission hook gets no
+    # signal — both are tested on the platform itself. The same steps on both; every step runs in bash
+    # (Git Bash on Windows), so the daemon step's printf and the dist check work as they are.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
     steps:
+      # keep LF line endings on Windows: the files are byte-for-byte what Linux checks out
+      - if: runner.os == 'Windows'
+        run: git config --global core.autocrlf false
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:

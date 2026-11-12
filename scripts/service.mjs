@@ -64,8 +64,9 @@ if (cmd === "on") {
   if (process.env.MYNA_ENV) rec.env = path.resolve(process.env.MYNA_ENV);
   try {
     fs.mkdirSync(serviceDir(), { recursive: true });
-    writeAtomic(startFile(), START_MJS);
-    writeAtomic(recordFile(), JSON.stringify(rec, null, 2) + "\n");
+    // this user's only, like the rest of ~/.myna (v0.26.3): what runs at login and where it points
+    writeAtomic(startFile(), START_MJS, undefined, { secret: true });
+    writeAtomic(recordFile(), JSON.stringify(rec, null, 2) + "\n", undefined, { secret: true });
   } catch (e) { fail(`${serviceDir()} 寫不進去（${e.message}）。沒有登記。`); }
   console.log(`myna service：${startFile()}、service.json → ${root}（v${version}）${rec.env ? `，.env：${rec.env}` : ""}`);
   const envPath = envPathFor(rec), port = portFor(envPath), log = path.join(path.dirname(envPath), "relay.log");

@@ -19,6 +19,7 @@ import fs from "node:fs";
 import crypto from "node:crypto";
 import * as inbox from "../src/inbox.mjs";
 import { readKey } from "../hooks/chat-mod.mjs";
+import { eventualPrivateProblem } from "./helpers/private-mode.mjs";
 
 // MYNA_TEST_ROOT=<another checkout> runs the relay, the chat mod and /myna:files of that code (0.21.1 → the
 // file checks fail; the pure parts above them always test this checkout's helpers)
@@ -158,7 +159,8 @@ let firstPath;
     `document in the topic → text = untrusted line + local path + caption:\n${m?.text}`);
   ok(m?.file_path && path.isAbsolute(m.file_path) && path.dirname(m.file_path) === fs.realpathSync.native(sdirA) && fs.readFileSync(m.file_path).equals(d.bytes),
     `…the file is in this session's inbox folder, byte for byte (${m?.file_path})`);
-  if (!WIN) ok((fs.statSync(m.file_path).mode & 0o777) === 0o600 && (fs.statSync(sdirA).mode & 0o777) === 0o700, "…file 0600, folder 0700");
+  const fileBad = await eventualPrivateProblem(m.file_path), dirBad = await eventualPrivateProblem(sdirA, { dir: true }); // Windows: set in the background
+  ok(!fileBad && !dirBad, `…file 0600, folder 0700 (Windows: ACLs of this user only)${fileBad || dirBad ? ` — ${fileBad || ""} ${dirBad || ""}` : ""}`);
   ok(!fs.readdirSync(sdirA).some((f) => f.endsWith(".part")), "…no .part left behind");
 }
 
@@ -331,6 +333,9 @@ let firstPath;
   sendDoc({ thread: tA, name: "new.pdf" });
   // the new file is saved (and the prune done) before anything is taken
   await until(async () => (JSON.parse(fs.readFileSync(CHAT_FILE, "utf8")).sessions["s-a"].inbox || []).some((m) => m.file?.name === "new.pdf"), 6000);
+  // the prune runs alongside the download (it never holds up the relay), so the new file can be in before the
+  // prune is done (seen on a busy Windows machine) — wait for the prune itself
+  await until(async () => !fs.existsSync(old8), 6000);
   const got = await takeAll(A.token, 2);
   const late = got.find((m) => m.text.includes("late.pdf")), fresh = got.find((m) => m.text.includes("new.pdf"));
   ok(!fs.existsSync(old8) && fs.existsSync(old2) && fresh?.file_path && fs.existsSync(fresh.file_path), "a new file prunes what came > 7 days ago, keeps the 2-day-old one");

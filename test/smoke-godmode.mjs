@@ -34,6 +34,7 @@ import { fileURLToPath } from "node:url";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { privateProblem } from "./helpers/private-mode.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const src = (...p) => path.join(ROOT, ...p);
@@ -197,7 +198,8 @@ fs.writeFileSync(PERM, "off\n"); // God mode does not depend on /myna:perm
   ok(allowed(r) && r.ms < 6000, `3: relay down → still allowed (${r.ms} ms)`);
   ok(u.length === 1 && /God mode 已自動同意｜myproj/.test(u[0].text) && /rm -rf build/.test(u[0].text) && u[0].session_id && u[0].reason && !Number.isNaN(Date.parse(u[0].at)) && u[0].tool === "Bash",
     `3: …the notice kept in the unsent file with time, session, tool and reason (${u[0]?.reason})`);
-  if (process.platform !== "win32") ok((fs.statSync(UNSENT).mode & 0o077) === 0, "3: the unsent file is private (0600)");
+  const unsentBad = privateProblem(UNSENT);
+  ok(!unsentBad, `3: the unsent file is private (0600; Windows: this user's ACL only)${unsentBad ? ` — ${unsentBad}` : ""}`);
 }
 {
   hubTg.refuse = true;

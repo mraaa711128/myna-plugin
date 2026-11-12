@@ -10,6 +10,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import crypto from "node:crypto";
+import { restrictToOwner, privateTempPath, sealTemp, writePrivate } from "./private-file.mjs";
 
 // Remote protocol version. An integer, separate from the plugin version: it changes only when an
 // existing endpoint, header or field changes incompatibly — new endpoints/fields do not bump it.
@@ -140,14 +141,8 @@ export function upstreamUrl(raw) {
   return { url: `${u.origin}${u.pathname.replace(/\/+$/, "")}` };
 }
 
-// write a file only this user can read (0600; on Windows the user profile's ACL protects it)
-export function writePrivate(file, text) {
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  const tmp = `${file}.${process.pid}.tmp`;
-  fs.writeFileSync(tmp, text, { mode: 0o600 });
-  try { fs.renameSync(tmp, file); } catch { fs.writeFileSync(file, text, { mode: 0o600 }); try { fs.unlinkSync(tmp); } catch {} }
-  try { fs.chmodSync(file, 0o600); } catch {}
-}
+// write a file only this user can read (0600; on Windows an ACL of this user only — src/private-file.mjs)
+export { writePrivate };
 
 // --- machines.json (hub) ---------------------------------------------------------------------------
 // {version:1, machines:[{id, name, sha256, os, hostname, created_at, revoked_at?}]} — token HASHES only;
@@ -266,7 +261,7 @@ export function withFileLock(file, fn, { waitMs = LOCK_WAIT_MS } = {}) {
 // once each keep the other's change. The rename is tried a few times (Windows: a scanner holding the file);
 // only if it still fails is the file written in place, as these writers always did, and only then can a
 // crash in the middle leave it partly written. The file's mode is kept; a new one is 0600 (it holds the bot
-// tokens); a link keeps pointing where it did (its target is written; a target not there yet is created
+// tokens; on Windows every write leaves it this user's only — src/private-file.mjs); a link keeps pointing where it did (its target is written; a target not there yet is created
 // through the link, as a plain write would). fn may throw to refuse: nothing is written, the lock is
 // released, the error goes to the caller. → what fn returned.
 // The lock sits next to the file actually written: a link is resolved first, so one program going through
@@ -287,15 +282,20 @@ export function updateEnvFile(envPath, fn) {
     if (typeof out !== "string") return out;
     let target = envPath, mode = 0o600, dangling = false;
     try { if (fs.lstatSync(envPath).isSymbolicLink()) { try { target = fs.realpathSync(envPath); } catch { dangling = true; } } } catch {}
-    if (dangling) { fs.writeFileSync(envPath, out, { mode }); return out; }
+    // Windows has no mode to keep: the temp file is born this user's only (privateTempPath, sealTemp), and a
+    // file written in place is made so — it holds the bot tokens. A dangling link: the file it names, which
+    // the write creates (lockOn), not the link — the link may sit in ~/.myna and point elsewhere.
+    const winPrivate = (f) => { if (process.platform === "win32") restrictToOwner(f); };
+    if (dangling) { fs.writeFileSync(envPath, out, { mode }); winPrivate(lockOn); return out; }
     try { mode = fs.statSync(target).mode & 0o777; } catch {}
-    const tmp = `${target}.${process.pid}.tmp`;
+    const tmp = privateTempPath(target);
     try {
       fs.writeFileSync(tmp, out, { mode });
       fs.chmodSync(tmp, mode); // the umask may have narrowed it
+      if (process.platform === "win32") sealTemp(tmp);
       for (let i = 0; ; i++) {
         try { fs.renameSync(tmp, target); break; }
-        catch (e) { if (i >= 4) { fs.writeFileSync(target, out); break; } sleepSync(50); }
+        catch (e) { if (i >= 4) { fs.writeFileSync(target, out); winPrivate(target); break; } sleepSync(50); }
       }
     } finally { try { fs.rmSync(tmp, { force: true }); } catch {} }
     return out;

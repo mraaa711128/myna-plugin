@@ -9,6 +9,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { privateTempPath, sealTemp } from "./private-file.mjs";
 
 // fixed place, NOT next to MYNA_ENV: start.mjs has to find service.json without any environment
 export const serviceDir = () => path.join(os.homedir(), ".myna", "service");
@@ -33,10 +34,14 @@ export function compareVersions(a, b) {
 // With `expect` (the text read before deciding): the file is read again right before the rename and left
 // alone (returns false) when someone else changed it meanwhile — no lock, but the window shrinks to the
 // moment between that read and the rename.
-export function writeAtomic(file, text, expect) {
-  const tmp = `${file}.${process.pid}-${crypto.randomBytes(4).toString("hex")}.tmp`;
+// `secret`: the file is this user's only, like Myna's other files in ~/.myna (src/private-file.mjs: 0600, on
+// Windows the folder's owner-only ACL) — for ~/.myna/service. The OS registration files (plist, unit, the
+// Startup .vbs) are ordinary files the OS reads.
+export function writeAtomic(file, text, expect, { secret = false } = {}) {
+  const tmp = secret ? privateTempPath(file) : `${file}.${process.pid}-${crypto.randomBytes(4).toString("hex")}.tmp`;
   try {
-    fs.writeFileSync(tmp, text);
+    fs.writeFileSync(tmp, text, secret ? { mode: 0o600 } : undefined);
+    if (secret) sealTemp(tmp); // the rename carries it over
     if (expect !== undefined) {
       let now = null;
       try { now = fs.readFileSync(file, "utf8"); } catch {}
@@ -67,7 +72,7 @@ export function updatePointer({ root, version, envPath = process.env.MYNA_ENV ||
   if (!(cmp > 0 || (cmp === 0 && gone && path.resolve(rec.root || ".") !== path.resolve(root)))) return "kept";
   // someone else (another session's ensure-relay, a `service.mjs on`) wrote it since we read it: theirs
   // stands — re-deciding on their record is the next ensure-relay's job
-  return writeAtomic(file, JSON.stringify({ ...rec, root, version }, null, 2) + "\n", text) ? "updated" : "raced";
+  return writeAtomic(file, JSON.stringify({ ...rec, root, version }, null, 2) + "\n", text, { secret: true }) ? "updated" : "raced";
 }
 
 // The file the OS runs at login. Its text never depends on the myna version: an upgrade does not need to

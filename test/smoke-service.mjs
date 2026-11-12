@@ -21,6 +21,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { START_MJS, startupVbs } from "../src/service.mjs";
+import { privateProblem } from "./helpers/private-mode.mjs";
 
 const HERE = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const ROOT = process.env.MYNA_TEST_ROOT ? path.resolve(process.env.MYNA_TEST_ROOT) : HERE;
@@ -110,6 +111,9 @@ try {
     ok(r.status === 0 && read(START) === START_MJS, `${platform}: on wrote the fixed start.mjs`);
     ok(rec?.root === ROOT && rec?.version === VERSION && rec?.node === process.execPath && !("env" in rec), `${platform}: service.json = {root, version, node} (no env without MYNA_ENV): ${JSON.stringify(rec)}`);
     ok(registered(), `${platform}: the (fake) OS registration is there`);
+    // like the rest of ~/.myna (v0.26.3): this user's only (Unix 0600; Windows the ACL, read back with icacls)
+    const priv = [START, REC].map((f) => privateProblem(f)).filter(Boolean);
+    ok(priv.length === 0, `${platform}: start.mjs and service.json are this user's only${priv.length ? ` — ${priv.join("; ")}` : ""}`);
     const cs = calls(F);
     if (platform === "darwin") {
       const plist = read(regFile) || "";
@@ -366,7 +370,7 @@ try {
       const d = path.join(TMP, "roots", name);
       fs.mkdirSync(path.join(d, "scripts"), { recursive: true }); fs.mkdirSync(path.join(d, "src"), { recursive: true });
       fs.copyFileSync(ENSURE, path.join(d, "scripts", "ensure-relay.mjs"));
-      fs.copyFileSync(path.join(ROOT, "src", "service.mjs"), path.join(d, "src", "service.mjs"));
+      for (const f of ["service.mjs", "private-file.mjs"]) fs.copyFileSync(path.join(ROOT, "src", f), path.join(d, "src", f));
       fs.writeFileSync(path.join(d, "package.json"), JSON.stringify({ name: "myna-plugin", version }));
       return path.join(d, "scripts", "ensure-relay.mjs");
     };
@@ -384,6 +388,8 @@ try {
     r = ens(NEW);
     let rec = JSON.parse(read(REC));
     ok(rec.root === NEW_ROOT && rec.version === "99.0.0" && rec.node === "/x/node" && /login start \(myna service\) now uses v99\.0\.0/.test(r.out), "newer ensure-relay → root/version updated, node kept, says so");
+    const p = privateProblem(REC);
+    ok(!p, `… the rewritten service.json is still this user's only${p ? ` — ${p}` : ""}`);
 
     let before = put({ root: NEW_ROOT, version: "99.0.0", node: "/x/node" });
     r = ens(OLD);

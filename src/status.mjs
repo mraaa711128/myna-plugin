@@ -273,6 +273,8 @@ export async function collect(cfg, opts = {}) {
   } else {
     const h = health.h;
     Object.assign(relay, { running: true, version: h.version, started_at: h.started_at || null, role: h.role || "hub", provider: h.provider, pending: h.pending, machine: h.machine, ...(h.node ? { node: h.node } : {}) });
+    // an owner-only file (relay secret, chat file, …) the relay could not restrict (0.26.3+; Windows: icacls)
+    if (h.private_files?.error) relay.private_files = { file: String(h.private_files.file || ""), error: String(h.private_files.error), at: h.private_files.at || null };
     relay.compare = h.version ? Math.sign(compareVersions(h.version, version)) : null; // -1 older, 0 same, 1 newer
   }
   if (!relay.running) {
@@ -450,6 +452,7 @@ export function nextSteps(d) {
   const old = r.running && (r.legacy || r.compare === -1);
   if (old) out.push("relay 比這個 plugin 舊：/myna:relay restart。");
   if (r.running && r.compare === 1) out.push("relay 比這個 plugin 新：/plugin update 更新 plugin。");
+  if (r.private_files) out.push(`relay 沒辦法把 ${tildePath(r.private_files.file)} 設成只有你讀得到（${r.private_files.error}）：Windows 確認 icacls 能用、檔案所在的磁碟支援權限設定，修好後 /myna:relay restart。`);
   const differs = t?.topic_settings?.differs || d.relay_differs?.role || d.relay_differs?.provider;
   if (!old && (differs || d.env_changed_since_start)) out.push(`relay 用的設定跟設定檔不同（或 ${envPath} 在 relay 啟動後改過）：/myna:relay restart 後才會照設定檔。`);
   else if (!old && t?.bot_maybe_other) out.push("（推測）Telegram 這幾項是用這個 session 的 bot token 查的，relay 可能用別支；要確定就 /myna:relay restart 再跑一次 /myna:status。");

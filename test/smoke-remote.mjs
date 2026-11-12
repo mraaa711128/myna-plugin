@@ -25,6 +25,7 @@ import { fileURLToPath } from "node:url";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { privateProblem } from "./helpers/private-mode.mjs";
 
 const HERE = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const ROOT = process.env.MYNA_TEST_ROOT ? path.resolve(process.env.MYNA_TEST_ROOT) : HERE;
@@ -214,8 +215,8 @@ if (jm) tap(jm, 0, 0);
 const joinRc = await Promise.race([joinDone, sleep(10000).then(() => "timeout")]);
 const A_TOKEN_FILE = path.join(A_DIR, "machine-token");
 const aToken = fs.existsSync(A_TOKEN_FILE) ? fs.readFileSync(A_TOKEN_FILE, "utf8").trim() : "";
-ok(joinRc === 0 && /^myna_m_[a-f0-9]{12}_/.test(aToken), `✅ tapped → join.mjs exits 0 and saves the token (rc=${joinRc})`);
-ok(process.platform === "win32" || (fs.statSync(A_TOKEN_FILE).mode & 0o777) === 0o600, "machine-token is 0600");
+ok(joinRc === 0 && /^myna_m_[a-f0-9]{12}_/.test(aToken), `✅ tapped → join.mjs exits 0 and saves the token (rc=${joinRc})${joinRc !== 0 ? `: ${joinOut.slice(-400)}` : ""}`);
+{ const bad = privateProblem(A_TOKEN_FILE); ok(!bad, `machine-token is 0600 (Windows: this user's ACL only)${bad ? ` — ${bad}` : ""}`); }
 const aEnv = fs.readFileSync(A_ENV, "utf8");
 ok(/^MYNA_ROLE=edge$/m.test(aEnv) && new RegExp(`^MYNA_UPSTREAM=${tunnel.url}$`, "m").test(aEnv), ".env now has MYNA_ROLE=edge and MYNA_UPSTREAM=<hub URL>");
 const machinesText = fs.existsSync(MACHINES) ? fs.readFileSync(MACHINES, "utf8") : "";
@@ -355,8 +356,10 @@ ok(r?.json?.role === "edge" && r.json.upstream.machine === "mbp" && r.json.upstr
 // pc2: its OWN bot (id 222222) as the fallback; config from the environment (MYNA_MACHINE_TOKEN), no .env file
 const botB = await botStub();
 const EB = freePort(), EDGE_B = `http://127.0.0.1:${EB}`;
-fs.mkdirSync(path.join(TMP, "pc2"), { recursive: true });
-startEdge(EB, { MYNA_ENV: path.join(TMP, "pc2", ".env"), MYNA_ROLE: "edge", MYNA_UPSTREAM: tunnel.url, MYNA_MACHINE_TOKEN: bToken, ...CF_ENV,
+// pc2 in its own ~/.myna (HOME = TMP/pc2), as on a real machine: its recovery is timed below to the check, and on
+// Windows a file outside ~/.myna would cost an icacls run on every edge-state write (src/private-file.mjs)
+fs.mkdirSync(path.join(TMP, "pc2", ".myna"), { recursive: true });
+startEdge(EB, { HOME: path.join(TMP, "pc2"), USERPROFILE: path.join(TMP, "pc2"), MYNA_ENV: path.join(TMP, "pc2", ".myna", ".env"), MYNA_ROLE: "edge", MYNA_UPSTREAM: tunnel.url, MYNA_MACHINE_TOKEN: bToken, ...CF_ENV,
   TELEGRAM_BOT_TOKEN: "222222:PC2-SECRET", TELEGRAM_CHAT_ID: "42", TELEGRAM_API_BASE: botB.url, TELEGRAM_TOPIC_ROUND_GRACE: "0" });
 r = await until(async () => { const x = await req(`${EDGE_B}/health`); return x.json?.upstream?.active ? x : null; });
 ok(r?.json?.own_bot?.on === true && r.json.own_bot.id === "telegram:222222" && !!(await until(() => botB.polls > 0, 3000)), `pc2's edge keeps its own bot (telegram:222222) polling as the fallback`);
@@ -438,9 +441,9 @@ ok(r.json?.ended === true, `mbp's round-end for "same-sid" is not held up by pc2
 {
   const PERM = ["✅ 允許", "❌ 拒絕"];
   const pw = await ask(EDGE_A, { kind: "permission", question: "mbp worker 權限", options: PERM, session_id: "perm-sid", agent_id: "a0123456789abcdef" });
-  const kw = await keyboardWith(/mbp worker 權限/);
-  let polling = true; // the worker's hook, polling through the edge
+  let polling = true; // the worker's hook, polling through the edge at once (as the real hook does)
   const poll = (async () => { for (;;) { const x = await req(`${EDGE_A}/answer/${pw.json?.request_id}`); if (!polling || (x.json && x.json.kind !== "pending")) return x; } })();
+  const kw = await keyboardWith(/mbp worker 權限/);
   await sleep(300);
   r = await req(`${EDGE_A}/session/round-end`, { method: "POST", body: { session_id: "perm-sid" } });
   const open = (await req(`${HUB}/requests`)).json?.requests?.find((x) => x.request_id === pw.json?.request_id);

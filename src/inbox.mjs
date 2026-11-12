@@ -12,6 +12,7 @@ import os from "node:os";
 import path from "node:path";
 import crypto from "node:crypto";
 import { APPROVES_HIDDEN_RANGES } from "./providers/util.mjs";
+import { restrictToOwner } from "./private-file.mjs";
 
 export const MAX_FILE_BYTES = 20 * 1024 * 1024; // the Bot API's download limit (getFile)
 export const KEEP_DEFAULT_DAYS = 7;
@@ -88,7 +89,11 @@ export async function save({ dir, sid, name, body, maxBytes = MAX_FILE_BYTES, sh
   const sdir = sessionDir(dir, sid);
   const final = path.resolve(sdir, name), part = `${final}.part`;
   if (!inside(path.resolve(inboxDir(dir)), final) || path.dirname(final) !== path.resolve(sdir)) throw fail("write", "path outside the inbox");
-  try { fs.mkdirSync(sdir, { recursive: true, mode: 0o700 }); } catch (e) { throw fail("write", e.message); }
+  let made;
+  try { made = fs.mkdirSync(sdir, { recursive: true, mode: 0o700 }); } catch (e) { throw fail("write", e.message); }
+  // a folder new to this save is made this user's only, inherited by what is written in it (Windows: in ~/.myna
+  // that is ~/.myna's own, once); in a folder from an older version each file is made so on its own, below
+  if (made) restrictToOwner(sdir, { dir: true });
   let st = null;
   try { st = fs.lstatSync(final); } catch {}
   if (st) {
@@ -101,6 +106,7 @@ export async function save({ dir, sid, name, body, maxBytes = MAX_FILE_BYTES, sh
   const hash = crypto.createHash("sha256");
   let n = 0, fd;
   try { fd = fs.openSync(part, "w", 0o600); } catch (e) { throw fail("write", e.message); }
+  if (!made || process.platform !== "win32") restrictToOwner(part); // before a byte of it is written
   try {
     for await (const chunk of body) {
       const b = Buffer.from(chunk);

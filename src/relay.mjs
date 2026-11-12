@@ -77,6 +77,7 @@ import { createEdgeChat } from "./edge-chat.mjs";
 import { applyNetAttemptTimeout } from "./net.mjs";
 import { createNode, treeSettings, nodeFiles, JOIN_ALLOW as NODE_JOIN_ALLOW } from "./node.mjs";
 import { godmodeOn, appendUnsent } from "./godmode.mjs";
+import { lastPrivateFileProblem } from "./private-file.mjs";
 import {
   PROTOCOL, PROTOCOL_HEADER, ENROLL_SECRET_HEADER, REQUEST_ID_HEADER, VERSION_HEADER, FEATURES, LOCAL_ID, NAME_RE, CODE_RE, ASK_MAX_BYTES_DEFAULT,
   roleOf, machinesFile, seenFile, machineStore, newMachineId, newMachineToken, sha256hex, sameHex, bearerOf,
@@ -293,6 +294,25 @@ function cancelPermissions(sid, why) {
     resolveRequest(id, { kind: "cancelled", reason: why });
   }
   return kept;
+}
+// The PermissionRequest hook holds an /answer poll the whole time its prompt is open (it polls right after
+// /ask answers, and again right after each "pending"), so the poll's connection closing before the relay
+// answered — or no poll coming after /ask or after a "pending" — means the hook is gone: stopped by Claude
+// Code (a terminal "No", the hook timeout, the session ending). On macOS / Linux its SIGTERM handler retracts the prompt
+// itself (POST /cancel, sent before it exits, so the prompt is already over here); on Windows it is killed
+// without a signal and cannot — so the relay does, once PERMISSION_GONE_MS passed with no new poll (the
+// hook re-polls after a failed poll within ~1 s; it must not lose its prompt to a dropped connection).
+// The same cancel as the hook's own: the phone's buttons retracted, "已在終端機處理". A local asker only:
+// an edge's held poll closing says nothing about its hook (the edge cancels through /cancel, edgeAnswer).
+const PERMISSION_GONE_MS = 3000;
+function permissionAskerGone(id, entry) {
+  const seen = entry.polls;
+  setTimeout(() => {
+    if (pending.get(id) !== entry || entry.result !== undefined || entry.detached || entry.holders > 0 || entry.polls !== seen) return;
+    log(`request ${id}: the permission hook hung up and did not poll again — cancelling`);
+    Promise.resolve(provider.cancelQuestion?.(id)).catch((e) => log("cancelQuestion err", e.message));
+    resolveRequest(id, { kind: "cancelled", reason: "asker gone" });
+  }, PERMISSION_GONE_MS).unref?.();
 }
 // sessions whose last round end left a subagent's permission prompt open because its hook still
 // polled. A stopped subagent's hook is killed (on Windows without a signal: it cannot retract) and its
@@ -700,7 +720,7 @@ if (EDGE) hub.sendHeld = async () => {
       if (hub.failStatus(r.status)) { hub.markDown(hub.why(r.status, j)); break; }
       if (r.status === 429) break; // the hub's rate limit: the rest goes out with the next good check
       hub.queued.delete(id);
-      if (r.status === 200 && j?.request_id === id) { hub.forwarded.set(id, { at: Date.now() }); log(`edge: question ${id} held since ${hhmm(q.at)} — sent to the hub`); }
+      if (r.status === 200 && j?.request_id === id) { hub.forwarded.set(id, { at: Date.now(), ...(args.kind === "permission" ? { permission: true } : {}) }); log(`edge: question ${id} held since ${hhmm(q.at)} — sent to the hub`); }
       else { hub.results.set(id, { kind: "unreachable", error: `the hub refused the held question (HTTP ${r.status}${j?.error ? `: ${j.error}` : ""})` }); log(`edge: question ${id}: the hub refused it (HTTP ${r.status})`); }
       hub.save();
     }
@@ -807,6 +827,8 @@ async function handleAsk(req, res, scope, pre) {
   }
   finally { delete entry.inFlight; entry.lastPoll = Date.now(); } // its asker starts polling now
   send(res, 200, { request_id });
+  // a permission hook polls at once: one stopped before its first poll is gone too (permissionAskerGone)
+  if (!scope.remote && args.kind === "permission" && entry.result === undefined) permissionAskerGone(request_id, entry);
 }
 
 // God mode and ✅ questions (v0.26.2; the human, 2026-11-12: everything God mode does stays inside myna).
@@ -927,6 +949,9 @@ async function handleAnswer(res, id, scope) {
   let timer, wake;
   const held = new Promise((r) => { timer = setTimeout(() => r(undefined), ANSWER_HOLD_MS); wake = () => r(undefined); entry.wake.add(wake); });
   entry.holders++;
+  entry.polls = (entry.polls || 0) + 1;
+  // a permission prompt's hook hanging up mid-poll: stop holding, and retract it unless the hook polls again
+  if (!scope.remote && entry.meta?.kind === "permission") res.on("close", () => { if (!res.writableEnded) { wake(); permissionAskerGone(id, entry); } });
   const result = await Promise.race([entry.promise, held]);
   clearTimeout(timer); entry.wake.delete(wake);
   entry.holders--; entry.lastPoll = Date.now();
@@ -934,6 +959,8 @@ async function handleAnswer(res, id, scope) {
   if (entry.detached) { res.writeHead(200, json); res.end(detachedReply()); return; }
   if (result === undefined) {
     res.writeHead(200, json); res.end(JSON.stringify({ kind: "pending" }));
+    // the hook polls again at once: one stopped between two polls is gone too (permissionAskerGone)
+    if (!scope.remote && entry.meta?.kind === "permission" && res.writableEnded) permissionAskerGone(id, entry);
     return;
   }
   deliver(result);                         // answered while we held
@@ -1200,6 +1227,49 @@ async function edgeAnswer(req, res, id) {
   if (hub.reachable) return edgeAnswer(req, res, id);
   send(res, 200, { kind: "pending" });
 }
+// cancel a question this edge forwarded to the hub or holds for it: the client's POST /cancel, or its
+// permission hook hanging up (edgeWatchPoll). → {json} | {relay: hub reply} | null (nothing known: drop)
+async function edgeCancel(id) {
+  edgePolls.delete(id);
+  // a held question the client gave up on (answered in the terminal): it never goes out — and if a send
+  // may have reached the hub, it is cancelled there once it is back
+  if (hub.queued.has(id) || hub.results.has(id)) {
+    const q = hub.queued.get(id);
+    hub.queued.delete(id); hub.results.delete(id);
+    if (q?.tried) hub.abandoned.add(id);
+    hub.save(); return { json: { cancelled: !!q } };
+  }
+  if (hub.reachable) { const r = await edgeForward({ method: "POST" }, `/cancel/${id}`, "{}", 10000); if (r.ok) { hub.forwarded.delete(id); hub.save(); return { relay: r }; } }
+  if (hub.forwarded.has(id)) { hub.forwarded.delete(id); hub.abandoned.add(id); hub.save(); return { json: { cancelled: true, queued: true } }; }
+  return null;
+}
+// The edge side of permissionAskerGone: this machine's permission hook polls the edge, and the hub only sees
+// the edge's own poll — so the edge retracts a forwarded (or held) permission prompt whose hook is gone (no
+// poll within PERMISSION_GONE_MS after /ask, after a poll ended, or after one hung up), the same way as the
+// hook's own POST /cancel. Kept for permission prompts only, dropped once the prompt is over here.
+const edgePolls = new Map(); // permission request id -> {polls, held}: the local hook's /answer polls (runtime only)
+const edgeIsPermission = (id) => !!hub.forwarded.get(id)?.permission || (hub.queued.has(id) && jsonOf(hub.queued.get(id).body).v?.kind === "permission");
+function edgeArm(id) {
+  const w = edgePolls.get(id) || { polls: 0, held: 0 };
+  edgePolls.set(id, w);
+  const seen = w.polls;
+  setTimeout(async () => {
+    if (edgePolls.get(id) !== w || w.held > 0 || w.polls !== seen) return;
+    if (!edgeIsPermission(id)) { edgePolls.delete(id); return; }
+    log(`edge: request ${id}: the permission hook is gone (no poll) — cancelling`);
+    try { await edgeCancel(id); } catch (e) { log("edge cancel err", e.message); }
+  }, PERMISSION_GONE_MS).unref?.();
+}
+function edgeWatchPoll(id, res) {
+  if (!edgeIsPermission(id)) return;
+  const w = edgePolls.get(id) || { polls: 0, held: 0 };
+  w.polls++; w.held++; edgePolls.set(id, w);
+  res.on("close", () => {
+    w.held--;
+    if (edgeIsPermission(id)) edgeArm(id);          // still open: the next poll has to come
+    else if (!w.held && edgePolls.get(id) === w) edgePolls.delete(id); // over (answered, cancelled, given up)
+  });
+}
 async function edgeRoute(req, res, url) {
   const p = url.pathname, M = req.method;
   if ((M === "GET" && p === "/health") || (M === "POST" && p === "/shutdown") || p === "/attest") return false;
@@ -1222,6 +1292,7 @@ async function edgeRoute(req, res, url) {
   if (M === "GET" && am) {
     const id = am[1];
     if (pending.has(id)) return false;
+    edgeWatchPoll(id, res);
     // a held question: still waiting for the hub (pending, queued) — or how it ended
     if (hub.results.has(id)) { const r = hub.results.get(id); hub.results.delete(id); hub.save(); send(res, 200, r); return true; }
     if (hub.queued.has(id)) {
@@ -1239,17 +1310,9 @@ async function edgeRoute(req, res, url) {
     const id = cm[1];
     if (pending.has(id)) return false;
     await readBody(req, SMALL_BODY_BYTES);
-    // a held question the client gave up on (answered in the terminal): it never goes out — and if a send
-    // may have reached the hub, it is cancelled there once it is back
-    if (hub.queued.has(id) || hub.results.has(id)) {
-      const q = hub.queued.get(id);
-      hub.queued.delete(id); hub.results.delete(id);
-      if (q?.tried) hub.abandoned.add(id);
-      hub.save(); send(res, 200, { cancelled: !!q }); return true;
-    }
-    if (hub.reachable) { const r = await edgeForward(req, `/cancel/${id}`, "{}", 10000); if (r.ok) { hub.forwarded.delete(id); hub.save(); return relayBack(res, r), true; } }
-    if (hub.forwarded.has(id)) { hub.forwarded.delete(id); hub.abandoned.add(id); hub.save(); send(res, 200, { cancelled: true, queued: true }); return true; }
-    dropConn(req); return true;
+    const c = await edgeCancel(id);
+    if (!c) dropConn(req); else if (c.relay) relayBack(res, c.relay); else send(res, 200, c.json);
+    return true;
   }
   if (M === "POST" && p === "/ask") {
     const pre = await readBody(req, ASK_MAX_BYTES);
@@ -1260,7 +1323,13 @@ async function edgeRoute(req, res, url) {
       // there once the hub is back — a copy that might exist does not stay answerable
       const rid = crypto.randomBytes(5).toString("hex");
       const r = await edgeForward(req, "/ask", pre.body, 30000, { [REQUEST_ID_HEADER]: rid });
-      if (r.ok) { if (r.status === 200 && r.json?.request_id) { hub.forwarded.set(String(r.json.request_id), { at: Date.now() }); hub.save(); } relayBack(res, r); return true; }
+      if (r.ok) {
+        const perm = jsonOf(pre.body).v?.kind === "permission";
+        if (r.status === 200 && r.json?.request_id) { hub.forwarded.set(String(r.json.request_id), { at: Date.now(), ...(perm ? { permission: true } : {}) }); hub.save(); }
+        relayBack(res, r);
+        if (perm && r.status === 200 && r.json?.request_id) edgeArm(String(r.json.request_id)); // its hook polls at once
+        return true;
+      }
       // the send may have reached the hub: held, it goes out again under the same id (the hub answers it
       // with the same request); not held, it is given up and cancelled there once the hub is back
       if (hold().on) { holdAsk(res, rid, pre.body, true); return true; }
@@ -1309,6 +1378,8 @@ function holdAsk(res, id, body, tried) {
   hub.save();
   log(`hub away (${hub.reason}) — question ${id} held for it (${hub.queued.size} held)`);
   send(res, 200, { request_id: id, queued: true });
+  if (args.kind === "permission") edgeArm(id); // its hook polls at once
+
 }
 const holdHealth = () => {
   const s = hold(), oldest = Math.min(...[...hub.queued.values()].map((q) => q.at));
@@ -1340,6 +1411,7 @@ const server = http.createServer(async (req, res) => {
     if (EDGE) open += hub.forwarded.size + hub.queued.size; // questions waiting on (or held for) the hub count too
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({ ok: true, name: "myna-relay", version: VERSION, provider: provider.name, pid: process.pid, root: ROOT, started_at: STARTED_AT, pending: open, detached: [...pending.values()].filter((p) => p.detached).length, handoff: true, attest: true, approval_ttl_ms: APPROVAL_TTL_MS, journal: PENDING_FILE, chat: !!provider.chatOpen, chat_sessions: chat.count(), net_attempt_ms: NET_ATTEMPT_MS,
+      private_files: lastPrivateFileProblem(), // null, or the last owner-only file it could not restrict (src/private-file.mjs)
       role: ROLE, protocol: PROTOCOL, machine: MACHINE_NAME, ...(EDGE ? edgeHealth() : {}), remote: REMOTE_PORT ? { port: REMOTE_PORT, listening: remoteListening, machines: machines.active().length, joining: [...joins.values()].filter((j) => j.status === "pending").length } : null,
       ...(TREE_CONFIGURED ? { node: node.health() } : {}) }));
     return;
@@ -1463,6 +1535,11 @@ server.listen(PORT, "127.0.0.1", () => {
   if (adopted && (adopted.open || adopted.answered)) log(`adopted ${adopted.open} open gate(s) + ${adopted.answered} answered-uncollected (${adopted.detached} detached) from the previous relay (v${adopted.from || "?"}, journal ${adopted.saved_at}) — buttons already on the phone stay valid`);
   if (EDGE) log(`edge → hub ${hub.url} (${hub.reachable ? "reachable" : `not reachable: ${hub.reason}`}; CF Access headers ${hub.cf ? "on" : "off"}); own bot: ${ownBot.on ? `${ownBot.id || provider.name} — fallback while the hub is away` : ownBot.reason}`);
   provider.start();
+  // permission prompts from before a restart: their hooks poll this relay again within a second or two (they
+  // retry a failed poll every second); one whose hook died too (e.g. with the machine's relay) is retracted
+  // like any other whose hook is gone — the same grace from now
+  for (const [id, p] of pending) if (p.meta?.kind === "permission" && p.result === undefined && !p.detached && !p.machine_id) permissionAskerGone(id, p);
+  if (EDGE) { for (const id of hub.forwarded.keys()) if (edgeIsPermission(id)) edgeArm(id); for (const id of hub.queued.keys()) if (edgeIsPermission(id)) edgeArm(id); }
   // the tree transport (its own listener on MYNA_NODE_PORT, the link to its parent) — only once this
   // process owns the local port, like the remote listener below
   node.start().catch((e) => log("node: start failed:", e.message));
