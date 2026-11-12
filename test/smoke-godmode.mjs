@@ -521,6 +521,14 @@ const script = (name, args, extra = {}) => spawnSync(process.execPath, [src("scr
   out = gm("off");
   ok(!fs.existsSync(AP) && /已經是關的/.test(out), "9: off before, turned off by hand meanwhile → stays off");
 
+  // on since before 0.26.2 (the flag holds only its time): `on` again brings autopilot along, the time kept
+  fs.rmSync(AP, { force: true });
+  fs.writeFileSync(GOD, "2026-11-12T01:00:00.000Z");
+  out = gm("on");
+  ok(/^godmode /.test(read(AP) || "") && read(GOD) === "2026-11-12T01:00:00.000Z\nautopilot-before: off\n" && /補上 autopilot 的連動/.test(out), `9: a flag from before 0.26.2 → on again brings autopilot along, its time kept (${JSON.stringify(read(GOD))})`);
+  out = gm("off");
+  ok(!fs.existsSync(AP) && /autopilot 也關回去了/.test(out), "9: …and off takes it back");
+
   // /myna:config godmode does the same (it runs the same script)
   let r = script("config.mjs", ["godmode", "on"]);
   ok(/^godmode /.test(read(AP) || ""), "9: /myna:config godmode on → autopilot on too");

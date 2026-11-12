@@ -768,7 +768,9 @@ export function create(cfg, ctx) {
   const GODMODE_TOPIC_FILE = cfg.MYNA_GODMODE_TOPIC_FILE
     || path.join(path.dirname(cfg.MYNA_ENV || path.join(os.homedir(), ".myna", ".env")), "telegram-godmode-topic.json");
   let godTopic = (() => { try { const j = JSON.parse(fs.readFileSync(GODMODE_TOPIC_FILE, "utf8")); return j?.thread && j.chat != null ? j : null; } catch { return null; } })();
-  let godCreating = null, godRetryAt = 0;
+  // per chat: a create under way (notices at the same time share it), and a refused create's retry time (a
+  // re-pair to another chat does not inherit it). In memory: a relay restart tries again once — one call.
+  const godCreating = new Map(), godRetryAt = new Map();
   const saveGodTopic = () => {
     try {
       if (!godTopic) return fs.rmSync(GODMODE_TOPIC_FILE, { force: true });
@@ -780,9 +782,9 @@ export function create(cfg, ctx) {
   function godmodeThread(chat) {
     if (!TOPICS) return Promise.resolve(undefined);
     if (godTopic && String(godTopic.chat) === chat) return Promise.resolve(godTopic.thread);
-    if (Date.now() < godRetryAt) return Promise.resolve(undefined);
+    if (Date.now() < (godRetryAt.get(chat) || 0)) return Promise.resolve(undefined);
     // notices at the same time share one create (two would leave an unused topic behind)
-    godCreating ||= (async () => {
+    if (!godCreating.has(chat)) godCreating.set(chat, (async () => {
       try {
         const res = await tg("createForumTopic", { chat_id: chat, name: GODMODE_TOPIC });
         const thread = res.ok ? res.result?.message_thread_id : undefined;
@@ -793,12 +795,12 @@ export function create(cfg, ctx) {
         }
         // refused (no Threaded Mode, not a forum, no rights) → wait before trying again; unreachable → next notice tries
         const refused = res.error_code !== undefined;
-        if (refused) godRetryAt = Date.now() + GODMODE_RETRY_MS;
+        if (refused) godRetryAt.set(chat, Date.now() + GODMODE_RETRY_MS);
         log(`godmode: no topic (${res.description || res.error || "createForumTopic failed"}) — this notice goes to the main view${refused ? `; next try in ${GODMODE_RETRY_MS / 60000} min` : ""}`);
         return undefined;
-      } finally { godCreating = null; }
-    })();
-    return godCreating;
+      } finally { godCreating.delete(chat); }
+    })());
+    return godCreating.get(chat);
   }
   // → where it went ("topic <thread>" / "main view"), for the relay's log line
   async function sendNotice(text) {

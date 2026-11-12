@@ -479,7 +479,7 @@ session：example-app 11/12 14:03・3f9a1c2e
 /myna:config godmode on|off   # 同一個開關
 ```
 
-- **順便打開 autopilot(v0.26.2):** `/myna:godmode on` 時 autopilot 原本關著就一起打開(帶 `recommendedIndex` 的題目自動選建議選項,照 autopilot 原本的方式記進 `MYNA-DECISIONS`,`mode: "auto"`);`/myna:godmode off` 時還原成開之前的狀態:原本開著就保持開著,原本關著就關掉。God mode 開著時你另外用 `/myna:autopilot on|off` 切過,就以你最後的操作為準,`off` 不動它、輸出寫一行說明。`/myna:godmode` 和 `/myna:status` 會顯示 autopilot 現在是不是 God mode 帶開的。
+- **順便打開 autopilot(v0.26.2):** `/myna:godmode on` 時 autopilot 原本關著就一起打開(帶 `recommendedIndex` 的題目自動選建議選項,照 autopilot 原本的方式記進 `MYNA-DECISIONS`,`mode: "auto"`);`/myna:godmode off` 時還原成開之前的狀態:原本開著就保持開著,原本關著就關掉。God mode 開著時你另外用 `/myna:autopilot on|off` 切過,就以你最後的操作為準,`off` 不動它、輸出寫一行說明。`/myna:godmode` 和 `/myna:status` 會顯示 autopilot 現在是不是 God mode 帶開的。0.26.2 以前就開著的 God mode,升級後不會自己帶動 autopilot,再跑一次 `/myna:godmode on` 就會補上(開啟時間不變)。
 - **誰回答哪種題目:** 帶 `approves` 的 ✅ 核准題 → God mode 自動按(autopilot 本來就碰不到這種題目);有 `recommendedIndex` 的一般題 → autopilot 選建議選項;兩者都沒有的一般題 → 照舊問你。
 - **範圍是整台機器:** 這台所有 session、背景 subagent 都算,關掉前一直有效(重開機也還在),沒有時限。多台機器各自開關(每台讀自己的 `~/.myna/godmode`)。
 - **包含別的工具攔下來要問人的動作:** 例如護欄 hook(PreToolUse 回 `ask`)跳出的確認框,也會被自動允許。`settings.json` 的 `permissions.deny` 規則和 hook 直接回 `deny` 的動作**照樣擋住**(Claude Code 規定 hook 的允許蓋不過 deny),也不會有確認框。
