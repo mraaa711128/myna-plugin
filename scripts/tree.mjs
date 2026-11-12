@@ -89,16 +89,26 @@ async function serveOn(port, servePort) {
   if (!r.ok) fail(`tailscale ${args.join(" ")} 失敗：${(r.err || r.out).trim()}\n（Windows 可能要先開 unattended mode；tailnet 要開 HTTPS 憑證。）`);
   say(`tailscale serve：tailnet :${servePort}（TLS）→ PROXY v1 → 127.0.0.1:${port}`);
 }
-async function serveOff(servePort) {
+// turn off this node's own serve entry — only when it still is ours (the port may have been given to something
+// else since); a failure stops the command before any setting changes
+async function serveOff(port, servePort) {
+  const st = await ts.run(["serve", "status", "--json"]);
+  let cur;
+  try { cur = st.ok ? JSON.parse(st.out || "{}")?.TCP?.[String(servePort)] ?? null : undefined; } catch { cur = undefined; }
+  if (cur === undefined) fail(`讀不到 tailscale serve status（${(st.err || st.out).trim() || "?"}），沒有改任何設定。`);
+  if (!cur) { say(`tailscale serve :${servePort} 本來就沒有設定`); return; }
+  if (!JSON.stringify(cur).includes(`127.0.0.1:${port}`)) { say(`tailscale serve :${servePort} 現在指到別的地方（${JSON.stringify(cur)}），不是這個節點的，不動它`); return; }
   const r = await ts.run(["serve", `--tls-terminated-tcp=${servePort}`, "off"]);
-  say(r.ok ? `tailscale serve :${servePort} 已關掉` : `tailscale serve :${servePort} 關不掉（${(r.err || r.out).trim()}）— 用 tailscale serve status 看一下`);
+  if (!r.ok) fail(`tailscale serve :${servePort} 關不掉（${(r.err || r.out).trim()}），沒有改任何設定。用 tailscale serve status 看一下。`);
+  say(`tailscale serve :${servePort} 已關掉`);
 }
 // with a bot: the owner binds a Telegram account before tree mode turns on (M4) — needs the listener (the
 // bind link opens through it). Exit 2 with how; the same command again continues.
 async function ensureListenerAndBinding(self, { requireBinding }) {
   const port = S.port || DEFAULT_NODE_PORT;
-  if (!S.port) editEnv({ MYNA_NODE_PORT: String(port) });
   await serveOn(port, S.servePort);
+  // without a bot there is nothing to bind and nothing else would start the relay: the mode goes on at once
+  if (!S.port || !botKind()) editEnv({ MYNA_NODE_PORT: String(port), ...(botKind() ? {} : { MYNA_TRANSPORT: "tree" }) });
   let h = await health();
   if (!h?.node?.listener?.listening || h.node.listener.port !== port) h = await restart((x) => x.node?.listener?.listening, " 開好 tree 的 listener");
   if (!requireBinding || !botKind()) return h;
@@ -140,7 +150,7 @@ export async function hubTree(argv) {
     const self = await me();
     if (!self.login && !readJson(F.parent)?.owner) fail("這台是 tagged 裝置（沒有使用者帳號），owner 要由上層在加入時指派：先 /myna:join tree <上層網址>。沒有改任何設定。");
     await ensureListenerAndBinding(self, { requireBinding: !!self.login });
-    if (S.tree && i < 0) { const h = await health(); if (h?.node?.tree) { say(`tree 模式已經開著（${h.node.name}，owner ${h.node.owner}）。下層用 /myna:join tree https://${self.dns_name}:${S.servePort} --name <名稱> 加入。`); process.exit(0); } }
+    if (i < 0) { const h = await health(); if (h?.node?.tree) { say(`tree 模式已經開著（${h.node.name}，owner ${h.node.owner}）。下層用 /myna:join tree https://${self.dns_name}:${S.servePort} --name <名稱> 加入。`); process.exit(0); } }
     editEnv({ MYNA_TRANSPORT: "tree" });
     const h = await restart((x) => x.node?.tree && x.node?.listener?.listening, " 進入 tree 模式");
     say(`tree 模式開了：這台是 ${h.node.name}，owner ${h.node.owner}。`);
@@ -149,9 +159,16 @@ export async function hubTree(argv) {
   }
   if (sub === "off") {
     for (const k of ["MYNA_TRANSPORT", "MYNA_NODE_PORT"]) if (String(process.env[k] ?? "").trim()) fail(`${k} 是環境變數設定的，優先於 .env，關不掉。先移除這個環境變數。沒有改任何設定。`);
+    if (S.port) await serveOff(S.port, S.servePort);
     editEnv({}, ["MYNA_TRANSPORT", "MYNA_NODE_PORT"]);
-    if (S.port) await serveOff(S.servePort);
-    await restart((x) => !x.node?.tree, " 離開 tree 模式");
+    if (botKind()) await restart((x) => !x.node?.tree, " 離開 tree 模式");
+    else {
+      // no bot: without the tree this relay has nothing to run (ensure-relay would not start it) — stop it
+      try { await fetch(`http://127.0.0.1:${relayPort}/shutdown`, { method: "POST", signal: AbortSignal.timeout(1500) }); } catch {}
+      const until = Date.now() + 5000;
+      while (Date.now() < until && (await health())) await sleep(150);
+      say((await health()) ? "relay 還在跑，用 /myna:relay stop 停掉" : "這台沒有 bot，relay 已停止（tree 模式關掉後它沒有事做）");
+    }
     say(`tree 模式關了。${path.basename(F.children)}、綁定檔留著，之後再開照舊有效。${readJson(F.parent) ? "這台接上層的設定（node-parent.json）也留著，tree 模式關著時不會用。" : ""}`);
     process.exit(0);
   }

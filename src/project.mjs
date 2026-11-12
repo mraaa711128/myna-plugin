@@ -3,7 +3,16 @@
 // same project. Azure DevOps paths (…/<project>/_git/<repo>) keep their organization: org/project/repo.
 // No remote (not a git repo) → dir:<folder name>. The relay computes it once, from what the session
 // froze at its start, and locks it (a later registration with another project is refused).
-const clean = (s) => { let v = String(s || ""); try { v = decodeURIComponent(v); } catch {} return v.trim().toLowerCase(); };
+
+// characters that must never reach a header line a session reads: C0/C1 controls (line breaks included),
+// zero-width and direction marks, the Unicode line/paragraph separators, BOM. Built from code points: a
+// literal U+2028 in a regex literal would end the line.
+const range = (a, b) => `${String.fromCharCode(a)}-${String.fromCharCode(b)}`;
+export const UNSAFE_CHARS = `\\x00-\\x1f\\x7f-\\x9f${range(0x200b, 0x200f)}${range(0x2028, 0x202e)}${range(0x2060, 0x2069)}${String.fromCharCode(0xfeff)}`;
+const UNSAFE_RE = new RegExp(`[${UNSAFE_CHARS}]`, "g");
+// one safe line: every such character becomes a space (an encoded %0A in a remote, a newline in a folder name)
+export const oneLineSafe = (s) => String(s ?? "").replace(UNSAFE_RE, " ").replace(/\s+/g, " ").trim();
+const clean = (s) => { let v = String(s || ""); try { v = decodeURIComponent(v); } catch {} return oneLineSafe(v).toLowerCase(); };
 const stripGit = (s) => s.replace(/\.git$/i, "").replace(/\/+$/, "");
 
 export function projectOfRemote(remote) {
@@ -34,6 +43,6 @@ export function projectOfRemote(remote) {
 export function projectOf({ remote, root } = {}) {
   const p = projectOfRemote(remote);
   if (p) return { project: p, project_source: "git" };
-  const dir = String(root || "").replace(/[\\/]+$/, "").split(/[\\/]/).pop() || "";
+  const dir = oneLineSafe(String(root || "").replace(/[\\/]+$/, "").split(/[\\/]/).pop() || "");
   return { project: `dir:${dir.toLowerCase() || "?"}`, project_source: "dir" };
 }

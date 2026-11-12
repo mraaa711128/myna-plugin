@@ -173,14 +173,23 @@ export function readKey(p) {
 }
 export const parentOf = (p) => String(p).replace(/[\\/][^\\/]*$/, "");
 
+// control / zero-width / direction / line-separator characters (as src/project.mjs UNSAFE_CHARS), built from
+// code points: a literal U+2028 inside a regex literal would end the line
+const cpRange = (a, b) => `${String.fromCharCode(a)}-${String.fromCharCode(b)}`;
+const UNSAFE_RE = new RegExp(`[\\x00-\\x1f\\x7f-\\x9f${cpRange(0x200b, 0x200f)}${cpRange(0x2028, 0x202e)}${cpRange(0x2060, 0x2069)}${String.fromCharCode(0xfeff)}]`, "g");
+const LINE_BREAKS = new RegExp(`\\r\\n|[\\r\\n${String.fromCharCode(0x2028, 0x2029)}]`);
 // A message another session sent (relay ≥ 0.25.0, tree transport: via "session"): the header line is made
 // here from what the relay stamped (its address, owner, project) and the text goes under it quoted, every
 // line "> " — so nothing in the text can pass for a header of its own.
 export function peerText(m) {
+  // every stamp on one line: a line break (or a control / bidi / zero-width character) in one must not start
+  // a line of its own outside the quote
+  const one = (s) => String(s ?? "").replace(UNSAFE_RE, " ").replace(/\s+/g, " ").trim();
   const p = m?.peer && typeof m.peer === "object" ? m.peer : {};
-  const meta = [p.owner, p.project].filter((x) => typeof x === "string" && x).join(" · ");
-  const body = String(m?.text ?? "").split(/\r?\n/).map((l) => `> ${l}`).join("\n");
-  return `[Myna · 來自 session ${m?.from || "?"}${meta ? `（${meta}）` : ""}] 要回覆就用 message_session(to: "${m?.from || "?"}")\n${body}`;
+  const meta = [p.owner, p.project].filter((x) => typeof x === "string" && x).map(one).join(" · ");
+  const from = one(m?.from) || "?";
+  const body = String(m?.text ?? "").split(LINE_BREAKS).map((l) => `> ${l}`).join("\n");
+  return `[Myna · 來自 session ${from}${meta ? `（${meta}）` : ""}] 要回覆就用 message_session(to: "${from}")\n${body}`;
 }
 const MAY_READ_MAX = 500;
 

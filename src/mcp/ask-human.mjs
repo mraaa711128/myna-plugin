@@ -195,7 +195,9 @@ function envFileValue(key) {
     return m ? m[1].trim() : "";
   } catch { return ""; }
 }
-const treeOn = () => String(process.env.MYNA_TRANSPORT ?? envFileValue("MYNA_TRANSPORT")).trim().toLowerCase() === "tree";
+// the relay's rule: with the old multi-machine settings (MYNA_ROLE=edge, MYNA_REMOTE_PORT) the tree stays off
+const setting = (k) => String(process.env[k] ?? envFileValue(k)).trim();
+const treeOn = () => setting("MYNA_TRANSPORT").toLowerCase() === "tree" && setting("MYNA_ROLE").toLowerCase() !== "edge" && !setting("MYNA_REMOTE_PORT");
 const MESSAGE_SESSION_TOOL = {
   name: "message_session",
   description:

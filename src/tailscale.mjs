@@ -29,7 +29,9 @@ export function parseWhois(j) {
   const n = j?.Node;
   if (!n || typeof n.StableID !== "string" || !n.StableID) return null;
   const tags = Array.isArray(n.Tags) ? n.Tags.map(String).sort() : [];
-  const login = !tags.length && typeof j.UserProfile?.LoginName === "string" && j.UserProfile.LoginName ? j.UserProfile.LoginName.toLowerCase() : null;
+  // a tagged device's UserProfile is the placeholder "tagged-devices" — never a user
+  const ln = typeof j.UserProfile?.LoginName === "string" ? j.UserProfile.LoginName.trim().toLowerCase() : "";
+  const login = !tags.length && ln && ln !== "tagged-devices" ? ln : null;
   return { stable_id: n.StableID, name: trimDot(n.Name || n.ComputedName || ""), addrs: (Array.isArray(n.Addresses) ? n.Addresses : []).map((a) => normIp(String(a).replace(/\/\d+$/, ""))), login, tags };
 }
 // the identity a device stands for: tailscale:<login>, or null for a tagged one (its owner is assigned at join)

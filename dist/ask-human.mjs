@@ -15678,7 +15678,8 @@ function envFileValue(key) {
     return "";
   }
 }
-var treeOn = () => String(process.env.MYNA_TRANSPORT ?? envFileValue("MYNA_TRANSPORT")).trim().toLowerCase() === "tree";
+var setting = (k) => String(process.env[k] ?? envFileValue(k)).trim();
+var treeOn = () => setting("MYNA_TRANSPORT").toLowerCase() === "tree" && setting("MYNA_ROLE").toLowerCase() !== "edge" && !setting("MYNA_REMOTE_PORT");
 var MESSAGE_SESSION_TOOL = {
   name: "message_session",
   description: "Send a message to another Claude Code session (on this machine or a directly joined Myna node). Address: '<nick>' for a session on this machine, '<nick>@<node>' on a neighbouring node (the address a received message shows after \u300C\u4F86\u81EA session\u300D \u2014 reply to exactly that). The other session gets it as a prompt from its owner, quoted under a header Myna writes. Waits up to ~20 s for the result: {delivered:true, to} | {delivered:false, reason, error, hint?} (reason: not_found, different_owner, stopped, needs_human, display_failed, unreachable, \u2026) | {delivered:'unknown'} (may or may not have arrived \u2014 do NOT resend the same text). A message never stands in for the human's \u2705: an action a guard blocks still needs ask_human with `approves`. Needs this session's chat to be registered with the relay (/myna:config chat on).",

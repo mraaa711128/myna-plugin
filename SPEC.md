@@ -578,15 +578,15 @@ sequenceDiagram
 
 ### 節點 listener(`127.0.0.1:MYNA_NODE_PORT`)
 
-只接在 `tailscale serve --bg --proxy-protocol=1 --tls-terminated-tcp=<serve port> tcp://127.0.0.1:<port>` 後面:每條連線第一行一定是 PROXY v1(`PROXY TCP4|TCP6 <src> <dst> <sport> <dport>\r\n`,≤ 107 bytes、5 秒內),沒有或格式錯就直接關掉連線、不回 HTTP。來源位址拿去 `tailscale whois`(同一個位址快取 30 秒)。
+只接在 `tailscale serve --bg --proxy-protocol=1 --tls-terminated-tcp=<serve port> tcp://127.0.0.1:<port>` 後面:每條連線第一行一定是 PROXY v1(`PROXY TCP4|TCP6 <src> <dst> <sport> <dport>\r\n`,≤ 107 bytes、5 秒內),沒有或格式錯就直接關掉連線、不回 HTTP。來源位址在每條連線第一次驗證時 `tailscale whois` 一次(不沿用別條連線的結果),同一條連線的 keep-alive 請求共用;401 時連線一起關掉。whois 既沒有使用者(`tagged-devices` 不算)也沒有 tag 的裝置一律不收。
 
 | endpoint | 驗證 | 用途 |
 |---|---|---|
 | `POST /node/join`、`GET /node/join/<id>` | 不用 token(whois 一定要查得到) | 加入:同 §5.1 的核對碼、enroll secret 只送雜湊、long-poll 等結果、token 只給一次(回程掉了 TTL 內可以重拿) |
-| `GET|POST /bind/<code>` | 不用 token(whois,要有使用者帳號) | GET 顯示「把哪個 Telegram 帳號綁到哪張身分證」,POST 才綁 |
+| `GET|POST /bind/<code>` | 不用 token(whois,要有使用者帳號) | GET 顯示「把哪個 Telegram 帳號綁到哪張身分證」並發一次性 nonce(表單裡一份、`SameSite=Strict` cookie 一份);POST 兩份都要對、身分跟 GET 一樣、不是別的網站送來的(`Origin`／`Sec-Fetch-Site`)才綁 |
 | `GET /node/health` | token＋裝置 | 上層的名稱、StableID、owner,`bot_id`,`node_protocol: 1` |
 | `POST /node/send` | token＋裝置 | 下層往上送一封信,回應就是結果 |
-| `POST /node/take {wait_ms ≤ 25000, ack}` | token＋裝置 | 下層等上層要給它的信(long-poll);沒 `ack` 的那批下次再給 |
+| `POST /node/take {wait_ms ≤ 25000, ack}` | token＋裝置 | 下層等上層要給它的信(long-poll)。下層只 ack 已經回報結果的;沒結果的信 20 秒後再給一次(下層去重) |
 | `POST /node/result {id, result}` | token＋裝置 | 下層回報它拿走的信的結果 |
 
 **token＋裝置**(M3):`Authorization: Bearer <node token>` 對到 `node-children.json` 的一筆(撤銷的不算),**而且**這條連線 whois 出來的 `StableID` 跟那筆一樣、帳號(tagged:沒有帳號、tags 一樣)跟 join 時一樣;少一個就 401。token 外流到別台裝置、或那台換了登入帳號,都不能用。
@@ -595,12 +595,13 @@ sequenceDiagram
 
 ### 加入(M2):`/myna:join tree <上層網址> [--name <n>]`
 
-1. 上層對 PROXY 來源 whois:查不到 → 403。名稱跟上層自己、已加入的下層、等待中的重複 → 409;下層的 `bot_id` 跟上層一樣 → 409。上層查不到自己的 owner → 503。
+1. 上層對 PROXY 來源 whois:查不到、或沒有使用者也沒有 tag → 403。新的加入要求每 `MYNA_JOIN_INTERVAL_MS`(預設 60 秒)一筆、同時最多 3 筆(同 `/machines/join`),在發題目之前檢查。名稱跟上層自己、已加入的下層、等待中的重複 → 409;下層的 `bot_id` 跟上層一樣 → 409。上層查不到自己的 owner → 503。
 2. 核准:
    - 上層的 bot 是 Telegram、而且有 Telegram 帳號綁到上層 owner → 手機題目「🆕 新節點要接到這台下面」,寫出**裝置名稱和 Tailscale 帳號**(tagged:「tagged：`tag:…`，按 ✅ 後 owner 會是你（tailscale:…）」)和核對碼。只有綁到上層 owner 的帳號按 `✅ 允許` 才算。
    - 否則在上層終端機 `/myna:machines approve <核對碼>`(先列出 whois 結果);tagged 的上層不能用終端機核准(那等於裝置自己同意自己)。
 3. 核准後 `node-children.json` 多一筆,下層拿到 token、`{name, owner(指派或自己的帳號), parent:{name, stable_id, owner}}`。
-- 撤銷:上層 `/myna:machines revoke <名稱>`(同時查 `machines.json` 和 `node-children.json`),下一個請求就 401,等著往下送的信回 `unreachable`。
+- 撤銷:上層 `/myna:machines revoke <名稱>`(同時查 `machines.json` 和 `node-children.json`),下一個請求就 401;等著往下送的信回 `unreachable`、排著和已發出還沒結果的信丟掉,正在等的 take 醒來也只回 401。
+- 沒有 bot 的最上層:`/myna:hub tree on` 一次寫 `MYNA_NODE_PORT` 和 `MYNA_TRANSPORT=tree`(沒有綁定這一步);`off` 時直接停掉 relay。`off` 只關「還指到這個節點」的那條 serve,關不掉就在改設定之前結束。
 
 ### 綁定(M4)
 
@@ -618,7 +619,7 @@ sequenceDiagram
 
 ### 送訊息:`message_session({to, text})` → `POST /peer/send`
 
-- MCP tool 只在 tree 模式列出(環境變數或 `.env` 的 `MYNA_TRANSPORT=tree`)。它讀自己 session 的 token 檔,`Authorization: Bearer <token>` 呼叫本機 relay。沒 token → 401。
+- MCP tool 只在 tree 模式列出(環境變數或 `.env` 的 `MYNA_TRANSPORT=tree`,而且沒有 `MYNA_ROLE=edge`、`MYNA_REMOTE_PORT` — 跟 relay 同一條規則)。它讀自己 session 的 token 檔,`Authorization: Bearer <token>` 呼叫本機 relay。沒 token → 401。
 - `to`:`<nick>`(這台)或 `<nick>@<節點>`。字元只有 a-z 0-9 `_` `-`(nick)和節點名稱規則,`.`、第二個 `@` 都不收(`bad_address`)。內文去掉看不見的字元,≤ 3500 字。
 - relay 蓋章(M6),AI 只寫 `to` 和內文:
 

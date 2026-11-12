@@ -37,6 +37,7 @@ import {
   NAME_RE, CODE_RE, ENROLL_SECRET_HEADER,
 } from "./remote.mjs";
 import { normNick } from "./chat.mjs";
+import { oneLineSafe } from "./project.mjs";
 
 export const NODE_PROTOCOL = 1;
 export const DEFAULT_NODE_PORT = 7802;
@@ -111,7 +112,10 @@ export function createNode({ cfg, log, dir, version, machineName, chat, provider
   const PEER_BUDGET_MS = intOf(cfg.MYNA_PEER_BUDGET_MS, 20000, 500);
   const PAIR_MAX = intOf(cfg.MYNA_PEER_PAIR_MAX, 20, 1);
   const JOIN_TTL_MS = intOf(cfg.MYNA_JOIN_TTL_MS, 600000, 1000);
+  const JOIN_INTERVAL_MS = intOf(cfg.MYNA_JOIN_INTERVAL_MS, 60000, 0); // at most one new join request per interval (as /machines/join)
+  let lastJoinAt = 0;
   const BIND_TTL_MS = 600000;
+  const RESEND_MS = 20000; // an envelope handed down without a result is handed again after this (the child dedupes)
   const hasBot = () => { const p = provider(); return !!p && p.name !== "none"; };
   // "show first, then deliver" (M10): on by default where this relay has a bot; off where it has none
   const showFirst = () => {
@@ -153,7 +157,7 @@ export function createNode({ cfg, log, dir, version, machineName, chat, provider
 
   // --- children (parent side): node-children.json, same record shape and token as machines.json --------
   const children = listenPort ? machineStore(F.children, {
-    onRevoked: (ids) => { for (const id of ids) { const L = links.get(id); if (L) { failLink(L, "revoked"); links.delete(id); } log(`node: child ${id} revoked — its token no longer works`); } },
+    onRevoked: (ids) => { for (const id of ids) { const L = links.get(id); if (L) { L.revoked = true; failLink(L, "revoked"); links.delete(id); } log(`node: child ${id} revoked — its token no longer works`); } },
     onError: (m) => log(`node: ${m}`),
   }) : null;
   if (children) setInterval(() => children.refresh(), 5000).unref();
@@ -236,10 +240,13 @@ export function createNode({ cfg, log, dir, version, machineName, chat, provider
   // --- downward: the child's long-poll take ------------------------------------------------------------
   const links = new Map(); // child id → {queue, unacked, taking, lastEnd, waiters, wake}
   const linkOf = (id) => { if (!links.has(id)) links.set(id, { queue: [], unacked: [], taking: 0, lastEnd: 0, waiters: new Map(), wake: new Set() }); return links.get(id); };
-  function failLink(L, why) { for (const [, w] of L.waiters) w({ delivered: false, reason: "unreachable", error: why }); L.waiters.clear(); for (const w of L.wake) w(); }
+  // revoked: nothing queued or handed out may still go to it — the queue is dropped and a held take answers 401
+  function failLink(L, why) { L.queue = []; L.unacked = []; for (const [, w] of L.waiters) w({ delivered: false, reason: "unreachable", error: why }); L.waiters.clear(); for (const w of L.wake) w(); }
+  const stillActive = (id) => !!children?.active().some((c) => c.id === id);
   const online = (L) => L.taking > 0 || Date.now() - L.lastEnd < ONLINE_GAP_MS;
   async function downSend(child, env, budgetMs) {
     const L = linkOf(child.id), until = Date.now() + budgetMs;
+    if (L.revoked || !stillActive(child.id)) return { delivered: false, reason: "unreachable", error: `${child.name} 已被撤銷` };
     if (!online(L)) return { delivered: false, reason: "unreachable", error: `${child.name} 現在沒有連上來` };
     while (!L.taking && Date.now() - L.lastEnd < ONLINE_GAP_MS && Date.now() < until) await sleep(50);
     if (!L.taking) return Date.now() >= until ? unknown() : { delivered: false, reason: "unreachable", error: `${child.name} 現在沒有連上來` };
@@ -298,22 +305,36 @@ export function createNode({ cfg, log, dir, version, machineName, chat, provider
     const po = up.parentWho ? identityOf(up.parentWho) || String(parentRec.parent?.owner || "").toLowerCase() : null;
     if (!env?.id || !f || f.node !== up.name || env.machine?.stable_id !== up.stable || (po && String(env.owner || "").toLowerCase() !== po) || typeof env.body?.text !== "string") r = { delivered: false, reason: "bad_stamp", error: "上層送來的信封章不對" };
     else if (!t || t.node !== ownName) r = notFound(`第 0 批只送到直接相鄰的節點`);
-    else r = await deliverLocal(env);
-    try { await fetch(`${up.url}/node/result`, { method: "POST", headers: upHeaders({ "content-type": "application/json" }), body: JSON.stringify({ id: env?.id, result: r }), redirect: "manual", signal: AbortSignal.timeout(5000) }); }
-    catch (e) { log(`node: result of ${env?.id} not sent up (${e.cause?.code || e.message}) — the parent hands it again`); }
+    else {
+      env.body.text = cleanPeerText(env.body.text).slice(0, PEER_TEXT_MAX);
+      env.project = env.project == null ? null : oneLineSafe(env.project).slice(0, 200);
+      r = await deliverLocal(env);
+    }
+    // acked (next take) only once the parent has the result; otherwise the parent hands it again later and
+    // the same id gets the same result from deliverLocal's record
+    try {
+      const x = await fetch(`${up.url}/node/result`, { method: "POST", headers: upHeaders({ "content-type": "application/json" }), body: JSON.stringify({ id: env?.id, result: r }), redirect: "manual", signal: AbortSignal.timeout(5000) });
+      if (x.status === 200 && env?.id) up.ack.push(env.id);
+      else log(`node: result of ${env?.id} refused by the parent (HTTP ${x.status}) — it hands the message again`);
+    } catch (e) { log(`node: result of ${env?.id} not sent up (${e.cause?.code || e.message}) — the parent hands it again`); }
   }
+  const handling = new Set(); // ids being handled now (a resend of one must not start a second delivery)
   let stopped = false;
   async function takeLoop() {
     while (!stopped) {
       if (!up.reachable || up.blocked) { await sleep(1000); continue; }
+      const ack = up.ack.splice(0);
       try {
-        const r = await fetch(`${up.url}/node/take`, { method: "POST", headers: upHeaders({ "content-type": "application/json" }), body: JSON.stringify({ wait_ms: TAKE_WAIT_MAX_MS, ack: up.ack }), redirect: "manual", signal: AbortSignal.timeout(TAKE_WAIT_MAX_MS + 10000) });
+        const r = await fetch(`${up.url}/node/take`, { method: "POST", headers: upHeaders({ "content-type": "application/json" }), body: JSON.stringify({ wait_ms: TAKE_WAIT_MAX_MS, ack }), redirect: "manual", signal: AbortSignal.timeout(TAKE_WAIT_MAX_MS + 10000) });
         const j = await r.json().catch(() => null);
-        if (r.status !== 200) { if (r.status === 401) { up.reachable = false; up.reason = "the parent refused this node (401)"; } await sleep(2000); continue; }
+        if (r.status !== 200) { up.ack.push(...ack); if (r.status === 401) { up.reachable = false; up.reason = "the parent refused this node (401)"; } await sleep(2000); continue; }
         const envs = Array.isArray(j?.envelopes) ? j.envelopes : [];
-        up.ack = envs.map((e) => e?.id).filter(Boolean);
-        for (const e of envs) handleDown(e).catch((x) => log("node: handling a message from the parent failed:", x.message));
-      } catch { await sleep(1000); }
+        for (const e of envs) {
+          if (!e?.id || handling.has(e.id)) continue;
+          handling.add(e.id);
+          handleDown(e).catch((x) => log("node: handling a message from the parent failed:", x.message)).finally(() => handling.delete(e.id));
+        }
+      } catch { up.ack.push(...ack); await sleep(1000); }
     }
   }
 
@@ -362,13 +383,18 @@ export function createNode({ cfg, log, dir, version, machineName, chat, provider
   const joins = new Map(), joinByQ = new Map();
   const send = (res, code, o) => { res.writeHead(code, { "content-type": "application/json" }); res.end(JSON.stringify(o)); };
   const page = (res, code, title, body) => { res.writeHead(code, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" }); res.end(html(title, body)); };
+  // who is on this connection: a fresh whois once per connection, shared by its keep-alive requests (never
+  // another connection's answer — a device that changed its account is seen on its next connection)
+  const whoOf = (req) => (req.socket.mynaWho ??= ts.whois(req.socket.mynaSrc, { fresh: true }));
+  // a user device (login) or a tagged one (tags); whois with neither proves nothing — refused
+  const knownDevice = (who) => !!who && (!!who.login || who.tags.length > 0);
   async function authChild(req) {
     const rec = children.verify(bearerOf(req));
     if (!rec) return { error: "node token missing, wrong or revoked" };
-    const who = await ts.whois(req.socket.mynaSrc);
+    const who = await whoOf(req);
     if (!who) return { error: "the connection does not come from a tailnet device" };
     if (who.stable_id !== rec.tailnet?.stable_id) return { error: "wrong_device: this token belongs to another device" };
-    const sameAccount = rec.login ? who.login === rec.login : !who.login && JSON.stringify(who.tags) === JSON.stringify(rec.tags || []);
+    const sameAccount = rec.login ? who.login === rec.login : !who.login && who.tags.length > 0 && JSON.stringify(who.tags) === JSON.stringify(rec.tags || []);
     if (!sameAccount) return { error: "the device's Tailscale account (or tags) changed since it joined — join again" };
     return { rec, who };
   }
@@ -380,7 +406,8 @@ export function createNode({ cfg, log, dir, version, machineName, chat, provider
     const bm = /^\/bind\/([A-Za-z0-9_-]{20})$/.exec(url.pathname);
     if (bm && (req.method === "GET" || req.method === "POST")) return bindPage(req, res, bm[1]);
     const a = await authChild(req);
-    if (a.error) { log(`node: 401 ${req.method} ${url.pathname} from ${req.socket.mynaSrc} — ${a.error}`); return send(res, 401, { error: a.error }); }
+    // refused: the connection is closed too — its next try is a new connection with a fresh whois
+    if (a.error) { log(`node: 401 ${req.method} ${url.pathname} from ${req.socket.mynaSrc} — ${a.error}`); res.setHeader("connection", "close"); return send(res, 401, { error: a.error }); }
     const { rec } = a;
     if (req.method === "GET" && url.pathname === "/node/health") {
       return send(res, 200, { ok: true, name: "myna-relay", version, node_protocol: NODE_PROTOCOL, node: { name: ownName, stable_id: me?.stable_id || null, owner: owner() }, you: { name: rec.name, owner: rec.owner }, bot_id: botId() });
@@ -397,34 +424,45 @@ export function createNode({ cfg, log, dir, version, machineName, chat, provider
         return send(res, 200, { delivered: false, reason: "bad_stamp", error: "信封的章跟連線的裝置或帳號對不上" });
       }
       env.body.text = cleanPeerText(env.body.text).slice(0, PEER_TEXT_MAX);
+      // the project stamp is "the sender node said so" (2.5): kept to one safe line whatever a modified node sends
+      env.project = env.project == null ? null : oneLineSafe(env.project).slice(0, 200);
       return send(res, 200, await deliverLocal(env));
     }
     if (req.method === "POST" && url.pathname === "/node/take") {
       const { body } = await readBody(req, 64 * 1024);
       let b = {}; try { b = JSON.parse(body || "{}"); } catch {}
       const L = linkOf(rec.id);
+      // ack: the ids whose result the child has reported (it acks only then) — those are done here
       const ack = new Set(Array.isArray(b.ack) ? b.ack.map(String) : []);
-      L.unacked = L.unacked.filter((e) => !ack.has(e.id));
+      L.unacked = L.unacked.filter((e) => !ack.has(e.env.id));
       const wait = Math.max(0, Math.min(TAKE_WAIT_MAX_MS, Number(b.wait_ms) || 0));
+      // what goes out now: new envelopes, and ones handed out RESEND_MS ago with no result yet (the reply may
+      // have been lost; the child dedupes) — never the same envelope again on every take
+      const due = () => L.queue.length || L.unacked.some((e) => Date.now() - e.at >= RESEND_MS);
       L.taking++;
       try {
-        if (!L.unacked.length && !L.queue.length && wait) {
+        if (!due() && wait) {
           let wake, timer;
           await new Promise((r) => { wake = r; timer = setTimeout(r, wait); L.wake.add(wake); res.on("close", r); });
           clearTimeout(timer); L.wake.delete(wake);
         }
         if (res.writableEnded || res.destroyed) return;
-        if (!L.unacked.length) L.unacked = L.queue.splice(0);
-        send(res, 200, { envelopes: L.unacked });
+        // revoked while it waited: nothing goes out
+        if (L.revoked || !stillActive(rec.id)) return send(res, 401, { error: "node token revoked" });
+        const now = Date.now();
+        const out = [...L.queue.splice(0).map((env) => { const e = { env, at: now }; L.unacked.push(e); return env; }),
+          ...L.unacked.filter((e) => now - e.at >= RESEND_MS && e.at !== now).map((e) => { e.at = now; return e.env; })];
+        send(res, 200, { envelopes: out });
       } finally { L.taking--; L.lastEnd = Date.now(); }
       return;
     }
     if (req.method === "POST" && url.pathname === "/node/result") {
       const { body } = await readBody(req, 64 * 1024);
       let b = {}; try { b = JSON.parse(body || "{}"); } catch {}
-      const L = linkOf(rec.id), w = L.waiters.get(String(b.id || ""));
+      const L = linkOf(rec.id), id = String(b.id || ""), w = L.waiters.get(id);
       if (w && b.result && typeof b.result === "object") w(b.result);
-      return send(res, 200, { ok: !!w });
+      L.unacked = L.unacked.filter((e) => e.env.id !== id); // a result is as good as an ack
+      return send(res, 200, { ok: true });
     }
     send(res, 404, { error: `not available on the node port: ${req.method} ${url.pathname}` });
   }
@@ -442,18 +480,22 @@ export function createNode({ cfg, log, dir, version, machineName, chat, provider
     if (!NAME_RE.test(name)) return send(res, 400, { error: "name must be 1–16 of a-z 0-9 - (starting with a letter or digit)" });
     if (!CODE_RE.test(String(a.code ?? ""))) return send(res, 400, { error: "code must look like ABC-234" });
     if (!/^[a-f0-9]{64}$/.test(String(a.enroll_secret_hash ?? ""))) return send(res, 400, { error: "enroll_secret_hash must be a hex SHA-256" });
-    const who = await ts.whois(req.socket.mynaSrc, { fresh: true });
+    const who = await whoOf(req);
     if (!who) return send(res, 403, { error: "the connection does not come from a device of this tailnet (tailscale whois)" });
+    if (!knownDevice(who)) return send(res, 403, { error: "tailscale whois gives this device neither a user nor tags — its identity cannot be told" });
     const o = owner();
     if (!o) return send(res, 503, { error: `this relay has no owner (tailscale: ${meError || "?"})` });
     const open = [...joins.values()].filter((j) => j.status === "pending");
     if (open.length >= 3) return send(res, 429, { error: "too many join requests waiting (3)" });
+    const since = Date.now() - lastJoinAt;
+    if (since < JOIN_INTERVAL_MS) return send(res, 429, { error: "one join request per interval — try again later", retry_after_s: Math.ceil((JOIN_INTERVAL_MS - since) / 1000) });
     if (name === ownName || childByName(name) || open.some((j) => j.name === name)) return send(res, 409, { error: `the name "${name}" is taken here (this node, a child or a join waiting) — pick another --name` });
     if (a.bot_id && botId() && String(a.bot_id) === botId()) return send(res, 409, { error: "this node uses the same bot as the parent — one bot can serve only one relay" });
     // the phone when someone there can press the ✅ (Telegram, an account bound to the owner); else this
     // machine's terminal — never for a tagged parent (that would be the device approving itself)
     const viaPhone = provider()?.name === "telegram" && ownerBound();
     if (!viaPhone && me?.tags?.length) return send(res, 403, { error: "a tagged parent takes a new node only through a bot bound to its assigned owner (a terminal approval here would be the device approving itself)" });
+    lastJoinAt = Date.now();
     const enrollId = crypto.randomBytes(8).toString("hex"), qid = crypto.randomBytes(5).toString("hex");
     const j = { qid, name, os: shown(a.os, 24), hostname: shown(a.hostname, 64), code: a.code, secretHash: a.enroll_secret_hash, who, bot_id: a.bot_id ? String(a.bot_id) : null, expires: Date.now() + JOIN_TTL_MS, status: "pending", via: viaPhone ? "phone" : "terminal", wake: new Set() };
     joins.set(enrollId, j);
@@ -525,14 +567,26 @@ export function createNode({ cfg, log, dir, version, machineName, chat, provider
   async function bindPage(req, res, code) {
     const b = binds.get(code);
     if (!b || b.expires < Date.now()) { binds.delete(code); return page(res, 404, "Myna 綁定", "<p>這個綁定連結無效或已過期。在 Telegram 再傳一次 <code>!bind</code>。</p>"); }
-    const who = await ts.whois(req.socket.mynaSrc, { fresh: true });
+    const who = await whoOf(req);
     if (!who) return page(res, 403, "Myna 綁定", "<p>這個連線不是從 tailnet 裡的裝置來的。</p>");
     if (!who.login) return page(res, 403, "Myna 綁定", `<p>這台裝置是 tagged（${esc(who.tags.join(", "))}），沒有使用者帳號，不能當身分證。請用登入自己帳號的裝置打開。</p>`);
     const identity = `tailscale:${who.login}`;
     if (req.method === "GET") {
-      return page(res, 200, "Myna 綁定", `<p>把 Telegram 帳號 <b>${esc(b.name)}</b> 綁到 <b>${esc(identity)}</b>？</p><p>綁定後，這個 Telegram 帳號可以替這個身分按 Myna 的確認鈕（✅ 核准、權限允許、新節點加入）。</p><form method="post"><button type="submit">確認綁定</button></form>`);
+      // the POST must come from this very page: a nonce in the form AND the same nonce in a SameSite=Strict
+      // cookie (a cross-site form can send neither — it cannot read this page, and the cookie stays home)
+      b.nonce = crypto.randomBytes(18).toString("base64url"); b.viewer = identity;
+      res.setHeader("set-cookie", `myna_bind=${b.nonce}; Path=/bind/${code}; HttpOnly; Secure; SameSite=Strict; Max-Age=600`);
+      return page(res, 200, "Myna 綁定", `<p>把 Telegram 帳號 <b>${esc(b.name)}</b> 綁到 <b>${esc(identity)}</b>？</p><p>綁定後，這個 Telegram 帳號可以替這個身分按 Myna 的確認鈕（✅ 核准、權限允許、新節點加入）。</p><form method="post"><input type="hidden" name="nonce" value="${esc(b.nonce)}"><button type="submit">確認綁定</button></form>`);
     }
-    await readBody(req, 4096);
+    const { body } = await readBody(req, 4096);
+    const formNonce = new URLSearchParams(String(body || "")).get("nonce") || "";
+    const cookieNonce = (/(?:^|;\s*)myna_bind=([A-Za-z0-9_-]+)/.exec(String(req.headers.cookie || "")) || [])[1] || "";
+    const origin = req.headers.origin, site = req.headers["sec-fetch-site"];
+    const crossSite = (origin !== undefined && origin !== "null" && me?.dns_name && origin !== `https://${me.dns_name}:${S.servePort}`) || origin === "null" || (site !== undefined && site !== "same-origin");
+    if (!b.nonce || !sameHex(formNonce, b.nonce) || !sameHex(cookieNonce, b.nonce) || b.viewer !== identity || crossSite) {
+      log(`node: a bind POST for ${b.im} without this page's nonce/cookie, from another site or another identity — refused`);
+      return page(res, 403, "Myna 綁定", "<p>這個確認不是從綁定頁送出的（或來自別的網站）。請重新打開 bot 給的連結再按一次。</p>");
+    }
     binds.delete(code);
     const list = bindings().filter((x) => !(x.im === b.im && x.identity.toLowerCase() === identity));
     list.push({ im: b.im, identity, name: b.name, at: new Date().toISOString() });
