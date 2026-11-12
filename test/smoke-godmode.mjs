@@ -117,7 +117,7 @@ async function relay(name, port, env) {
   relayLogs[name] = relayLogs[name] || "";
   c.stderr.on("data", (b) => (relayLogs[name] += b));
   children.push(c);
-  if (!(await up(`http://127.0.0.1:${port}/health`))) { console.error(`❌ relay ${name} never came up`); process.exit(1); }
+  if (!(await up(`http://127.0.0.1:${port}/health`))) { console.error(`❌ relay ${name} never came up (exit ${c.exitCode}) — its log:\n${relayLogs[name].slice(-3000)}`); process.exit(1); }
   return c;
 }
 const H = freePort(), R = freePort();
