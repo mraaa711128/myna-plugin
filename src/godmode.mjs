@@ -11,6 +11,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import crypto from "node:crypto";
 import { withFileLock } from "./remote.mjs";
 
 export const UNSENT_MAX = 200;
@@ -29,40 +30,51 @@ export function godmodeSince(env = process.env) {
 }
 
 const lines = (text) => text.split(/\r?\n/).filter((l) => l.trim());
+// spool files: lines written while the lock was busy — <unsent file>.<time>-<pid>-<random>.spool, next to it
+const spoolFiles = (f) => {
+  const dir = path.dirname(f), base = `${path.basename(f)}.`;
+  try { return fs.readdirSync(dir).filter((n) => n.startsWith(base) && n.endsWith(".spool")).sort().map((n) => path.join(dir, n)); } catch { return []; }
+};
 
-// one line appended; the file cut to the newest UNSENT_MAX lines (rewritten through a temp file + rename).
-// Several hooks may write at once (relay down, many sessions): the append and the cut run under the file's
-// lock (withFileLock, src/remote.mjs — the .env writers' lock), so a cut never drops a line another hook
-// appended meanwhile. The lock not had within its wait → appended anyway, not cut (the next write cuts it).
-export function appendUnsent(record, env = process.env) {
+// One line kept. Several hooks may write at once (relay down, many sessions), so the main file is only ever
+// changed under its lock (withFileLock, src/remote.mjs): the spooled lines merged in, this line appended, the
+// file cut to the newest UNSENT_MAX lines (a temp file + rename). A cut never drops another hook's line: no
+// one appends to the main file outside the lock. The lock not had within waitMs → the line goes to a spool
+// file of its own (never touched by a rename), merged by the next writer that gets the lock.
+// waitMs: what is left of the hook's time (it answers within GODMODE_NOTIFY_MS overall); 0 → straight to a spool.
+export function appendUnsent(record, env = process.env, { waitMs = 500 } = {}) {
   const f = unsentFile(env);
   const line = JSON.stringify(record) + "\n";
   const write = () => {
-    fs.appendFileSync(f, line, { mode: 0o600 });
-    const all = lines(fs.readFileSync(f, "utf8"));
-    if (all.length > UNSENT_MAX) {
-      const tmp = `${f}.${process.pid}.tmp`;
-      fs.writeFileSync(tmp, all.slice(-UNSENT_MAX).join("\n") + "\n", { mode: 0o600 });
-      fs.renameSync(tmp, f);
-    }
+    let extra = "";
+    const spools = spoolFiles(f);
+    for (const s of spools) { try { extra += fs.readFileSync(s, "utf8"); } catch {} }
+    let cur = ""; try { cur = fs.readFileSync(f, "utf8"); } catch {}
+    const all = lines(cur + (cur && !cur.endsWith("\n") ? "\n" : "") + extra + line);
+    const tmp = `${f}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, all.slice(-UNSENT_MAX).join("\n") + "\n", { mode: 0o600 });
+    fs.renameSync(tmp, f);
+    for (const s of spools) { try { fs.rmSync(s, { force: true }); } catch {} } // only after the merge is written
   };
+  const spool = () => fs.writeFileSync(`${f}.${Date.now()}-${process.pid}-${crypto.randomBytes(4).toString("hex")}.spool`, line, { mode: 0o600, flag: "wx" });
   try {
     fs.mkdirSync(path.dirname(f), { recursive: true });
-    try { withFileLock(f, write, { waitMs: UNSENT_LOCK_WAIT_MS }); }
-    catch (e) { if (!/is held by another process/.test(e?.message || "")) throw e; fs.appendFileSync(f, line, { mode: 0o600 }); }
+    if (!(waitMs > 0)) { spool(); return true; }
+    try { withFileLock(f, write, { waitMs }); }
+    catch (e) { if (!/is held by another process/.test(e?.message || "")) throw e; spool(); }
     return true;
   } catch { return false; }
 }
-const UNSENT_LOCK_WAIT_MS = 2000; // the hook waits for its notice at most 5 s; this is on top of it
 
-// the unsent notices since a time (ms): {count, file}. Lines that cannot be read are not counted.
+// the unsent notices since a time (ms): {count, file}, spooled lines included. Unreadable lines are not counted.
 export function unsentSince(since, env = process.env) {
   const f = unsentFile(env);
   let n = 0;
-  try {
-    for (const l of lines(fs.readFileSync(f, "utf8"))) {
+  for (const file of [f, ...spoolFiles(f)]) {
+    let text = ""; try { text = fs.readFileSync(file, "utf8"); } catch { continue; }
+    for (const l of lines(text)) {
       try { const t = Date.parse(JSON.parse(l).at); if (Number.isFinite(t) && (since == null || t >= since)) n++; } catch {}
     }
-  } catch {}
+  }
   return { count: n, file: f };
 }

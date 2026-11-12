@@ -779,7 +779,11 @@ async function handleNotify(req, res, scope, pre) {
   if (typeof provider.sendNotice !== "function") { log(`notify${who}: ${provider.name} cannot send notices (501)`); return send(res, 501, { error: `${provider.name} cannot send notices` }); }
   const label = topicMachine(scope);
   try { await provider.sendNotice(label ? `${args.text}\n機器：${label}` : args.text); }
-  catch (e) { log(`notify${who}: not sent — ${e.message}`); return send(res, 502, { error: `notice not sent: ${e.message}` }); }
+  catch (e) {
+    // maybeSent: the IM gave no answer (it may have taken it) → 504, so nobody sends a second copy; else refused → 502
+    log(`notify${who}: ${e.maybeSent ? "no answer from the IM (may have been sent)" : "not sent"} — ${e.message}`);
+    return send(res, e.maybeSent ? 504 : 502, { error: `notice ${e.maybeSent ? "may or may not have gone out" : "not sent"}: ${e.message}` });
+  }
   log(`notify${who}: sent`);
   send(res, 200, { ok: true });
 }
@@ -1194,6 +1198,7 @@ async function edgeRoute(req, res, url) {
     const r = viaHub ? await edgeForward(req, "/notify", pre.body, 3000) : null;
     if (r?.ok && r.status === 200) { relayBack(res, r); return true; }
     if (r && !r.ok) { log("notify: no answer from the hub (it may have sent it) — not sending a second copy"); send(res, 504, { error: "no answer from the hub — the notice may have been sent there" }); return true; }
+    if (r && r.status === 504) { log("notify: the hub's IM gave no answer (it may have sent it) — not sending a second copy"); relayBack(res, r); return true; }
     if (ownBot.on) { log(`notify: ${r ? `the hub answered HTTP ${r.status}` : hub.reachable ? "the hub takes no notices (older than 0.25.0)" : `hub away (${hub.reason})`} — sending on this machine's own bot`); await handleNotify(req, res, LOCAL_SCOPE, pre); return true; }
     if (r) { relayBack(res, r); return true; }
     send(res, 503, { error: hub.reachable ? "the hub takes no notices (older than 0.25.0) and this edge has no bot of its own" : `the hub is away (${hub.reason}) and this edge has no bot of its own` }); return true;

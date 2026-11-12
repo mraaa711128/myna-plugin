@@ -760,7 +760,13 @@ export function create(cfg, ctx) {
     if (!CHAT_ID) throw new Error("no Telegram chat paired yet — run /myna:pair");
     const t = String(text ?? "");
     const res = await tg("sendMessage", { chat_id: CHAT_ID, text: t.length > NOTICE_MAX ? `${t.slice(0, NOTICE_MAX)}…` : t });
-    if (!res.ok) throw new Error(`telegram sendMessage failed: ${res.error || res.description || JSON.stringify(res).slice(0, 200)}`);
+    if (!res.ok) {
+      const e = new Error(`telegram sendMessage failed: ${res.error || res.description || JSON.stringify(res).slice(0, 200)}`);
+      // no answer from Telegram (transport error after the retries): it may have taken the message — the relay
+      // says so (504), and an edge does not send a second copy on another bot. An answer with ok:false is a refusal.
+      if (res.error_code === undefined) e.maybeSent = true;
+      throw e;
+    }
   }
 
   async function sendQuestion(request_id, args = {}) {

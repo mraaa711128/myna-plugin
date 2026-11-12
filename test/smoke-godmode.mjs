@@ -62,6 +62,7 @@ function tgStub() {
       s.calls.push({ method, b });
       if (method === "sendMessage") {
         if (s.refuse) return json({ ok: false, error_code: 403, description: "Forbidden: bot was blocked by the user" });
+        if (s.drop) return req.socket.destroy(); // no answer at all: Telegram may or may not have taken it
         b._id = ++s.mid; return setTimeout(() => json({ ok: true, result: { message_id: b._id } }), s.delayMs);
       }
       if (method === "createForumTopic") return json({ ok: true, result: { message_thread_id: ++s.thread, name: b.name } });
@@ -203,6 +204,24 @@ fs.writeFileSync(PERM, "off\n"); // God mode does not depend on /myna:perm
   const rs = await Promise.all(Array.from({ length: 8 }, (_, i) => runHook(bash(`echo par-${i}`), { port: 9 }).done));
   const u2 = unsent(), got = Array.from({ length: 8 }, (_, i) => u2.some((x) => x.text.includes(`echo par-${i}`)));
   ok(rs.every(allowed) && u2.length === 200 && got.every(Boolean) && !fs.existsSync(`${UNSENT}.lock`), `3: 8 hooks at once on a full file → all 8 lines kept, still 200 lines, no lock left (${got.filter(Boolean).length}/8, ${u2.length})`);
+  // the lock held by a live process for longer than the hook can wait: the line goes to a spool file (the main
+  // file untouched), counted by /myna:godmode status, and merged by the next writer that gets the lock
+  const spools = () => fs.readdirSync(TMP).filter((n) => n.startsWith("godmode-unsent.jsonl.") && n.endsWith(".spool"));
+  fs.writeFileSync(`${UNSENT}.lock`, `${process.pid} held-by-the-test\n`);
+  const main0 = fs.readFileSync(UNSENT, "utf8");
+  const rl = await runHook(bash("echo locked"), { port: 9 }).done;
+  ok(allowed(rl) && rl.ms < 5500 && fs.readFileSync(UNSENT, "utf8") === main0 && spools().length === 1, `3: lock held elsewhere → allowed in ${rl.ms} ms, the line in a spool file (${spools().length}), the main file untouched`);
+  const st = spawnSync(process.execPath, [src("scripts", "godmode.mjs"), "status"], { env: { ...baseEnv, ...files, MYNA_ENV: path.join(TMP, "no-such-env") }, encoding: "utf8" });
+  ok(/有 \d+ 則通知沒送出去/.test(st.stdout), "3: …status counts it too");
+  fs.rmSync(`${UNSENT}.lock`);
+  const rn = await runHook(bash("echo after-lock"), { port: 9 }).done;
+  const u3 = unsent();
+  ok(allowed(rn) && spools().length === 0 && u3.length === 200 && u3.at(-2).text.includes("echo locked") && u3.at(-1).text.includes("echo after-lock"), "3: the next writer merges the spool (in order), removes it, keeps 200 lines");
+  // Telegram gives no answer at all: it may have taken it → 504, marked "may still have been sent"
+  hubTg.drop = true;
+  const rd = await runHook(bash("echo dropped")).done;
+  hubTg.drop = false;
+  ok(allowed(rd) && /^HTTP 504.*may still have been sent/.test(unsent().at(-1)?.reason || ""), `3: no answer from Telegram → 504, unsent marked "may still have been sent" (${unsent().at(-1)?.reason})`);
 }
 
 // === 4. POST /notify itself ===================================================================================

@@ -765,7 +765,7 @@ MYNA_MACHINE_NAME=win        # 選填,topic 前面的短名稱(預設 hostname)
 | `~/.myna/chat-state/<session>.json` | 每個 session 的聊天開關(chat mod 寫,`/myna:config` 列出;已結束的 session 在列清單時刪掉)(v0.24.0) |
 | `~/.myna/autopilot` | flag 檔;存在=autopilot 開 |
 | `~/.myna/godmode` | flag 檔;**存在=God mode 開**(內容是開啟的時間);位置可用 `MYNA_GODMODE_FILE` 改。其他工具可以讀(對外約定只有「路徑」和「存在就是開」)(v0.25.0) |
-| `~/.myna/godmode-unsent.jsonl` | God mode 送不出去的通知(每行一筆:時間、session、工具、原因、通知全文;權限 0600,只留最近 200 行);位置可用 `MYNA_GODMODE_UNSENT_FILE` 改(v0.25.0) |
+| `~/.myna/godmode-unsent.jsonl` | God mode 送不出去的通知(每行一筆:時間、session、工具、原因、通知全文;權限 0600,只留最近 200 行;好幾個 session 同時寫、等不到檔案鎖時先寫在旁邊的 `godmode-unsent.jsonl.<時間>-<pid>-<亂數>.spool`,下一次寫入時併回來;原因寫 `may still have been sent` 的是逾時或沒回應,其實可能已經送到);位置可用 `MYNA_GODMODE_UNSENT_FILE` 改(v0.25.0) |
 | `~/.myna/intercept` | flag 檔;**無檔(或首行≠`off`)=攔截開(預設)**,首行 `off`=關 |
 | `~/.myna/permission` | flag 檔;**無檔(或首行≠`off`)=權限確認轉手機開(預設)**,首行 `off`=關 |
 | `~/.myna/stopcatch` | flag 檔;**無檔(或首行≠`off`)=stop-catch 開(預設)**,首行 `off`=關 |
