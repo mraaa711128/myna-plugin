@@ -247,6 +247,16 @@ try {
     ok(r.status === 0 && /^登記：查不到/m.test(r.out) && /Failed to connect to bus/.test(r.out), "linux: systemctl --user cannot reach the bus → status says it cannot tell, with the reason");
   }
 
+  // ============ the port from .env, read the relay's way ==========================================
+  {
+    const H = home("home-port"), F = path.join(TMP, "fake-port");
+    fs.writeFileSync(path.join(H, ".myna", ".env"), BOT + "RELAY_PORT = 1111\nRELAY_PORT=  2222 \n");
+    const env = envFor(H, { MYNA_SERVICE_PLATFORM: "linux", MYNA_FAKE_OS_DIR: F });
+    delete env.RELAY_PORT;
+    const r = svc(["status"], env);
+    ok(/127\.0\.0\.1:2222/.test(r.out), "status: RELAY_PORT from .env — spaces trimmed, the last line wins (2222), as the relay reads it");
+  }
+
   // ============ start.mjs ========================================================================
   {
     console.log("\n--- start.mjs ---");
@@ -270,9 +280,13 @@ try {
 
     fs.writeFileSync(path.join(H, ".myna", ".env"), BOT);
     const before = read(LOG);
-    r = run();
+    // no env recorded = the default ~/.myna/.env, even with a MYNA_ENV inherited from the environment
+    r = node(path.join(SDIR, "start.mjs"), [], { ...env, MYNA_ENV: path.join(TMP, "nowhere", ".env") });
     const h = await waitHealth();
-    ok(r.status === 0 && h?.root === ROOT && /started relay/.test(r.out), `start.mjs, configured → ensure-relay starts the relay (pid ${h?.pid})`);
+    ok(r.status === 0 && h?.root === ROOT && /started relay/.test(r.out) && !fs.existsSync(path.join(TMP, "nowhere")), `start.mjs, configured, no env recorded → the default .env, not an inherited MYNA_ENV; relay started (pid ${h?.pid})`);
+    // status from a shell with another MYNA_ENV still reports the service's own (default) .env
+    const other = svc(["status"], envFor(H, { MYNA_SERVICE_PLATFORM: "linux", MYNA_FAKE_OS_DIR: path.join(TMP, "fake-start"), MYNA_ENV: path.join(TMP, "nowhere", ".env") }));
+    ok(/\.env：預設/.test(other.out) && other.out.includes(path.join(H, ".myna", "relay.log")) && /relay：在跑/.test(other.out), "status from a shell with another MYNA_ENV → the service's default .env and its relay");
     ok(!/login start/.test((read(LOG) || "").slice(before.length)), "start.mjs, success → no extra line of its own in relay.log");
     stop();
   }

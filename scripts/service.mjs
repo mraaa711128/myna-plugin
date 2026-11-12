@@ -16,7 +16,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { setTimeout as sleep } from "node:timers/promises";
-import { serviceDir, recordFile, startFile, writeAtomic, START_MJS, adapter, platformOf, runner } from "../src/service.mjs";
+import { serviceDir, recordFile, startFile, writeAtomic, START_MJS, adapter, platformOf, runner, defaultEnvPath } from "../src/service.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const version = (() => { try { return JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8")).version || "0.0.0"; } catch { return "0.0.0"; } })();
@@ -29,13 +29,21 @@ if (!["on", "off", "status"].includes(cmd)) fail(USAGE);
 if (!os_) fail(`這個平台（${platform}）不支援；只支援 macOS（launchd）、Windows（工作排程器）、Linux（systemd --user）。`);
 
 const readRecord = () => { try { return JSON.parse(fs.readFileSync(recordFile(), "utf8")); } catch { return null; } };
-// the .env (and so the port) the login start uses: service.json's env, else this shell's, else the default
-const envPathFor = (rec) => (rec && typeof rec.env === "string" && rec.env) || process.env.MYNA_ENV || path.join(os.homedir(), ".myna", ".env");
+// the .env (and so the port) the login start uses: with a service.json, its env — none recorded means the
+// default, whatever this shell's MYNA_ENV says (start.mjs drops an inherited one too); without one, this
+// shell's MYNA_ENV, else the default
+const envPathFor = (rec) => rec
+  ? ((typeof rec.env === "string" && rec.env) || defaultEnvPath())
+  : (process.env.MYNA_ENV || defaultEnvPath());
 const portFor = (envPath) => {
-  // the relay's own rule: process env over the .env file
-  if (process.env.RELAY_PORT) return Number(process.env.RELAY_PORT);
-  try { const m = /^RELAY_PORT=(.*)$/m.exec(fs.readFileSync(envPath, "utf8")); if (m && m[1].trim()) return Number(m[1].trim()); } catch {}
-  return 7800;
+  // the relay's own rule (src/relay.mjs): .env lines trimmed, the last one of a key wins, the process
+  // environment over the file — the login start inherits the user's environment the same way
+  let fileEnv = {};
+  try {
+    fileEnv = Object.fromEntries(fs.readFileSync(envPath, "utf8").split(/\r?\n/).filter((l) => l && !l.startsWith("#") && l.includes("="))
+      .map((l) => { const i = l.indexOf("="); return [l.slice(0, i).trim(), l.slice(i + 1).trim()]; }));
+  } catch {}
+  return Number({ ...fileEnv, ...process.env }.RELAY_PORT || 7800);
 };
 async function health(port) {
   try {

@@ -679,7 +679,7 @@ sequenceDiagram
 
 ### start.mjs(登入時 OS 跑的)
 
-讀旁邊的 `service.json`;有 `env` 就設成 `MYNA_ENV`(登入環境沒有互動 shell 設的 `MYNA_ENV`);跑 `node <root>/scripts/ensure-relay.mjs`。失敗時在那個 `.env` 旁的 `relay.log` 寫**一行**(`myna service (login start): …`)、exit 1:`service.json` 讀不懂、`root` 不在、`ensure-relay` exit 非零、或 `ensure-relay` 說 `relay not started`(沒設定、`MYNA_ROLE` 不對)。成功時不寫自己的紀錄(relay 啟動那行就是紀錄)。
+讀旁邊的 `service.json`;有 `env` 就設成 `MYNA_ENV`(登入環境沒有互動 shell 設的 `MYNA_ENV`),沒有 `env` 就拿掉繼承來的 `MYNA_ENV`(沒記 = 預設的 `~/.myna/.env`;`status` 也照這個規則,不看當下 shell 的 `MYNA_ENV`;port 照 relay 的讀法:`.env` 每行 trim、同一個 key 後面的贏、環境變數優先);跑 `node <root>/scripts/ensure-relay.mjs`。失敗時在那個 `.env` 旁的 `relay.log` 寫**一行**(`myna service (login start): …`)、exit 1:`service.json` 讀不懂、`root` 不在、`ensure-relay` exit 非零、或 `ensure-relay` 說 `relay not started`(沒設定、`MYNA_ROLE` 不對)。成功時不寫自己的紀錄(relay 啟動那行就是紀錄)。
 
 ### `ensure-relay` 更新 `service.json`
 

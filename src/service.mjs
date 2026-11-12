@@ -88,8 +88,10 @@ const recFile = path.join(here, "service.json");
 const env = { ...process.env };
 let rec = null, why = "";
 try { rec = JSON.parse(fs.readFileSync(recFile, "utf8")); } catch (e) { why = recFile + " could not be read (" + e.message + ")"; }
-// the login environment has no MYNA_ENV an interactive shell set: use the one recorded by service.mjs on
+// the .env is the one recorded by service.mjs on (the login environment has no MYNA_ENV an interactive
+// shell set); none recorded means the default ~/.myna/.env, even when the environment carries a MYNA_ENV
 if (rec && typeof rec.env === "string" && rec.env) env.MYNA_ENV = rec.env;
+else if (rec) delete env.MYNA_ENV;
 const ensure = rec && typeof rec.root === "string" ? path.join(rec.root, "scripts", "ensure-relay.mjs") : "";
 if (!why && !(ensure && fs.existsSync(ensure))) why = "no myna at " + (rec && rec.root) + " (the recorded root is gone)";
 let out = "";
