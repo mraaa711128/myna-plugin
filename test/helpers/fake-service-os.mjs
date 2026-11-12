@@ -4,7 +4,8 @@
 // Which tool it plays is read from the arguments. State and a log of every call live in MYNA_FAKE_OS_DIR:
 //   calls.jsonl          one {tool, args} line per call
 //   registered-<tool>    present = "registered" (loaded agent, existing task, enabled unit)
-// MYNA_FAKE_OS_FAIL=<word>   that subcommand (bootout, bootstrap, /Create, /Delete, enable, disable, …) fails
+// MYNA_FAKE_OS_FAIL=<word>[,<word>…]   those subcommands (print, bootout, bootstrap, /Query, /Create, /Delete,
+//                            enable, disable, daemon-reload, …) fail with exit 1 "Access is denied."
 // MYNA_FAKE_OS_NORUN=1       launchctl bootstrap does not run the plist's program (no RunAtLoad effect)
 // launchctl bootstrap reads the plist and, like RunAtLoad, starts its ProgramArguments (detached).
 import { spawn } from "node:child_process";
@@ -21,8 +22,8 @@ const verb = tool === "systemctl" ? args[1] : args[0];
 const flag = path.join(dir, `registered-${tool}`);
 const isOn = () => fs.existsSync(flag);
 const set = (on) => { if (on) fs.writeFileSync(flag, JSON.stringify(args)); else fs.rmSync(flag, { force: true }); };
-const failWord = process.env.MYNA_FAKE_OS_FAIL || "";
-if (failWord && verb.toLowerCase() === failWord.toLowerCase()) { console.error(`fake ${tool}: ${verb} failed (Access is denied.)`); process.exit(1); }
+const failWords = String(process.env.MYNA_FAKE_OS_FAIL || "").toLowerCase().split(",").filter(Boolean);
+if (failWords.includes(String(verb).toLowerCase())) { console.error(`fake ${tool}: ${verb} failed (Access is denied.)`); process.exit(1); }
 
 const unxml = (s) => s.replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&amp;/g, "&");
 
@@ -44,6 +45,13 @@ if (tool === "launchctl") {
   }
 }
 if (tool === "schtasks") {
+  // the whole list as CSV (what service.mjs asks): a few other tasks, ours when registered
+  if (verb === "/Query" && args.includes("/FO")) {
+    console.log('"\\Microsoft\\Windows\\Defrag\\ScheduledDefrag","N/A","Ready"');
+    console.log('"\\Myna relay helper","N/A","Ready"');
+    if (isOn()) console.log('"\\Myna relay","N/A","Ready"');
+    process.exit(0);
+  }
   if (verb === "/Query") { if (isOn()) { console.log("TaskName: \\Myna relay"); process.exit(0); } console.error("ERROR: The system cannot find the file specified."); process.exit(1); }
   if (verb === "/Create") { set(true); console.log('SUCCESS: The scheduled task "Myna relay" has successfully been created.'); process.exit(0); }
   if (verb === "/Delete") { if (!isOn()) { console.error("ERROR: The system cannot find the file specified."); process.exit(1); } set(false); console.log("SUCCESS"); process.exit(0); }

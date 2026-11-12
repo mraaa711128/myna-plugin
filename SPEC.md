@@ -665,17 +665,17 @@ sequenceDiagram
 - **`on`**:
   1. 寫 `~/.myna/service/start.mjs`(固定位置、內容跟版本無關)和 `~/.myna/service/service.json` = `{root, version, node, env?}`:`root` 是跑 `on` 的那份 myna,`node` 是 `process.execPath`(登入時的 `PATH` 不一定有 nvm、Homebrew 的 node),`env` 只在 `on` 當下有 `MYNA_ENV` 時記它的絕對路徑(只存路徑)。兩個檔都用「暫存檔 + rename」寫。`~/.myna/service/` 不跟著 `MYNA_ENV`,start.mjs 才找得到它。
   2. 向 OS 登記「登入時跑 `<node 絕對路徑> ~/.myna/service/start.mjs`」(下表);已經登記過就重新登記,重跑 `on` 結果一樣(也是換 node、換 checkout 的方法)。
-  3. 確保 relay 現在就在跑:macOS 的 `bootstrap` 搭 `RunAtLoad` 已經跑了一次 start.mjs,不再另外跑;Windows、Linux 的登記不會馬上執行,由 `on` 自己跑一次 start.mjs。最後用 `GET /health` 確認、印出結果(還沒設定 bot 時說明,exit 0)。登記失敗 → 印 OS 的錯誤、exit 1,`~/.myna/service/` 留著。
+  3. 確保 relay 現在就在跑:macOS 的 `bootstrap` 搭 `RunAtLoad` 已經跑了一次 start.mjs,不再另外跑;Windows、Linux 的登記不會馬上執行,由 `on` 自己跑一次 start.mjs。最後用 `GET /health` 確認、印出結果。還沒設定(`ensure-relay` 說 `relay not started`:沒有 bot、`MYNA_ROLE` 不對)→ 說明、exit 0,登記留著;其他情況 relay 沒起來(start.mjs 失敗、10 秒內 `/health` 沒回)→ exit 1,登記留著。macOS 看不到 launchd 跑 start.mjs 的輸出,改看 `on` 之後 `relay.log` 新增的內容。登記失敗 → 印 OS 的錯誤、exit 1,`~/.myna/service/` 留著。
 - **`off`**:拿掉 OS 的登記;**拿掉成功、或確認本來就沒登記**,才刪 `~/.myna/service/`。OS 指令回錯誤 → 不刪檔、印出錯誤、exit 1。**不停正在跑的 relay**(它可能正在服務 session、題目、tree 轉送);要停用 `/myna:relay stop`(沒有 Claude Code:`stop-relay.mjs`),輸出會提醒。`~/.myna/.env`、`relay.log`、journal 都不碰。
 - **`status`**(預設,唯讀):登記在不在(問 OS;問不到時說「查不到」和原因)、登記檔在不在、`service.json` 的 `root`／`version`／`node`／`env` 和路徑還在不在、`/health` 的 `version`、`pid`、`started_at`,以及登入啟動失敗時去哪裡看。
 
 | OS | `on` | `off` | `status` |
 |---|---|---|---|
-| macOS | 寫 `~/Library/LaunchAgents/com.myna.relay.plist`(`ProgramArguments` = node + start.mjs,`RunAtLoad` true,不設 `KeepAlive`,`StandardErrorPath` = `~/.myna/service/launchd.err`);`launchctl print gui/<uid>/com.myna.relay` 成功(已載入)就先 `bootout`,再 `launchctl bootstrap gui/<uid> <plist>`(剛 bootout 完 bootstrap 可能暫時失敗,最多試 3 次) | 已載入就 `launchctl bootout gui/<uid>/com.myna.relay`,刪 plist | `launchctl print` 成功與否 |
-| Windows | `schtasks /Create /TN "Myna relay" /SC ONLOGON /TR "\"<node.exe>\" \"<start.mjs>\"" /F` | `schtasks /Query` 有才 `schtasks /Delete /TN "Myna relay" /F` | `schtasks /Query /TN "Myna relay"`(非零 = 沒有;訊息會依語系翻譯,不比對文字) |
-| Linux | 寫 `$XDG_CONFIG_HOME/systemd/user/myna-relay.service`(預設 `~/.config`;`Type=oneshot`、`RemainAfterExit=yes`、`ExecStart="<node>" "<start.mjs>"`、`WantedBy=default.target`),`systemctl --user daemon-reload`、`enable` | `systemctl --user disable`,刪檔、`daemon-reload`。**不 `stop`**:`RemainAfterExit` 的 unit 一 stop,cgroup 裡的 relay 會被一起清掉 | `systemctl --user is-enabled myna-relay.service`(輸出 `disabled`/`not-found` = 沒有;連不到 user bus = 查不到) |
+| macOS | 寫 `~/Library/LaunchAgents/com.myna.relay.plist`(`ProgramArguments` = node + start.mjs,`RunAtLoad` true,不設 `KeepAlive`,`StandardErrorPath` = `~/.myna/service/launchd.err`);`launchctl print gui/<uid>/com.myna.relay` 成功(已載入)就先 `bootout`,再 `launchctl bootstrap gui/<uid> <plist>`(剛 bootout 完 bootstrap 可能暫時失敗,最多試 3 次) | 沒有確定沒載入就 `launchctl bootout gui/<uid>/com.myna.relay`,刪 plist | `launchctl print`:成功 = 有;exit 113(`Could not find service`)= 沒有;其他 = 查不到 |
+| Windows | `schtasks /Create /TN "Myna relay" /SC ONLOGON /TR "\"<node.exe>\" \"<start.mjs>\"" /F` | 沒有確定沒登記就 `schtasks /Delete /TN "Myna relay" /F` | `schtasks /Query /FO CSV /NH` 列出全部工作,找第一欄是 `"\Myna relay"` 的那一行(`/Query /TN` 找不到和沒權限都是 exit 1,訊息又依語系翻譯,分不出來);列不出來 = 查不到 |
+| Linux | 寫 `$XDG_CONFIG_HOME/systemd/user/myna-relay.service`(預設 `~/.config`;`Type=oneshot`、`RemainAfterExit=yes`、`ExecStart="<node>" "<start.mjs>"`、`WantedBy=default.target`),`systemctl --user daemon-reload`、`enable` | 沒有確定沒 enable 就 `systemctl --user disable`,刪檔、`daemon-reload`(失敗 → exit 1、`~/.myna/service/` 留著,下次 `off` 會再 reload)。**不 `stop`**:`RemainAfterExit` 的 unit 一 stop,cgroup 裡的 relay 會被一起清掉 | `systemctl --user is-enabled myna-relay.service`(輸出 `disabled`/`not-found` = 沒有;連不到 user bus = 查不到) |
 
-OS 指令一律 `execFile` 帶參數陣列,不經 shell。
+「查不到」(OS 指令跑了但不是明確的「沒有」,例如沒權限、連不到 user bus)絕不當成「沒登記」:`status` 照實說查不到,`off` 照樣試著拿掉,拿掉也失敗就不刪檔、exit 1。OS 指令一律 `execFile` 帶參數陣列,不經 shell。
 
 ### start.mjs(登入時 OS 跑的)
 
@@ -683,7 +683,7 @@ OS 指令一律 `execFile` 帶參數陣列,不經 shell。
 
 ### `ensure-relay` 更新 `service.json`
 
-`~/.myna/service/service.json` 存在時,**只有**「自己的版本比裡面記的新」(同一套 semver 比較),或「版本一樣、但記的 `root` 已經不在」→ 把 `root`、`version` 改成自己的(其他欄位不動;暫存檔 `service.json.<pid>-<亂數>.tmp` + rename)。比裡面記的舊、任一邊的版本看不懂、檔案不存在 → 不動(不倒退、不建檔)。**只處理同一個 `.env` 的 relay**:這次 `ensure-relay` 用的 `.env`(`MYNA_ENV` 或預設)跟 `service.json` 的 `env`(沒有就是預設)不同時不動,免得測試或另一套設定把登入啟動指到別的 checkout。這一步是**獨立的 best-effort**:每一個結束點(包括「沒設定」「同版本已在跑」)都會跑,包在自己的 try 裡;讀不到、JSON 壞掉、寫不進去、rename 失敗都只印一行 `warning`,relay 的啟動、替換照舊。好幾個 session 同時寫時最後一個 rename 的贏,寫的都是「比原本新」的版本。不碰 OS 的登記。
+`~/.myna/service/service.json` 存在時,**只有**「自己的版本比裡面記的新」(同一套 semver 比較),或「版本一樣、但記的 `root` 已經不在」→ 把 `root`、`version` 改成自己的(其他欄位不動;暫存檔 `service.json.<pid>-<亂數>.tmp` + rename)。比裡面記的舊、任一邊的版本看不懂、檔案不存在 → 不動(不倒退、不建檔)。**只處理同一個 `.env` 的 relay**:這次 `ensure-relay` 用的 `.env`(`MYNA_ENV` 或預設)跟 `service.json` 的 `env`(沒有就是預設)不同時不動,免得測試或另一套設定把登入啟動指到別的 checkout。這一步是**獨立的 best-effort**:每一個結束點(包括「沒設定」「同版本已在跑」)都會跑,包在自己的 try 裡;讀不到、JSON 壞掉、寫不進去、rename 失敗都只印一行 `warning`,relay 的啟動、替換照舊。好幾個 session 同時寫時最後一個 rename 的贏,寫的都是「比原本新」的版本;為了縮小這個窗口,rename 前再讀一次檔案,跟決定時讀到的不一樣(別人剛寫過,包括 `service.mjs on`)就放棄這次、不覆寫。沒有檔案鎖:極少數同時寫的情況可能停在兩個較新版本裡較舊的那個,下一次較新版的 `ensure-relay` 會再改正。不碰 OS 的登記。
 
 ### 刻意不做(第一版)
 

@@ -58,25 +58,34 @@ if (cmd === "on") {
     writeAtomic(recordFile(), JSON.stringify(rec, null, 2) + "\n");
   } catch (e) { fail(`${serviceDir()} 寫不進去（${e.message}）。沒有登記。`); }
   console.log(`myna service：${startFile()}、service.json → ${root}（v${version}）${rec.env ? `，.env：${rec.env}` : ""}`);
+  const envPath = envPathFor(rec), port = portFor(envPath), log = path.join(path.dirname(envPath), "relay.log");
+  // what start.mjs writes to relay.log from here on (macOS: launchd ran it, its output is not ours to read)
+  const logFrom = (() => { try { return fs.statSync(log).size; } catch { return 0; } })();
+  const newLog = () => { try { const b = fs.readFileSync(log); return b.subarray(Math.min(logFrom, b.length)).toString("utf8"); } catch { return ""; } };
   const r = os_.register({ node: process.execPath, start: startFile() });
   if (!r.ok) fail(`登記失敗：${os_.name}\n${r.out}\n${startFile()} 和 service.json 留著；問題排除後重跑 on，或用 off 清掉。`);
   console.log(`已登記：${os_.name}${os_.file ? `（${os_.file}）` : ""}。下次登入會自動跑 ${startFile()}（node：${process.execPath}）。`);
   // now, not at the next login: macOS RunAtLoad already ran start.mjs at bootstrap; the others did not
-  let started = "";
+  let started = "", startFailed = false;
   if (!os_.runsAtRegister) {
     const s = spawnSync(process.execPath, [startFile()], { encoding: "utf8", windowsHide: true, timeout: 60000 });
     started = ((s.stdout || "") + (s.stderr || "")).trim();
     if (started) console.log(started);
+    startFailed = !!s.error || s.status !== 0;
   }
-  const envPath = envPathFor(rec), port = portFor(envPath);
+  // "relay not started" is ensure-relay's word for "nothing to start" (no bot, bad MYNA_ROLE): not an error
+  // of `on` — the registration stands and the next login starts it once it is set up
+  const notConfigured = () => /relay not started/.test(started) || /relay not started/.test(newLog());
   let h = null;
-  if (!/relay not started|login start\)/.test(started)) {
+  if (!notConfigured()) {
     const until = Date.now() + 10000;
-    while (Date.now() < until && !(h = await health(port))) await sleep(200);
+    while (Date.now() < until && !(h = await health(port)) && !notConfigured() && !/login start\)/.test(newLog())) await sleep(200);
   }
   console.log(relayLine(h, port));
-  if (!h) console.log(`relay 沒有起來：看 ${path.join(path.dirname(envPath), "relay.log")}（還沒設定 bot 的話先跑 configure.mjs 或 /myna:setup，之後下次登入就會起來）。`);
-  process.exit(0);
+  if (h) process.exit(0);
+  if (notConfigured()) { console.log(`還沒設定（${log} 有說明）：先跑 configure.mjs 或 /myna:setup，之後下次登入（或現在再跑一次 on）relay 就會起來。登記留著。`); process.exit(0); }
+  const why = [startFailed && "start.mjs 失敗", newLog().trim().split("\n").filter((l) => /login start\)/.test(l)).pop()].filter(Boolean).join("；");
+  fail(`登記好了，但 relay 沒有起來${why ? `（${why}）` : ""}。看 ${log}${os_.runsAtRegister ? `、${os_.logHint}` : ""}。登記留著；排除問題後重跑 on。`);
 }
 
 if (cmd === "off") {

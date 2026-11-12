@@ -29,11 +29,22 @@ export function compareVersions(a, b) {
   return pa.pre < pb.pre ? -1 : 1;
 }
 
-// write through a temp file + rename; the temp name is unique per call, so two writers never share one
-export function writeAtomic(file, text) {
+// write through a temp file + rename; the temp name is unique per call, so two writers never share one.
+// With `expect` (the text read before deciding): the file is read again right before the rename and left
+// alone (returns false) when someone else changed it meanwhile — no lock, but the window shrinks to the
+// moment between that read and the rename.
+export function writeAtomic(file, text, expect) {
   const tmp = `${file}.${process.pid}-${crypto.randomBytes(4).toString("hex")}.tmp`;
-  try { fs.writeFileSync(tmp, text); fs.renameSync(tmp, file); }
-  catch (e) { try { fs.rmSync(tmp, { force: true }); } catch {} throw e; }
+  try {
+    fs.writeFileSync(tmp, text);
+    if (expect !== undefined) {
+      let now = null;
+      try { now = fs.readFileSync(file, "utf8"); } catch {}
+      if (now !== expect) { fs.rmSync(tmp, { force: true }); return false; }
+    }
+    fs.renameSync(tmp, file);
+    return true;
+  } catch (e) { try { fs.rmSync(tmp, { force: true }); } catch {} throw e; }
 }
 
 // ensure-relay's part (best-effort; it catches and warns): service.json exists → point it at THIS myna when
@@ -54,8 +65,9 @@ export function updatePointer({ root, version, envPath = process.env.MYNA_ENV ||
   const cmp = compareVersions(version, rec.version);
   const gone = typeof rec.root !== "string" || !fs.existsSync(rec.root);
   if (!(cmp > 0 || (cmp === 0 && gone && path.resolve(rec.root || ".") !== path.resolve(root)))) return "kept";
-  writeAtomic(file, JSON.stringify({ ...rec, root, version }, null, 2) + "\n");
-  return "updated";
+  // someone else (another session's ensure-relay, a `service.mjs on`) wrote it since we read it: theirs
+  // stands — re-deciding on their record is the next ensure-relay's job
+  return writeAtomic(file, JSON.stringify({ ...rec, root, version }, null, 2) + "\n", text) ? "updated" : "raced";
 }
 
 // The file the OS runs at login. Its text never depends on the myna version: an upgrade does not need to
@@ -136,7 +148,10 @@ export function adapter(platform, { run, home = os.homedir(), env = process.env 
     const file = path.join(home, "Library", "LaunchAgents", `${LABEL}.plist`);
     const query = () => {
       const r = run("launchctl", ["print", target]);
-      return { registered: r.error ? null : r.ok, out: r.out };
+      if (r.ok) return { registered: true, out: r.out };
+      // only launchd's own "not found" (exit 113) means not loaded; anything else is "cannot tell"
+      if (!r.error && (r.status === 113 || /Could not find service/i.test(r.out))) return { registered: false, out: r.out };
+      return { registered: null, out: r.out };
     };
     return {
       name: `macOS LaunchAgent ${LABEL}`, file, target, runsAtRegister: true,
@@ -187,9 +202,13 @@ export function adapter(platform, { run, home = os.homedir(), env = process.env 
   }
   if (platform === "win32") {
     const query = () => {
-      const r = run("schtasks", ["/Query", "/TN", TASK]);
-      // a missing task is a non-zero exit with a localized message: anything but a spawn error is "not there"
-      return { registered: r.error ? null : r.ok, out: r.out };
+      // `/Query /TN` exits 1 both for "no such task" and "access denied", with a localized message. So list
+      // every task as CSV and look for ours by name: the list failing is "cannot tell", a list without it
+      // is "not there"
+      const r = run("schtasks", ["/Query", "/FO", "CSV", "/NH"]);
+      if (!r.ok) return { registered: null, out: r.out };
+      const ours = `"\\${TASK}"`.toLowerCase();
+      return { registered: r.stdout.split(/\r?\n/).some((l) => l.trim().toLowerCase().startsWith(`${ours},`)), out: "" };
     };
     return {
       name: `Windows 工作排程器「${TASK}」`, file: null, runsAtRegister: false,
@@ -255,7 +274,12 @@ WantedBy=default.target
         const hadFile = fs.existsSync(file);
         const had = q.registered !== false || hadFile;
         fs.rmSync(file, { force: true });
-        if (hadFile) { const r = run("systemctl", ["--user", "daemon-reload"]); if (!r.ok) return { ok: true, out: "", had, warn: `systemctl --user daemon-reload: ${r.out}` }; }
+        // reload after removing the file; also when ~/.myna/service is still there — an earlier off whose
+        // reload failed kept it, so running off again retries the reload
+        if (hadFile || fs.existsSync(serviceDir())) {
+          const r = run("systemctl", ["--user", "daemon-reload"]);
+          if (!r.ok) return { ok: false, out: `systemctl --user daemon-reload: ${r.out}` };
+        }
         return { ok: true, out: "", had };
       },
     };

@@ -799,8 +799,8 @@ node <myna>/scripts/service.mjs off
 node <myna>/scripts/service.mjs status
 ```
 
-- **`on`**:寫 `~/.myna/service/start.mjs`(固定的小啟動檔,每個版本都一樣)和 `~/.myna/service/service.json`(指向跑 `on` 的那份 myna、它的版本、node 的絕對路徑;有設 `MYNA_ENV` 時記下它的路徑),向 OS 登記「登入時跑 start.mjs」,並確認 relay 現在就在跑。登入時 start.mjs 跑的就是 `ensure-relay`(跟 SessionStart 同一段程式),所以常駐的 relay 跟 session 叫起來的是同一個,同一台只有一個,照版本決定要不要換(新版優先、同版不動、舊版不搶新版)。重跑 `on` 結果一樣,也是換 node、換 checkout 位置的方法。
-- **`off`**:拿掉 OS 的登記,再刪 `~/.myna/service/`。**正在跑的 relay 不會停**(它可能正在服務 session、題目);要停用 `/myna:relay stop`(沒有 Claude Code:`node <myna>/scripts/stop-relay.mjs`)。OS 拒絕拿掉時什麼都不刪、印出 OS 的錯誤。
+- **`on`**:寫 `~/.myna/service/start.mjs`(固定的小啟動檔,每個版本都一樣)和 `~/.myna/service/service.json`(指向跑 `on` 的那份 myna、它的版本、node 的絕對路徑;有設 `MYNA_ENV` 時記下它的路徑),向 OS 登記「登入時跑 start.mjs」,並確認 relay 現在就在跑。登入時 start.mjs 跑的就是 `ensure-relay`(跟 SessionStart 同一段程式),所以常駐的 relay 跟 session 叫起來的是同一個,同一台只有一個,照版本決定要不要換(新版優先、同版不動、舊版不搶新版)。重跑 `on` 結果一樣,也是換 node、換 checkout 位置的方法。登記好了但 relay 沒起來時 exit 1(還沒設定 bot 除外:說明後 exit 0,設定好後下次登入就會起來)。
+- **`off`**:拿掉 OS 的登記,再刪 `~/.myna/service/`。**正在跑的 relay 不會停**(它可能正在服務 session、題目);要停用 `/myna:relay stop`(沒有 Claude Code:`node <myna>/scripts/stop-relay.mjs`)。OS 拒絕拿掉(或查不到有沒有登記、拿掉也失敗)時什麼都不刪、印出 OS 的錯誤、exit 1。
 - **`status`**:登記在不在、`service.json` 指向哪裡(路徑還在不在)、relay 有沒有在跑(`/health` 的版本、pid、`started_at`:在登入時間附近就是登入那次叫起來的),以及登入啟動失敗時去哪裡看。
 - **升級**:Claude Code 升級 plugin 後,下一次 SessionStart 的 `ensure-relay` 發現自己比 `service.json` 記的新,就把它改指向新版(不重新登記 OS,也不會倒退到舊版);下次登入就用新版。沒有 Claude Code 的機器:`git pull` 就好(路徑不變)。
 - **log**:relay 照舊寫 `~/.myna/relay.log`;登入時啟動失敗(myna 的路徑不見了、`service.json` 壞了、還沒設定 bot)也在同一個檔寫一行說明。start.mjs 根本沒跑起來(例如 node 換了位置)時:macOS 看 `~/.myna/service/launchd.err`,Windows 看 `schtasks /Query /TN "Myna relay" /V /FO LIST` 的「上次執行結果」,Linux 看 `journalctl --user -u myna-relay.service`。

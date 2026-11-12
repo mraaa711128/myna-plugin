@@ -147,6 +147,14 @@ try {
     show(`off (${failVerb} fails)`, r);
     ok(r.status !== 0 && /拿掉登記失敗/.test(r.out) && /Access is denied/.test(r.out) && fs.existsSync(START) && fs.existsSync(REC) && registered() && (!regFile || fs.existsSync(regFile)), `${platform}: off with ${failVerb} failing → exit ${r.status}, OS error shown, files and registration kept`);
 
+    // the query itself fails (access denied, no bus): never read as "not registered"
+    const queryVerb = platform === "darwin" ? "print" : platform === "win32" ? "/Query" : "is-enabled";
+    r = svc(["status"], { ...env, MYNA_FAKE_OS_FAIL: queryVerb });
+    ok(r.status === 0 && /^登記：查不到/m.test(r.out), `${platform}: status with ${queryVerb} failing → "查不到", not "沒有"`);
+    r = svc(["off"], { ...env, MYNA_FAKE_OS_FAIL: `${queryVerb},${failVerb}` });
+    show(`off (${queryVerb} and ${failVerb} fail)`, r);
+    ok(r.status !== 0 && fs.existsSync(SDIR) && registered(), `${platform}: off with ${queryVerb} failing → still tries ${failVerb}; that failing too → exit ${r.status}, files and registration kept`);
+
     clearCalls(F);
     r = svc(["off"], env);
     show("off", r);
@@ -165,6 +173,13 @@ try {
     const v4 = verbs(calls(F));
     ok(r.status === 0 && !v4.some((v) => ["bootout", "/Delete", "disable"].includes(v)) && /本來就沒有登記/.test(r.out), `${platform}: off with nothing registered → exit 0, no removal call, says so (${JSON.stringify(v4)})`);
 
+    // on again, then off while the query fails: the removal is tried anyway and succeeds
+    svc(["on"], env);
+    clearCalls(F);
+    r = svc(["off"], { ...env, MYNA_FAKE_OS_FAIL: queryVerb });
+    show(`off (${queryVerb} fails)`, r);
+    ok(r.status === 0 && !registered() && !fs.existsSync(SDIR) && verbs(calls(F)).includes(failVerb), `${platform}: off with ${queryVerb} failing → ${failVerb} tried anyway, registration and files gone`);
+
     r = svc(["status"], env);
     ok(r.status === 0 && /^登記：沒有/m.test(r.out) && /沒有開常駐/.test(r.out) && /relay：在跑/.test(r.out), `${platform}: status after off — not registered, no service dir, relay still up`);
 
@@ -180,8 +195,36 @@ try {
     const env = envFor(H, { MYNA_SERVICE_PLATFORM: "darwin", MYNA_FAKE_OS_DIR: F, MYNA_FAKE_OS_NORUN: "1" });
     const r = svc(["on"], env);
     show("on (darwin, no RunAtLoad)", r);
-    ok(r.status === 0 && !(await health()) && /relay：沒有在跑/.test(r.out), "darwin: with launchd not running it, on did not run start.mjs a second way — relay down, says so");
+    ok(r.status !== 0 && !(await health()) && /relay：沒有在跑/.test(r.out) && /relay 沒有起來/.test(r.out), `darwin: with launchd not running it, on did not run start.mjs a second way — relay down, exit ${r.status}`);
+    ok(fs.existsSync(path.join(H, ".myna", "service", "service.json")) && fs.existsSync(path.join(F, "registered-launchctl")), "darwin: relay not up → the registration stays");
     svc(["off"], env);
+  }
+
+  // ============ on with nothing configured: registered, exit 0, says so ==========================
+  for (const platform of ["darwin", "win32"]) {
+    const H = home(`home-unconfigured-${platform}`), F = path.join(TMP, `fake-unconfigured-${platform}`);
+    const env = envFor(H, { MYNA_SERVICE_PLATFORM: platform, MYNA_FAKE_OS_DIR: F });
+    const t0 = Date.now();
+    const r = svc(["on"], env);
+    show(`on (${platform}, not configured)`, r);
+    ok(r.status === 0 && /還沒設定/.test(r.out) && !(await health()) && fs.existsSync(path.join(H, ".myna", "service", "service.json")), `${platform}: on with no bot → registered, exit 0, says to configure first`);
+    ok(Date.now() - t0 < 8000, `${platform}: … without waiting the full 10 s for /health (${Date.now() - t0} ms)`);
+    svc(["off"], env);
+  }
+
+  // ============ linux: daemon-reload fails during off → kept, retried by the next off ==============
+  {
+    const H = home("home-reload"), F = path.join(TMP, "fake-reload");
+    fs.writeFileSync(path.join(H, ".myna", ".env"), BOT);
+    const env = envFor(H, { MYNA_SERVICE_PLATFORM: "linux", MYNA_FAKE_OS_DIR: F });
+    svc(["on"], env);
+    let r = svc(["off"], { ...env, MYNA_FAKE_OS_FAIL: "daemon-reload" });
+    show("off (linux, daemon-reload fails)", r);
+    ok(r.status !== 0 && /daemon-reload/.test(r.out) && fs.existsSync(path.join(H, ".myna", "service")), "linux: daemon-reload failing in off → exit ≠ 0, ~/.myna/service kept");
+    clearCalls(F);
+    r = svc(["off"], env);
+    ok(r.status === 0 && verbs(calls(F)).includes("daemon-reload") && !fs.existsSync(path.join(H, ".myna", "service")), "linux: the next off retries daemon-reload (unit file already gone) and cleans up");
+    stop();
   }
 
   // ============ on: the registration fails =======================================================
