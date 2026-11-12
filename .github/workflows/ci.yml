@@ -116,7 +116,7 @@ jobs:
       - name: Smoke — God mode (permission hook auto-allow + POST /notify, unsent file, edge forwarding; temp HOME, never :7800)
         run: node test/smoke-godmode.mjs
 
-      - name: Smoke — /myna:service on / off / status, start.mjs, ensure-relay's service.json pointer (temp HOME, fake launchctl / schtasks / systemctl for all three OSes, never :7800)
+      - name: Smoke — /myna:service on / off / status, start.mjs, ensure-relay's service.json pointer (temp HOME and APPDATA, fake launchctl / systemctl, all three OSes played, never :7800)
         run: node test/smoke-service.mjs
 
       - name: Smoke — relay daemon lifecycle (fake .env — no real bot)

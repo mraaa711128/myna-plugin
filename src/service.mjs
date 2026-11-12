@@ -74,8 +74,8 @@ export function updatePointer({ root, version, envPath = process.env.MYNA_ENV ||
 // rewrite it. It reports a failure (no myna at the recorded root, service.json unreadable, ensure-relay
 // not starting a relay — e.g. not configured) with one line in relay.log, next to the .env it uses.
 export const START_MJS = `#!/usr/bin/env node
-// Written by myna's scripts/service.mjs on — the OS runs this at login (LaunchAgent, Task Scheduler,
-// systemd --user). It reads service.json next to it and runs <root>/scripts/ensure-relay.mjs, the same
+// Written by myna's scripts/service.mjs on — the OS runs this at login (LaunchAgent, the Windows Startup
+// folder, systemd --user). It reads service.json next to it and runs <root>/scripts/ensure-relay.mjs, the same
 // start a Claude Code SessionStart does. The same text for every myna version; do not edit.
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
@@ -114,12 +114,24 @@ if (why) {
 `;
 
 // --- the OS layer ---------------------------------------------------------------------------------------
-// Every OS command goes through run(): a test points MYNA_SERVICE_LAUNCHCTL / _SCHTASKS / _SYSTEMCTL at a
+// Every OS command goes through run(): a test points MYNA_SERVICE_LAUNCHCTL / _SYSTEMCTL at a
 // fake program (a .mjs/.js path is run with this node), so nothing is ever registered for real.
-// MYNA_SERVICE_PLATFORM (darwin|win32|linux) lets one machine test all three.
+// MYNA_SERVICE_PLATFORM (darwin|win32|linux) lets one machine test all three. Windows runs no command: its
+// registration is a file in the Startup folder under %APPDATA% (a test points APPDATA at a temp dir).
 export const LABEL = "com.myna.relay";      // macOS LaunchAgent
-export const TASK = "Myna relay";            // Windows Task Scheduler
+export const STARTUP = "myna-relay.vbs";     // Windows Startup folder entry
 export const UNIT = "myna-relay.service";   // Linux systemd --user
+
+// The Windows Startup entry: VBScript under wscript (no console of its own) starting node with window
+// style 0 (hidden) — a .cmd always shows its own console window for a moment, even with start /min.
+// UTF-16LE with a BOM: wscript reads that as Unicode, so a user folder with non-ASCII characters works.
+export const startupVbs = ({ node, start }) => {
+  const q = (s) => `""${String(s).replace(/"/g, '""')}""`;
+  return `' Written by myna's scripts/service.mjs on: at login, run ~/.myna/service/start.mjs with no window.\r\n` +
+    `' Remove with: node <myna>/scripts/service.mjs off\r\n` +
+    `CreateObject("WScript.Shell").Run "${q(node)} ${q(start)}", 0, False\r\n`;
+};
+const utf16 = (s) => Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(s, "utf16le")]);
 
 export const platformOf = (env = process.env) => String(env.MYNA_SERVICE_PLATFORM || process.platform);
 
@@ -203,29 +215,33 @@ export function adapter(platform, { run, home = os.homedir(), env = process.env 
     };
   }
   if (platform === "win32") {
-    const query = () => {
-      // `/Query /TN` exits 1 both for "no such task" and "access denied", with a localized message. So list
-      // every task as CSV and look for ours by name: the list failing is "cannot tell", a list without it
-      // is "not there"
-      const r = run("schtasks", ["/Query", "/FO", "CSV", "/NH"]);
-      if (!r.ok) return { registered: null, out: r.out };
-      const ours = `"\\${TASK}"`.toLowerCase();
-      return { registered: r.stdout.split(/\r?\n/).some((l) => l.trim().toLowerCase().startsWith(`${ours},`)), out: "" };
-    };
+    // the per-user Startup folder (shell:startup): no admin rights, no command to run — writing or deleting
+    // one file is the whole registration. Built from APPDATA, never hard-coded.
+    const appdata = env.APPDATA;
+    const file = appdata ? path.join(appdata, "Microsoft", "Windows", "Start Menu", "Programs", "Startup", STARTUP) : null;
+    const noAppdata = { ok: false, out: "環境變數 APPDATA 沒有設定，找不到「啟動」資料夾" };
     return {
-      name: `Windows 工作排程器「${TASK}」`, file: null, runsAtRegister: false,
-      logHint: `schtasks /Query /TN "${TASK}" /V /FO LIST 的「上次執行結果」`,
-      query,
+      name: `Windows「啟動」資料夾 ${STARTUP}`, file, runsAtRegister: false,
+      logHint: "Windows 不記錄「啟動」資料夾項目的執行結果；start.mjs 失敗時看上面的 relay.log",
+      // the user can turn the entry off in Settings → Apps → Startup (Task Manager → Startup apps): that
+      // is kept outside the file, so neither status nor anything here can see it
+      notice: "提醒：「設定 → 應用程式 → 啟動」（或工作管理員的「啟動應用程式」）可以把它停用，status 偵測不到；登入後 relay 沒起來時先看那裡。",
+      query: () => (file ? { registered: fs.existsSync(file), out: "" } : { registered: null, out: noAppdata.out }),
+      // whether the file is exactly what `on` would write for this node + start.mjs
+      matches: ({ node, start }) => { try { return fs.readFileSync(file).equals(utf16(startupVbs({ node, start }))); } catch { return false; } },
       register({ node, start }) {
-        // /TR is one string: both paths quoted (spaces); execFile passes it as one argument, no shell
-        const r = run("schtasks", ["/Create", "/TN", TASK, "/SC", "ONLOGON", "/TR", `"${node}" "${start}"`, "/F"]);
-        return r.ok ? { ok: true, out: r.out } : { ok: false, out: `schtasks /Create: ${r.out}` };
+        if (!file) return noAppdata;
+        try {
+          fs.mkdirSync(path.dirname(file), { recursive: true });
+          writeAtomic(file, utf16(startupVbs({ node, start })));
+          return { ok: true, out: "" };
+        } catch (e) { return { ok: false, out: `${file}: ${e.message}` }; }
       },
       unregister() {
-        const q = query();
-        if (q.registered === false) return { ok: true, out: "", had: false };
-        const r = run("schtasks", ["/Delete", "/TN", TASK, "/F"]);
-        return r.ok ? { ok: true, out: r.out, had: true } : { ok: false, out: `schtasks /Delete: ${r.out}` };
+        if (!file) return fs.existsSync(serviceDir()) ? noAppdata : { ok: true, out: "", had: false };
+        const had = fs.existsSync(file);
+        try { if (had) fs.rmSync(file); } catch (e) { return { ok: false, out: `${file}: ${e.message}` }; }
+        return { ok: true, out: "", had };
       },
     };
   }

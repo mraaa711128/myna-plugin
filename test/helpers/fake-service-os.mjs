@@ -1,11 +1,12 @@
 #!/usr/bin/env node
-// A stand-in for launchctl / schtasks / systemctl in test/smoke-service.mjs — scripts/service.mjs runs it
-// through MYNA_SERVICE_LAUNCHCTL / _SCHTASKS / _SYSTEMCTL, so nothing is ever registered with the real OS.
+// A stand-in for launchctl / systemctl in test/smoke-service.mjs — scripts/service.mjs runs it through
+// MYNA_SERVICE_LAUNCHCTL / _SYSTEMCTL, so nothing is ever registered with the real OS. (Windows runs no
+// command: its registration is a file in the Startup folder, which the test keeps under a temp APPDATA.)
 // Which tool it plays is read from the arguments. State and a log of every call live in MYNA_FAKE_OS_DIR:
 //   calls.jsonl          one {tool, args} line per call
-//   registered-<tool>    present = "registered" (loaded agent, existing task, enabled unit)
-// MYNA_FAKE_OS_FAIL=<word>[,<word>…]   those subcommands (print, bootout, bootstrap, /Query, /Create, /Delete,
-//                            enable, disable, daemon-reload, …) fail with exit 1 "Access is denied."
+//   registered-<tool>    present = "registered" (loaded agent, enabled unit)
+// MYNA_FAKE_OS_FAIL=<word>[,<word>…]   those subcommands (print, bootout, bootstrap, is-enabled, enable,
+//                            disable, daemon-reload, …) fail with exit 1 "Access is denied."
 // MYNA_FAKE_OS_NORUN=1       launchctl bootstrap does not run the plist's program (no RunAtLoad effect)
 // launchctl bootstrap reads the plist and, like RunAtLoad, starts its ProgramArguments (detached).
 import { spawn } from "node:child_process";
@@ -16,7 +17,7 @@ const args = process.argv.slice(2);
 const dir = process.env.MYNA_FAKE_OS_DIR;
 if (!dir) { console.error("fake-service-os: MYNA_FAKE_OS_DIR not set"); process.exit(2); }
 fs.mkdirSync(dir, { recursive: true });
-const tool = args[0] === "--user" ? "systemctl" : /^\//.test(args[0] || "") ? "schtasks" : "launchctl";
+const tool = args[0] === "--user" ? "systemctl" : "launchctl";
 fs.appendFileSync(path.join(dir, "calls.jsonl"), JSON.stringify({ tool, args }) + "\n");
 const verb = tool === "systemctl" ? args[1] : args[0];
 const flag = path.join(dir, `registered-${tool}`);
@@ -43,18 +44,6 @@ if (tool === "launchctl") {
     }
     process.exit(0);
   }
-}
-if (tool === "schtasks") {
-  // the whole list as CSV (what service.mjs asks): a few other tasks, ours when registered
-  if (verb === "/Query" && args.includes("/FO")) {
-    console.log('"\\Microsoft\\Windows\\Defrag\\ScheduledDefrag","N/A","Ready"');
-    console.log('"\\Myna relay helper","N/A","Ready"');
-    if (isOn()) console.log('"\\Myna relay","N/A","Ready"');
-    process.exit(0);
-  }
-  if (verb === "/Query") { if (isOn()) { console.log("TaskName: \\Myna relay"); process.exit(0); } console.error("ERROR: The system cannot find the file specified."); process.exit(1); }
-  if (verb === "/Create") { set(true); console.log('SUCCESS: The scheduled task "Myna relay" has successfully been created.'); process.exit(0); }
-  if (verb === "/Delete") { if (!isOn()) { console.error("ERROR: The system cannot find the file specified."); process.exit(1); } set(false); console.log("SUCCESS"); process.exit(0); }
 }
 if (tool === "systemctl") {
   if (verb === "daemon-reload") process.exit(0);

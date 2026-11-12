@@ -1,11 +1,13 @@
 #!/usr/bin/env node
 // /myna:service (scripts/service.mjs, v0.27.0): start the relay at login. Everything in a temp dir (HOME
 // with a space and "&" in it, the .env, the service files) and on a random port — never ~/.myna, never
-// :7800/:7801. launchctl / schtasks / systemctl are ALWAYS the fake test/helpers/fake-service-os.mjs
-// (MYNA_SERVICE_*), and MYNA_SERVICE_PLATFORM plays each OS on any machine: nothing is registered for real.
+// :7800/:7801. launchctl / systemctl are ALWAYS the fake test/helpers/fake-service-os.mjs (MYNA_SERVICE_*),
+// APPDATA (where the Windows Startup folder is) is ALWAYS inside the temp dir, and MYNA_SERVICE_PLATFORM
+// plays each OS on any machine: nothing is registered for real.
 // A fake bot token whose API base points nowhere: the relay starts and answers /health, nothing reaches an IM.
-//   - on (each OS): start.mjs + service.json written, the OS call's arguments (absolute node path, paths
-//     with spaces), /health answers; on twice (macOS: bootout then bootstrap, start.mjs not run by `on`)
+//   - on (each OS): start.mjs + service.json written, the OS call's arguments / the registration file
+//     (absolute node path, paths with spaces, the Windows .vbs as UTF-16), /health answers; on twice
+//     (macOS: bootout then bootstrap, start.mjs not run by `on`)
 //   - status in each state; off: registration gone, ~/.myna/service gone, the relay STILL running;
 //     off when nothing is registered → exit 0; an OS failure → files kept, exit ≠ 0
 //   - start.mjs: root gone / service.json broken / not configured → one line in relay.log, no crash;
@@ -18,7 +20,7 @@ import { fileURLToPath } from "node:url";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { START_MJS } from "../src/service.mjs";
+import { START_MJS, startupVbs } from "../src/service.mjs";
 
 const HERE = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const ROOT = process.env.MYNA_TEST_ROOT ? path.resolve(process.env.MYNA_TEST_ROOT) : HERE;
@@ -44,17 +46,21 @@ const cleanEnv = (() => {
   return e;
 })();
 const envFor = (home, extra = {}) => ({
-  ...cleanEnv, HOME: home, USERPROFILE: home, RELAY_PORT: String(RP),
+  ...cleanEnv, HOME: home, USERPROFILE: home, APPDATA: path.join(home, "AppData", "Roaming"), RELAY_PORT: String(RP),
   MYNA_GODMODE_FILE: path.join(TMP, "no-godmode"),
-  MYNA_SERVICE_LAUNCHCTL: FAKE, MYNA_SERVICE_SCHTASKS: FAKE, MYNA_SERVICE_SYSTEMCTL: FAKE,
+  MYNA_SERVICE_LAUNCHCTL: FAKE, MYNA_SERVICE_SYSTEMCTL: FAKE,
   ...extra,
 });
-// never let a run reach the real OS tools: refuse unless every override points at the fake
+// never let a run reach the real OS tools or the real Startup folder: refuse unless every override points
+// at the fake and APPDATA (if set) is inside the temp dir
 const guard = (env) => {
-  for (const k of ["MYNA_SERVICE_LAUNCHCTL", "MYNA_SERVICE_SCHTASKS", "MYNA_SERVICE_SYSTEMCTL"]) if (env[k] !== FAKE) throw new Error(`test bug: ${k} is not the fake`);
+  for (const k of ["MYNA_SERVICE_LAUNCHCTL", "MYNA_SERVICE_SYSTEMCTL"]) if (env[k] !== FAKE) throw new Error(`test bug: ${k} is not the fake`);
   if (!["darwin", "win32", "linux"].includes(env.MYNA_SERVICE_PLATFORM)) throw new Error("test bug: MYNA_SERVICE_PLATFORM not set");
   if (!env.MYNA_FAKE_OS_DIR || !env.HOME.startsWith(TMP)) throw new Error("test bug: fake OS dir / HOME not in the temp dir");
+  if (env.APPDATA !== undefined && !env.APPDATA.startsWith(TMP)) throw new Error("test bug: APPDATA not in the temp dir");
 };
+const startupOf = (env) => path.join(env.APPDATA, "Microsoft", "Windows", "Start Menu", "Programs", "Startup", "myna-relay.vbs");
+const utf16 = (s) => Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(s, "utf16le")]);
 const node = (file, args, env, timeout = 45000) => {
   const r = spawnSync(process.execPath, [file, ...args], { env, encoding: "utf8", timeout });
   return { out: ((r.stdout || "") + (r.stderr || "")).trim(), status: r.status };
@@ -88,8 +94,9 @@ try {
     const env = envFor(H, { MYNA_SERVICE_PLATFORM: platform, MYNA_FAKE_OS_DIR: F });
     const SDIR = path.join(H, ".myna", "service"), START = path.join(SDIR, "start.mjs"), REC = path.join(SDIR, "service.json");
     const regFile = platform === "darwin" ? path.join(H, "Library", "LaunchAgents", "com.myna.relay.plist")
-      : platform === "linux" ? path.join(H, ".config", "systemd", "user", "myna-relay.service") : null;
-    const registered = () => fs.existsSync(path.join(F, `registered-${platform === "darwin" ? "launchctl" : platform === "win32" ? "schtasks" : "systemctl"}`));
+      : platform === "linux" ? path.join(H, ".config", "systemd", "user", "myna-relay.service") : startupOf(env);
+    // Windows: the Startup file is the registration; the others: the fake's state
+    const registered = () => platform === "win32" ? fs.existsSync(regFile) : fs.existsSync(path.join(F, `registered-${platform === "darwin" ? "launchctl" : "systemctl"}`));
 
     let r = svc([], env);
     show("status (nothing)", r);
@@ -112,8 +119,13 @@ try {
       ok(JSON.stringify(verbs(cs)) === JSON.stringify(["print", "bootstrap"]) && cs.find((c) => c.args[0] === "bootstrap")?.args.join(" ") === `bootstrap gui/${UID} ${regFile}`, `darwin: launchctl print, then bootstrap gui/${UID} <plist> (${JSON.stringify(verbs(cs))})`);
       ok(cs.some((c) => c.tool === "launchd-run"), "darwin: RunAtLoad ran start.mjs (the fake launchd)");
     } else if (platform === "win32") {
-      const c = cs.find((x) => x.args[0] === "/Create");
-      ok(JSON.stringify(c?.args) === JSON.stringify(["/Create", "/TN", "Myna relay", "/SC", "ONLOGON", "/TR", `"${process.execPath}" "${START}"`, "/F"]), `win32: schtasks /Create /TN "Myna relay" /SC ONLOGON /TR "\\"node\\" \\"start.mjs\\"" /F — ${JSON.stringify(c?.args)}`);
+      const bytes = fs.readFileSync(regFile);
+      const text = bytes.subarray(2).toString("utf16le");
+      ok(regFile.startsWith(path.join(H, "AppData", "Roaming", "Microsoft", "Windows", "Start Menu", "Programs", "Startup")), `win32: the entry is under %APPDATA%\\…\\Startup (temp APPDATA): ${regFile}`);
+      ok(bytes[0] === 0xff && bytes[1] === 0xfe && bytes.equals(utf16(startupVbs({ node: process.execPath, start: START }))), "win32: the .vbs is UTF-16LE with a BOM, exactly what startupVbs() gives");
+      ok(text.includes(`CreateObject("WScript.Shell").Run """${process.execPath}"" ""${START}""", 0, False\r\n`), `win32: WScript.Shell.Run "<node>" "<start.mjs>" with window style 0 (hidden), not waiting`);
+      ok(cs.length === 0, `win32: no OS command run (${JSON.stringify(cs)})`);
+      ok(/設定 → 應用程式 → 啟動/.test(r.out) && /偵測不到/.test(r.out), "win32: on reminds that Settings → Apps → Startup can turn it off unseen");
     } else {
       const unit = read(regFile) || "";
       const q = (s) => `"${s.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/%/g, "%%").replace(/\$/g, "$$$$")}"`;
@@ -133,27 +145,39 @@ try {
     ok(r.status === 0 && registered() && h?.pid === pid, `${platform}: on twice — still registered, same relay pid ${pid}`);
     const v2 = verbs(calls(F));
     if (platform === "darwin") ok(JSON.stringify(v2) === JSON.stringify(["print", "bootout", "bootstrap"]), `darwin: second on = print, bootout, bootstrap (${JSON.stringify(v2)})`);
-    if (platform === "win32") ok(JSON.stringify(v2) === JSON.stringify(["/Create"]), `win32: second on = /Create … /F only (${JSON.stringify(v2)})`);
+    if (platform === "win32") ok(v2.length === 0 && fs.readFileSync(regFile).equals(utf16(startupVbs({ node: process.execPath, start: START }))), "win32: second on rewrites the same .vbs, no command");
     if (platform === "linux") ok(JSON.stringify(v2) === JSON.stringify(["daemon-reload", "enable"]), `linux: second on = daemon-reload, enable (${JSON.stringify(v2)})`);
 
     r = svc(["status"], env);
     show("status (on)", r);
     ok(r.status === 0 && /^登記：有/m.test(r.out) && r.out.includes(`指向：${ROOT}（在），v${VERSION}`) && r.out.includes(`node：${process.execPath}（在）`) && new RegExp(`relay：在跑 v${VERSION.replace(/\./g, "\\.")}（pid ${pid}`).test(r.out), `${platform}: status — registered, root and node there, relay running`);
-    if (regFile) ok(r.out.includes(`登記檔：${regFile}（在）`), `${platform}: status shows the registration file`);
+    if (platform === "win32") {
+      ok(r.out.includes(`登記檔：${regFile}（在，內容正確）`) && /設定 → 應用程式 → 啟動/.test(r.out) && /偵測不到/.test(r.out), "win32: status — the Startup file is there with the right content, and the Settings reminder");
+      // someone edited the entry: status says so
+      const good = fs.readFileSync(regFile);
+      fs.writeFileSync(regFile, utf16(startupVbs({ node: "C:\\other\\node.exe", start: START })));
+      r = svc(["status"], env);
+      ok(r.out.includes("內容跟 on 寫的不一樣") , "win32: status — a .vbs that is not what on writes → says so, rerun on");
+      fs.writeFileSync(regFile, good);
+    } else ok(r.out.includes(`登記檔：${regFile}（在）`) && !/設定 → 應用程式/.test(r.out), `${platform}: status shows the registration file (no Windows reminder)`);
 
-    // off with an OS failure: nothing deleted, exit ≠ 0
-    const failVerb = platform === "darwin" ? "bootout" : platform === "win32" ? "/Delete" : "disable";
-    r = svc(["off"], { ...env, MYNA_FAKE_OS_FAIL: failVerb });
-    show(`off (${failVerb} fails)`, r);
-    ok(r.status !== 0 && /拿掉登記失敗/.test(r.out) && /Access is denied/.test(r.out) && fs.existsSync(START) && fs.existsSync(REC) && registered() && (!regFile || fs.existsSync(regFile)), `${platform}: off with ${failVerb} failing → exit ${r.status}, OS error shown, files and registration kept`);
+    // off with an OS failure: nothing deleted, exit ≠ 0 (Windows: the .vbs cannot be removed — a folder in its place)
+    const failVerb = platform === "darwin" ? "bootout" : platform === "win32" ? null : "disable";
+    if (platform === "win32") { fs.rmSync(regFile); fs.mkdirSync(regFile); }
+    r = svc(["off"], failVerb ? { ...env, MYNA_FAKE_OS_FAIL: failVerb } : env);
+    show(`off (${failVerb || "the .vbs cannot be removed"})`, r);
+    ok(r.status !== 0 && /拿掉登記失敗/.test(r.out) && (platform === "win32" || /Access is denied/.test(r.out)) && fs.existsSync(START) && fs.existsSync(REC) && registered() && fs.existsSync(regFile), `${platform}: off failing to remove the registration → exit ${r.status}, error shown, files and registration kept`);
+    if (platform === "win32") { fs.rmdirSync(regFile); svc(["on"], env); }
 
-    // the query itself fails (access denied, no bus): never read as "not registered"
-    const queryVerb = platform === "darwin" ? "print" : platform === "win32" ? "/Query" : "is-enabled";
-    r = svc(["status"], { ...env, MYNA_FAKE_OS_FAIL: queryVerb });
-    ok(r.status === 0 && /^登記：查不到/m.test(r.out), `${platform}: status with ${queryVerb} failing → "查不到", not "沒有"`);
-    r = svc(["off"], { ...env, MYNA_FAKE_OS_FAIL: `${queryVerb},${failVerb}` });
-    show(`off (${queryVerb} and ${failVerb} fail)`, r);
-    ok(r.status !== 0 && fs.existsSync(SDIR) && registered(), `${platform}: off with ${queryVerb} failing → still tries ${failVerb}; that failing too → exit ${r.status}, files and registration kept`);
+    // the query itself fails (access denied, no bus): never read as "not registered" (Windows has no query)
+    const queryVerb = platform === "darwin" ? "print" : platform === "linux" ? "is-enabled" : null;
+    if (queryVerb) {
+      r = svc(["status"], { ...env, MYNA_FAKE_OS_FAIL: queryVerb });
+      ok(r.status === 0 && /^登記：查不到/m.test(r.out), `${platform}: status with ${queryVerb} failing → "查不到", not "沒有"`);
+      r = svc(["off"], { ...env, MYNA_FAKE_OS_FAIL: `${queryVerb},${failVerb}` });
+      show(`off (${queryVerb} and ${failVerb} fail)`, r);
+      ok(r.status !== 0 && fs.existsSync(SDIR) && registered(), `${platform}: off with ${queryVerb} failing → still tries ${failVerb}; that failing too → exit ${r.status}, files and registration kept`);
+    }
 
     clearCalls(F);
     r = svc(["off"], env);
@@ -163,7 +187,7 @@ try {
     ok(h?.pid === pid && /沒有停/.test(r.out) && /stop-relay/.test(r.out), `${platform}: off did NOT stop the relay (pid ${h?.pid}) and says how to`);
     const v3 = verbs(calls(F));
     if (platform === "darwin") ok(JSON.stringify(v3) === JSON.stringify(["print", "bootout"]), `darwin: off = print, bootout (${JSON.stringify(v3)})`);
-    if (platform === "win32") ok(JSON.stringify(v3) === JSON.stringify(["/Query", "/Delete"]), `win32: off = /Query, /Delete (${JSON.stringify(v3)})`);
+    if (platform === "win32") ok(v3.length === 0, `win32: off = delete the .vbs, no command (${JSON.stringify(v3)})`);
     if (platform === "linux") ok(JSON.stringify(v3) === JSON.stringify(["is-enabled", "disable", "daemon-reload"]) && !v3.includes("stop"), `linux: off = is-enabled, disable, daemon-reload — never stop (${JSON.stringify(v3)})`);
 
     // off when nothing is registered: exit 0, nothing to take away
@@ -174,11 +198,13 @@ try {
     ok(r.status === 0 && !v4.some((v) => ["bootout", "/Delete", "disable"].includes(v)) && /本來就沒有登記/.test(r.out), `${platform}: off with nothing registered → exit 0, no removal call, says so (${JSON.stringify(v4)})`);
 
     // on again, then off while the query fails: the removal is tried anyway and succeeds
-    svc(["on"], env);
-    clearCalls(F);
-    r = svc(["off"], { ...env, MYNA_FAKE_OS_FAIL: queryVerb });
-    show(`off (${queryVerb} fails)`, r);
-    ok(r.status === 0 && !registered() && !fs.existsSync(SDIR) && verbs(calls(F)).includes(failVerb), `${platform}: off with ${queryVerb} failing → ${failVerb} tried anyway, registration and files gone`);
+    if (queryVerb) {
+      svc(["on"], env);
+      clearCalls(F);
+      r = svc(["off"], { ...env, MYNA_FAKE_OS_FAIL: queryVerb });
+      show(`off (${queryVerb} fails)`, r);
+      ok(r.status === 0 && !registered() && !fs.existsSync(SDIR) && verbs(calls(F)).includes(failVerb), `${platform}: off with ${queryVerb} failing → ${failVerb} tried anyway, registration and files gone`);
+    }
 
     r = svc(["status"], env);
     ok(r.status === 0 && /^登記：沒有/m.test(r.out) && /沒有開常駐/.test(r.out) && /relay：在跑/.test(r.out), `${platform}: status after off — not registered, no service dir, relay still up`);
@@ -232,11 +258,28 @@ try {
     console.log("\n--- on: registration refused ---");
     const H = home("home-refused"), F = path.join(TMP, "fake-refused");
     fs.writeFileSync(path.join(H, ".myna", ".env"), BOT);
-    const env = envFor(H, { MYNA_SERVICE_PLATFORM: "win32", MYNA_FAKE_OS_DIR: F, MYNA_FAKE_OS_FAIL: "/Create" });
-    const r = svc(["on"], env);
-    show("on (/Create refused)", r);
-    ok(r.status !== 0 && /登記失敗/.test(r.out) && /Access is denied/.test(r.out) && !(await health()), "on with schtasks /Create refused → exit ≠ 0, OS error shown, no relay started");
+    const env = envFor(H, { MYNA_SERVICE_PLATFORM: "linux", MYNA_FAKE_OS_DIR: F, MYNA_FAKE_OS_FAIL: "enable" });
+    let r = svc(["on"], env);
+    show("on (enable refused)", r);
+    ok(r.status !== 0 && /登記失敗/.test(r.out) && /Access is denied/.test(r.out) && !(await health()), "on with systemctl --user enable refused → exit ≠ 0, OS error shown, no relay started");
     ok(fs.existsSync(path.join(H, ".myna", "service", "service.json")) && /off 清掉/.test(r.out), "on refused: service files kept, says to rerun on or clean with off");
+
+    // Windows: the Startup folder cannot be made (a file where a folder should be)
+    const W = home("home-refused-win"), wenv = envFor(W, { MYNA_SERVICE_PLATFORM: "win32", MYNA_FAKE_OS_DIR: F });
+    fs.writeFileSync(path.join(W, ".myna", ".env"), BOT);
+    fs.mkdirSync(path.dirname(path.dirname(startupOf(wenv))), { recursive: true });
+    fs.writeFileSync(path.dirname(startupOf(wenv)), "not a folder");
+    r = svc(["on"], wenv);
+    show("on (win32, Startup not writable)", r);
+    ok(r.status !== 0 && /登記失敗/.test(r.out) && !(await health()), "win32: the Startup entry cannot be written → exit ≠ 0, error shown, no relay started");
+
+    // Windows without APPDATA: no Startup folder to find — refused, never a guessed path
+    const nenv = envFor(home("home-noappdata"), { MYNA_SERVICE_PLATFORM: "win32", MYNA_FAKE_OS_DIR: F });
+    delete nenv.APPDATA;
+    r = svc(["status"], nenv);
+    ok(/^登記：查不到/m.test(r.out) && /APPDATA/.test(r.out), "win32 without APPDATA: status says it cannot tell (APPDATA not set)");
+    r = svc(["on"], nenv);
+    ok(r.status !== 0 && /APPDATA/.test(r.out), "win32 without APPDATA: on refused, says why");
   }
 
   // ============ linux: no user instance to ask ===================================================
