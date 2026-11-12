@@ -73,17 +73,17 @@ function tgStub() {
   s.notices = () => s.sends().filter((m) => /God mode 已自動同意/.test(m.text || ""));
   return s;
 }
-const hubTg = tgStub(), pc2Tg = tgStub();
+const hubTg = tgStub(), pc2Tg = tgStub(), pc4Tg = tgStub();
 // a Discord REST stub: the gateway it names is a dead local port (the relay never reaches the real Discord)
 const dsrv = http.createServer((req, res) => { res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify(/\/gateway\/bot$/.test(req.url) ? { url: "ws://127.0.0.1:9" } : {})); });
-await Promise.all([hubTg.ready, pc2Tg.ready, new Promise((r) => dsrv.listen(0, "127.0.0.1", r))]);
+await Promise.all([hubTg.ready, pc2Tg.ready, pc4Tg.ready, new Promise((r) => dsrv.listen(0, "127.0.0.1", r))]);
 
 // --- machines (joining itself is test/smoke-remote.mjs) ----------------------------------------------------
 const sha = (s) => crypto.createHash("sha256").update(s).digest("hex");
 const machine = (name) => { const id = crypto.randomBytes(6).toString("hex"); return { id, name, token: `myna_m_${id}_${crypto.randomBytes(32).toString("base64url")}` }; };
-const MBP = machine("mbp"), PC2 = machine("pc2");
+const MBP = machine("mbp"), PC2 = machine("pc2"), PC4 = machine("pc4");
 const HUB_DIR = dirOf("hub"), MACHINES = path.join(HUB_DIR, "machines.json");
-fs.writeFileSync(MACHINES, JSON.stringify({ version: 1, machines: [MBP, PC2].map((m) => ({ id: m.id, name: m.name, sha256: sha(m.token), os: "test", hostname: m.name, created_at: new Date().toISOString() })) }, null, 2));
+fs.writeFileSync(MACHINES, JSON.stringify({ version: 1, machines: [MBP, PC2, PC4].map((m) => ({ id: m.id, name: m.name, sha256: sha(m.token), os: "test", hostname: m.name, created_at: new Date().toISOString() })) }, null, 2));
 
 // --- relays ------------------------------------------------------------------------------------------------
 const up = (url) => until(async () => { try { await fetch(url, { signal: AbortSignal.timeout(400) }); return true; } catch { return false; } }, 10000);
@@ -103,10 +103,11 @@ await relay("hub", H, { MYNA_PROVIDER: "telegram", TELEGRAM_BOT_TOKEN: "111111:H
 const D = freePort();
 await relay("discord", D, { MYNA_PROVIDER: "discord", DISCORD_BOT_TOKEN: "x.y.z", DISCORD_CHANNEL_ID: "123", DISCORD_API_BASE: `http://127.0.0.1:${dsrv.address().port}` });
 const EDGE_TIMING = { MYNA_ROLE: "edge", MYNA_UPSTREAM_CHECK_MS: "250", MYNA_UPSTREAM_GRACE: "2", MYNA_UPSTREAM_RECOVER: "2" };
-const E1 = freePort(), E2 = freePort(), E3 = freePort();
+const E1 = freePort(), E2 = freePort(), E3 = freePort(), E4 = freePort();
 await relay("mbp", E1, { ...EDGE_TIMING, MYNA_UPSTREAM: `http://127.0.0.1:${R}`, MYNA_MACHINE_TOKEN: MBP.token });
 await relay("pc2", E2, { ...EDGE_TIMING, MYNA_UPSTREAM: "http://127.0.0.1:9", MYNA_MACHINE_TOKEN: PC2.token, TELEGRAM_BOT_TOKEN: "222222:PC2-OWN", TELEGRAM_CHAT_ID: "42", TELEGRAM_API_BASE: pc2Tg.url });
 await relay("pc3", E3, { ...EDGE_TIMING, MYNA_UPSTREAM: "http://127.0.0.1:9", MYNA_MACHINE_TOKEN: PC2.token });
+await relay("pc4", E4, { ...EDGE_TIMING, MYNA_UPSTREAM: `http://127.0.0.1:${R}`, MYNA_MACHINE_TOKEN: PC4.token, TELEGRAM_BOT_TOKEN: "444444:PC4-OWN", TELEGRAM_CHAT_ID: "42", TELEGRAM_API_BASE: pc4Tg.url });
 const health = async (port) => { try { return await (await fetch(`http://127.0.0.1:${port}/health`, { signal: AbortSignal.timeout(3000) })).json(); } catch { return null; } };
 await until(async () => (await health(E1))?.upstream?.active);
 
@@ -185,7 +186,7 @@ fs.writeFileSync(PERM, "off\n"); // God mode does not depend on /myna:perm
   const r = await runHook(bash("npm publish")).done;
   hubTg.delayMs = 0;
   const u = unsent().at(-1);
-  ok(allowed(r) && r.ms < 6500 && u?.reason === "timeout" && /npm publish/.test(u.text), `3: Telegram too slow → allowed after ~5 s (${r.ms} ms), unsent "timeout"`);
+  ok(allowed(r) && r.ms < 6500 && /^timeout \(may still have been sent\)$/.test(u?.reason || "") && /npm publish/.test(u.text), `3: Telegram too slow → allowed after ~5 s (${r.ms} ms), unsent "${u?.reason}"`);
 }
 {
   const r = await runHook(bash("echo discord"), { port: D }).done;
@@ -198,6 +199,10 @@ fs.writeFileSync(PERM, "off\n"); // God mode does not depend on /myna:perm
   const r = await runHook(bash("echo cap"), { port: 9 }).done;
   const u = unsent();
   ok(allowed(r) && u.length === 200 && /echo cap/.test(u.at(-1).text) && u[0].text === "old 6", `3: the unsent file keeps the newest 200 lines (${u.length}; first "${u[0]?.text}")`);
+  // many hooks at once on a full file (relay down, several sessions): none of their lines is lost to another's cut
+  const rs = await Promise.all(Array.from({ length: 8 }, (_, i) => runHook(bash(`echo par-${i}`), { port: 9 }).done));
+  const u2 = unsent(), got = Array.from({ length: 8 }, (_, i) => u2.some((x) => x.text.includes(`echo par-${i}`)));
+  ok(rs.every(allowed) && u2.length === 200 && got.every(Boolean) && !fs.existsSync(`${UNSENT}.lock`), `3: 8 hooks at once on a full file → all 8 lines kept, still 200 lines, no lock left (${got.filter(Boolean).length}/8, ${u2.length})`);
 }
 
 // === 4. POST /notify itself ===================================================================================
@@ -227,7 +232,19 @@ fs.rmSync(UNSENT, { force: true });
   const before = unsent().length;
   const r = await runHook(bash("echo from-pc3"), { port: E3 }).done;
   const u = unsent();
-  ok(allowed(r) && u.length === before + 1 && /echo from-pc3/.test(u.at(-1).text), `5: an edge whose hub is away, no bot of its own → still allowed, unsent (${u.at(-1)?.reason})`);
+  ok(allowed(r) && u.length === before + 1 && /echo from-pc3/.test(u.at(-1).text) && /^HTTP 503/.test(u.at(-1).reason), `5: an edge whose hub is away, no bot of its own → 503, still allowed, unsent (${u.at(-1)?.reason})`);
+}
+{
+  // the hub reachable but too slow to answer: it may still send it — the edge must not send a second copy on its own bot
+  await until(async () => (await health(E4))?.upstream?.active);
+  hubTg.delayMs = 5000;
+  const n4 = pc4Tg.notices().length, before = unsent().length;
+  const r = await runHook(bash("echo from-pc4"), { port: E4 }).done;
+  await sleep(3000); // the hub's late send lands; a wrong fallback would have sent on pc4's bot by now
+  hubTg.delayMs = 0;
+  const u = unsent();
+  ok(allowed(r) && pc4Tg.notices().length === n4 && u.length === before + 1 && /HTTP 504.*may still have been sent/.test(u.at(-1).reason) && hubTg.notices().some((m) => /echo from-pc4/.test(m.text)),
+    `5: the hub reachable but no answer in time → 504, no second copy on the edge's own bot, unsent marked "may still have been sent" (${u.at(-1)?.reason})`);
 }
 
 // === 6. off, the toggles, /myna:status ============================================================================
@@ -247,6 +264,10 @@ const script = (name, args, extra = {}) => spawnSync(process.execPath, [src("scr
   ok(r.status === 0 && /God mode 關著/.test(r.stdout), "6: no argument → status: off");
   r = script("godmode.mjs", ["on"]);
   ok(r.status === 0 && fs.existsSync(GOD) && !Number.isNaN(Date.parse(fs.readFileSync(GOD, "utf8"))) && /God mode 開了/.test(r.stdout), "6: /myna:godmode on → the flag file, holding the time it was turned on");
+  const t0 = fs.readFileSync(GOD, "utf8");
+  await sleep(20);
+  r = script("godmode.mjs", ["on"]);
+  ok(r.status === 0 && fs.readFileSync(GOD, "utf8") === t0 && /本來就開著/.test(r.stdout), "6: on again while on → the flag (its time) kept, says it was already on");
   r = script("godmode.mjs", ["on"], { MYNA_PROVIDER: "discord" });
   ok(/還不支援 God mode 的通知/.test(r.stdout), "6: on with a provider other than Telegram → says notices are not supported there");
   r = script("godmode.mjs", ["maybe"]);

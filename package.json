@@ -9,7 +9,7 @@
     "build": "esbuild src/mcp/ask-human.mjs --bundle --platform=node --format=esm --outfile=dist/ask-human.mjs",
     "relay": "node src/relay.mjs",
     "mcp": "node dist/ask-human.mjs",
-    "test": "node test/smoke-autopilot.mjs"
+    "test": "node test/smoke-autopilot.mjs && node test/smoke-godmode.mjs"
   },
   "devDependencies": {
     "@modelcontextprotocol/sdk": "^1.18.0",

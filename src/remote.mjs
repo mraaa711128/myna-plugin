@@ -227,8 +227,9 @@ export function machineStore(file, { onRevoked, onError, onLoad } = {}) {
 const LOCK_WAIT_MS = 10000, LOCK_STALE_MS = 30000;
 const sleepSync = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 const pidAlive = (pid) => { try { process.kill(pid, 0); return true; } catch (e) { return e.code === "EPERM"; } };
-export function withFileLock(file, fn) {
-  const lock = `${file}.lock`, until = Date.now() + LOCK_WAIT_MS, mine = `${process.pid} ${crypto.randomBytes(12).toString("hex")}\n`;
+// opts.waitMs: how long to wait for it (default LOCK_WAIT_MS; God mode's unsent file waits less, src/godmode.mjs)
+export function withFileLock(file, fn, { waitMs = LOCK_WAIT_MS } = {}) {
+  const lock = `${file}.lock`, until = Date.now() + waitMs, mine = `${process.pid} ${crypto.randomBytes(12).toString("hex")}\n`;
   const readLock = (f) => { try { return fs.readFileSync(f, "utf8"); } catch { return null; } };
   const isStale = (content) => {
     const pid = Number(/^(\d+) /.exec(content || "")?.[1]);

@@ -11,6 +11,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { withFileLock } from "./remote.mjs";
 
 export const UNSENT_MAX = 200;
 export const godmodeFile = (env = process.env) => env.MYNA_GODMODE_FILE || path.join(os.homedir(), ".myna", "godmode");
@@ -29,21 +30,30 @@ export function godmodeSince(env = process.env) {
 
 const lines = (text) => text.split(/\r?\n/).filter((l) => l.trim());
 
-// one line appended; the file cut to the newest UNSENT_MAX lines (rewritten through a temp file + rename)
+// one line appended; the file cut to the newest UNSENT_MAX lines (rewritten through a temp file + rename).
+// Several hooks may write at once (relay down, many sessions): the append and the cut run under the file's
+// lock (withFileLock, src/remote.mjs — the .env writers' lock), so a cut never drops a line another hook
+// appended meanwhile. The lock not had within its wait → appended anyway, not cut (the next write cuts it).
 export function appendUnsent(record, env = process.env) {
   const f = unsentFile(env);
-  try {
-    fs.mkdirSync(path.dirname(f), { recursive: true });
-    fs.appendFileSync(f, JSON.stringify(record) + "\n", { mode: 0o600 });
+  const line = JSON.stringify(record) + "\n";
+  const write = () => {
+    fs.appendFileSync(f, line, { mode: 0o600 });
     const all = lines(fs.readFileSync(f, "utf8"));
     if (all.length > UNSENT_MAX) {
       const tmp = `${f}.${process.pid}.tmp`;
       fs.writeFileSync(tmp, all.slice(-UNSENT_MAX).join("\n") + "\n", { mode: 0o600 });
       fs.renameSync(tmp, f);
     }
+  };
+  try {
+    fs.mkdirSync(path.dirname(f), { recursive: true });
+    try { withFileLock(f, write, { waitMs: UNSENT_LOCK_WAIT_MS }); }
+    catch (e) { if (!/is held by another process/.test(e?.message || "")) throw e; fs.appendFileSync(f, line, { mode: 0o600 }); }
     return true;
   } catch { return false; }
 }
+const UNSENT_LOCK_WAIT_MS = 2000; // the hook waits for its notice at most 5 s; this is on top of it
 
 // the unsent notices since a time (ms): {count, file}. Lines that cannot be read are not counted.
 export function unsentSince(since, env = process.env) {

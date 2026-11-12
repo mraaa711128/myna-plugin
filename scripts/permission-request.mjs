@@ -94,8 +94,13 @@ if (GOD && input.tool_name !== "AskUserQuestion") {
   let why = null;
   try {
     const r = await post("/notify", { text, session_id: input.session_id, ...(AGENT_ID ? { agent_id: AGENT_ID } : {}) }, GODMODE_NOTIFY_MS);
-    if (!r.ok) why = `HTTP ${r.status}${await r.json().then((j) => (j?.error ? `: ${j.error}` : ""), () => "")}`;
-  } catch (e) { why = e?.name === "TimeoutError" || e?.name === "AbortError" ? "timeout" : e?.cause?.code || e?.message || "error"; }
+    if (!r.ok) why = `HTTP ${r.status}${await r.json().then((j) => (j?.error ? `: ${j.error}` : ""), () => "")}${r.status === 504 ? " (may still have been sent)" : ""}`;
+  } catch (e) {
+    // a timeout (or a connection cut mid-request) is not a sure "not sent": the relay may still deliver it
+    why = e?.name === "TimeoutError" || e?.name === "AbortError" ? "timeout (may still have been sent)"
+      : e?.cause?.code === "UND_ERR_SOCKET" ? "connection dropped (may have been sent)"
+      : e?.cause?.code || e?.message || "error";
+  }
   if (why) appendUnsent({ at: new Date().toISOString(), session_id: input.session_id ?? null, ...(AGENT_ID ? { agent_id: AGENT_ID } : {}), tool: input.tool_name, reason: why, text });
   process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: "PermissionRequest", decision: { behavior: "allow" } } }), () => process.exit(0));
   await new Promise(() => {}); // the write callback exits

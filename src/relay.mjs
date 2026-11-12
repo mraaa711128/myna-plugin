@@ -1183,17 +1183,20 @@ async function edgeRoute(req, res, url) {
   }
   if (M === "POST" && p === "/notify") {
     // God mode's notice (v0.25.0): the hub's bot when the hub is reachable and takes notices (its /health
-    // features has "notify"); else — or when the hub could not send it — this machine's own bot; else none:
-    // the connection is dropped and the hook keeps the notice in its unsent file. Never held (by the time
-    // a held notice went out the action would long be done; the unsent file is the record).
+    // features has "notify"). This machine's own bot only when the hub surely did not send it: away before
+    // trying, takes no notices (older than 0.25.0), or answered with an error. A forward that got no answer
+    // (timeout, broken link) may still have gone out at the hub — no second copy here: 504, and the hook keeps
+    // the notice in its unsent file marked as maybe sent. No way to send it at all → 503 (surely not sent).
+    // Never held (by the time a held notice went out the action would long be done; the unsent file is the record).
     const pre = await readBody(req, ASK_MAX_BYTES);
     if (pre.tooLarge) { refuseTooLarge(req, res, `request body over ${ASK_MAX_BYTES} bytes`); return true; }
-    let r = { ok: false };
-    if (hub.reachable && hub.features?.includes("notify")) r = await edgeForward(req, "/notify", pre.body, 3000);
-    if (r.ok && r.status === 200) { relayBack(res, r); return true; }
-    if (ownBot.on) { log(`notify: ${r.ok ? `the hub answered HTTP ${r.status}` : hub.reachable ? (hub.features?.includes("notify") ? "the hub could not be reached" : "the hub takes no notices (older than 0.25.0)") : `hub away (${hub.reason})`} — sending on this machine's own bot`); await handleNotify(req, res, LOCAL_SCOPE, pre); return true; }
-    if (r.ok) { relayBack(res, r); return true; }
-    dropConn(req); return true;
+    const viaHub = hub.reachable && hub.features?.includes("notify");
+    const r = viaHub ? await edgeForward(req, "/notify", pre.body, 3000) : null;
+    if (r?.ok && r.status === 200) { relayBack(res, r); return true; }
+    if (r && !r.ok) { log("notify: no answer from the hub (it may have sent it) — not sending a second copy"); send(res, 504, { error: "no answer from the hub — the notice may have been sent there" }); return true; }
+    if (ownBot.on) { log(`notify: ${r ? `the hub answered HTTP ${r.status}` : hub.reachable ? "the hub takes no notices (older than 0.25.0)" : `hub away (${hub.reason})`} — sending on this machine's own bot`); await handleNotify(req, res, LOCAL_SCOPE, pre); return true; }
+    if (r) { relayBack(res, r); return true; }
+    send(res, 503, { error: hub.reachable ? "the hub takes no notices (older than 0.25.0) and this edge has no bot of its own" : `the hub is away (${hub.reason}) and this edge has no bot of its own` }); return true;
   }
   if (M === "POST" && (p === "/session/close" || p === "/session/round-end")) {
     // both places may hold this session's topics: the hub's and this machine's own bot's
