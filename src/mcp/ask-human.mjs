@@ -134,6 +134,10 @@ function logDecision(rec, logDir) {
   } catch (e) { log("logDecision failed:", e.message); }
 }
 
+// who answered, for the decision log: "godmode" when the relay pressed a ✅ question's ✅ itself (God mode on,
+// v0.26.2 — as autopilot's own picks are "auto"), else "human"
+const modeOf = (result) => (result?.by === "godmode" ? "godmode" : "human");
+
 // "question x of y" of a gate asking several related questions — kept in the decision log with the answer
 const partOf = (a) => (a.questionNumber && a.questionTotal ? { questionNumber: a.questionNumber, questionTotal: a.questionTotal } : {});
 
@@ -243,7 +247,8 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
       "Tag each question with `gate` (the same short name for every question of one decision) so each gate gets its own IM topic. " +
       "Several gates may be open at once (e.g. parallel calls): each keeps its own topic and every answer is tied to its own question. " +
       "To get a guard-blocked command approved, pass it in `approves` and start the approving option — and only that one — with \"✅\": tapping it on the phone lets exactly that one command line through ONCE. " +
-      "In autopilot mode this auto-accepts the recommended option (needs recommendedIndex) and logs it instead of asking (never for a question with `approves`).",
+      "In autopilot mode this auto-accepts the recommended option (needs recommendedIndex) and logs it instead of asking (never for a question with `approves`). " +
+      "With Myna God mode on (/myna:godmode — the human's choice, never yours) the relay presses the ✅ of a question with `approves` itself: the answer comes back at once with by:\"godmode\" and the approval works as a tap's would.",
     inputSchema: {
       type: "object",
       properties: {
@@ -259,7 +264,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
         ticket: { type: "string", description: "issue key this session is working on (e.g. 'PROJ-1234'); labels this session's IM topic (renamed in place when it changes). Falls back to MYNA_TICKET when omitted; never inferred from the branch or header." },
         preamble: { type: "string", description: "your reply to the human's last message, shown above the question" },
         logDir: { type: "string", description: "absolute dir to write the decision log (MYNA-DECISIONS.jsonl/.md); pass the run's worktree cwd so decisions travel with the branch. Defaults to cwd." },
-        approves: { type: "string", maxLength: 2000, description: "OPTIONAL — when this question asks the human to approve running one command that a guard blocks (e.g. a push to main, merging a PR): the ONE full command line to run once approved, exactly as you will run it (≤2000 chars; printable characters and newlines only — tabs, control characters and invisible/bidi characters such as U+200B or U+202E are rejected). EXACTLY ONE option, the approving one, MUST start with \"✅\" (e.g. '✅ 核准執行'); no other option may (two ✅ options are rejected). The phone shows the command verbatim under '核准後執行：'. If the human taps the ✅ option on their phone, the relay records an approval that lets exactly this command (whitespace-normalized, same session) through the guard ONCE within its TTL (default 15 min); a ✍️ reply, another option, a cancel or a terminal answer approves nothing. To run a different command, ask again. Autopilot never approves: a question with `approves` always goes to the human." },
+        approves: { type: "string", maxLength: 2000, description: "OPTIONAL — when this question asks the human to approve running one command that a guard blocks (e.g. a push to main, merging a PR): the ONE full command line to run once approved, exactly as you will run it (≤2000 chars; printable characters and newlines only — tabs, control characters and invisible/bidi characters such as U+200B or U+202E are rejected). EXACTLY ONE option, the approving one, MUST start with \"✅\" (e.g. '✅ 核准執行'); no other option may (two ✅ options are rejected). The phone shows the command verbatim under '核准後執行：'. If the human taps the ✅ option on their phone, the relay records an approval that lets exactly this command (whitespace-normalized, same session) through the guard ONCE within its TTL (default 15 min); a ✍️ reply, another option, a cancel or a terminal answer approves nothing. To run a different command, ask again. Autopilot never approves: a question with `approves` always goes to the human — except with God mode on, where the relay presses the ✅ itself (answer by:\"godmode\")." },
       },
       required: ["question", "options"],
     },
@@ -323,8 +328,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req, extra) => {
   }
 
   // --- autopilot: auto-accept the recommended option, no relay, log it ---
-  // An approval (approval attestation) only exists when a human taps ✅ on the phone — an auto-accept could never let
-  // the guarded command through, so a question with `approves` always goes to the human.
+  // An approval (approval attestation) only exists when ✅ is pressed at the relay — by a human on the phone, or by the
+  // relay itself in God mode (v0.26.2) — an auto-accept here could never let the guarded command through, so a
+  // question with `approves` always goes to the relay.
   if (autopilotOn() && args.approves !== undefined) log("autopilot ON but the question carries `approves` → asking the human (only a human tap approves)");
   else if (autopilotOn()) {
     const ri = recommendedIdx(args);
@@ -359,7 +365,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req, extra) => {
     const result = await waitForAnswer(request_id, extra, req.params?._meta?.progressToken);
     const answered_at = new Date().toISOString(); // when this server got the answer (ts = when it was asked)
     if (result.kind === "selection") {
-      logDecision({ ts, answered_at, machine, mode: "human", ...(args.gate ? { gate: args.gate } : {}), ...partOf(args), header: args.header, question: args.question, options: args.options, chosen: result.value, ...(args.approves !== undefined ? { approves: args.approves } : {}) }, args.logDir);
+      logDecision({ ts, answered_at, machine, mode: modeOf(result), ...(args.gate ? { gate: args.gate } : {}), ...partOf(args), header: args.header, question: args.question, options: args.options, chosen: result.value, ...(args.approves !== undefined ? { approves: args.approves } : {}) }, args.logDir);
     }
     return textResult(result);
   } catch (e) {
@@ -410,7 +416,7 @@ async function awaitHuman(args, req, extra) {
     const result = await waitForAnswer(id, extra, req.params?._meta?.progressToken);
     const answered_at = new Date().toISOString();
     if (result.kind === "selection") {
-      logDecision({ ts, answered_at, machine: os.hostname(), mode: "human", ...(info.gate ? { gate: info.gate } : {}), header: info.header, question: info.question, options: info.options, chosen: result.value, ...(info.approves !== undefined ? { approves: info.approves } : {}), reattached: id }, args.logDir);
+      logDecision({ ts, answered_at, machine: os.hostname(), mode: modeOf(result), ...(info.gate ? { gate: info.gate } : {}), header: info.header, question: info.question, options: info.options, chosen: result.value, ...(info.approves !== undefined ? { approves: info.approves } : {}), reattached: id }, args.logDir);
     }
     return textResult({ ...result, request_id: id });
   } catch (e) {

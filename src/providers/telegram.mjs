@@ -752,14 +752,75 @@ export function create(cfg, ctx) {
     return res;
   }
 
-  // God mode's one-way notice (relay POST /notify, v0.25.0): the bound chat's main view — no topic (a
-  // topic is deleted at its end, the notice with it), no buttons, plain text (no parse_mode: a command
-  // line is arbitrary content). Throws when it did not go out, so the relay answers 502.
+  // God mode's one-way notice (relay POST /notify, v0.25.0): no buttons, plain text (no parse_mode: a command
+  // line is arbitrary content). Throws when it did not go out, so the relay answers 502 (504: maybe sent).
+  // Where (v0.26.2): one fixed topic "🔓 God mode" — with Threaded Mode on, the main view is hard to find (the
+  // human missed notices there). Opened by the first notice and kept for good: it is neither a gate nor a chat
+  // topic, so gate / round / session ends (retire, endTopic) never touch it. Its thread is kept with its chat in
+  // MYNA_GODMODE_TOPIC_FILE (default telegram-godmode-topic.json next to .env): a relay restart reuses it, a
+  // re-pair to another chat opens a new one. Deleted by hand → recreated once and sent again. No topic to be
+  // had (TELEGRAM_TOPICS=off, no Threaded Mode, the create refused) → the main view, as before 0.26.2, with a
+  // relay.log line; after a refused create the next try waits GODMODE_RETRY_MS, so a chat without topics does
+  // not pay a failed createForumTopic on every notice.
   const NOTICE_MAX = 4000; // Telegram's limit is 4096 characters
+  const GODMODE_TOPIC = "🔓 God mode";
+  const GODMODE_RETRY_MS = 10 * 60 * 1000;
+  const GODMODE_TOPIC_FILE = cfg.MYNA_GODMODE_TOPIC_FILE
+    || path.join(path.dirname(cfg.MYNA_ENV || path.join(os.homedir(), ".myna", ".env")), "telegram-godmode-topic.json");
+  let godTopic = (() => { try { const j = JSON.parse(fs.readFileSync(GODMODE_TOPIC_FILE, "utf8")); return j?.thread && j.chat != null ? j : null; } catch { return null; } })();
+  let godCreating = null, godRetryAt = 0;
+  const saveGodTopic = () => {
+    try {
+      if (!godTopic) return fs.rmSync(GODMODE_TOPIC_FILE, { force: true });
+      fs.mkdirSync(path.dirname(GODMODE_TOPIC_FILE), { recursive: true });
+      fs.writeFileSync(GODMODE_TOPIC_FILE, JSON.stringify(godTopic, null, 2));
+    } catch (e) { log("godmode topic: could not persist", GODMODE_TOPIC_FILE, e.message); }
+  };
+  // the God mode topic's thread in `chat`, opened if there is none → thread, or undefined (the main view)
+  function godmodeThread(chat) {
+    if (!TOPICS) return Promise.resolve(undefined);
+    if (godTopic && String(godTopic.chat) === chat) return Promise.resolve(godTopic.thread);
+    if (Date.now() < godRetryAt) return Promise.resolve(undefined);
+    // notices at the same time share one create (two would leave an unused topic behind)
+    godCreating ||= (async () => {
+      try {
+        const res = await tg("createForumTopic", { chat_id: chat, name: GODMODE_TOPIC });
+        const thread = res.ok ? res.result?.message_thread_id : undefined;
+        if (thread) {
+          godTopic = { chat, thread, name: GODMODE_TOPIC, created: new Date().toISOString() }; saveGodTopic();
+          log(`godmode: topic "${GODMODE_TOPIC}" created (thread ${thread})`);
+          return thread;
+        }
+        // refused (no Threaded Mode, not a forum, no rights) → wait before trying again; unreachable → next notice tries
+        const refused = res.error_code !== undefined;
+        if (refused) godRetryAt = Date.now() + GODMODE_RETRY_MS;
+        log(`godmode: no topic (${res.description || res.error || "createForumTopic failed"}) — this notice goes to the main view${refused ? `; next try in ${GODMODE_RETRY_MS / 60000} min` : ""}`);
+        return undefined;
+      } finally { godCreating = null; }
+    })();
+    return godCreating;
+  }
+  // → where it went ("topic <thread>" / "main view"), for the relay's log line
   async function sendNotice(text) {
     if (!CHAT_ID) throw new Error("no Telegram chat paired yet — run /myna:pair");
+    const chat = CHAT_ID; // a re-pair mid-send must not split this notice across two chats
     const t = String(text ?? "");
-    const res = await tg("sendMessage", { chat_id: CHAT_ID, text: t.length > NOTICE_MAX ? `${t.slice(0, NOTICE_MAX)}…` : t });
+    const body = { chat_id: chat, text: t.length > NOTICE_MAX ? `${t.slice(0, NOTICE_MAX)}…` : t };
+    let thread = await godmodeThread(chat);
+    let res = await tg("sendMessage", inTopic(thread, body));
+    if (thread && isThreadGone(res)) {
+      // the human deleted it → a new one, once; only the thread that failed is dropped (a racing notice may have replaced it)
+      log(`godmode: topic ${thread} is gone — recreating`);
+      if (godTopic?.thread === thread) { godTopic = null; saveGodTopic(); }
+      thread = await godmodeThread(chat);
+      res = await tg("sendMessage", inTopic(thread, body));
+      if (thread && isThreadGone(res)) {
+        log(`godmode: the new topic ${thread} is gone too — this notice goes to the main view`);
+        if (godTopic?.thread === thread) { godTopic = null; saveGodTopic(); }
+        thread = undefined;
+        res = await tg("sendMessage", body);
+      }
+    }
     if (!res.ok) {
       const e = new Error(`telegram sendMessage failed: ${res.error || res.description || JSON.stringify(res).slice(0, 200)}`);
       // no answer from Telegram (transport error after the retries): it may have taken the message — the relay
@@ -767,6 +828,7 @@ export function create(cfg, ctx) {
       if (res.error_code === undefined) e.maybeSent = true;
       throw e;
     }
+    return thread ? `topic ${thread}` : "main view";
   }
 
   async function sendQuestion(request_id, args = {}) {

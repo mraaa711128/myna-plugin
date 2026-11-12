@@ -46,9 +46,11 @@ const freePort = () => { for (;;) { const p = 20000 + Math.floor(Math.random() *
 const baseEnv = (() => {
   const e = { ...process.env };
   for (const k of Object.keys(e)) if (/^(MYNA_|TELEGRAM_|DISCORD_|SLACK_|RELAY_PORT$|CLAUDE_CODE_SESSION_ID$)/.test(k)) delete e[k];
+  // God mode off whatever the developer's own ~/.myna/godmode says (it would press the ✅ questions below)
+  e.MYNA_GODMODE_FILE = path.join(TMP, "no-godmode");
   return e;
 })();
-const CF = { "CF-Access-Client-Id": "test-client.access", "CF-Access-Client-Secret": "test-secret-value" };
+const CF ={ "CF-Access-Client-Id": "test-client.access", "CF-Access-Client-Secret": "test-secret-value" };
 const CF_ENV = { MYNA_CF_ACCESS_CLIENT_ID: CF["CF-Access-Client-Id"], MYNA_CF_ACCESS_CLIENT_SECRET: CF["CF-Access-Client-Secret"] };
 
 // --- Telegram API stub (the "human") -----------------------------------------------------------

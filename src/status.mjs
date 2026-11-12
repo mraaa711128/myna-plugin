@@ -22,7 +22,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { mynaDir, roleOf, holdSettings } from "./remote.mjs";
 import { keepFile, readKeep } from "./inbox.mjs";
-import { godmodeFile, godmodeSince, unsentSince } from "./godmode.mjs";
+import { godmodeFile, godmodeSince, unsentSince, autopilotState } from "./godmode.mjs";
 
 export const DEADLINE_MS = 6000;
 export const LOG_TAIL_BYTES = 256 * 1024;
@@ -122,7 +122,8 @@ export const SWITCHES = [
     state(cfg, env) {
       const file = this.file(cfg, env), on = fs.existsSync(file);
       const u = on ? unsentSince(godmodeSince(env), env) : null;
-      return { on, isDefault: !on, source: on ? "file" : "default", file, ...(u ? { unsent: u.count, unsent_file: u.file } : {}) };
+      // autopilot_by_godmode (v0.26.2): autopilot is on because /myna:godmode on turned it on (and nobody touched it since)
+      return { on, isDefault: !on, source: on ? "file" : "default", file, ...(u ? { unsent: u.count, unsent_file: u.file } : {}), ...(on ? { autopilot_by_godmode: autopilotState(env).byGodmode } : {}) };
     },
   },
   {

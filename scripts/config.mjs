@@ -95,8 +95,8 @@ const INFO = {
   },
   godmode: {
     values: "on / off",
-    purpose: "所有權限確認自動同意並送通知到 IM（含護欄 hook 攔下來要問的動作），不再問你",
-    more: "整台機器一起開，關掉前一直有效；只允許那一次，不寫永久規則；AskUserQuestion 不算（交給 intercept／autopilot）；通知送不出去時照樣同意，記在 ~/.myna/godmode-unsent.jsonl（/myna:status 看得到筆數）；通知目前只有 Telegram；也可以用 /myna:godmode",
+    purpose: "所有權限確認自動同意（含護欄 hook 攔下來要問的動作）、帶 ✅ 核准的 ask_human 題目自動按 ✅，每一筆送通知到 IM 的「🔓 God mode」topic，不再問你；同時帶開 autopilot",
+    more: "整台機器一起開，關掉前一直有效；只允許那一次，不寫永久規則；AskUserQuestion 和不帶 approves 的題目不算（交給 intercept／autopilot／手機）；開的時候 autopilot 原本關著就一起打開，關的時候還原（期間手動切過 autopilot 就不動它）；通知送不出去時照樣同意，記在 ~/.myna/godmode-unsent.jsonl（/myna:status 看得到筆數）；通知目前只有 Telegram；也可以用 /myna:godmode",
     applies: "馬上生效",
   },
   intercept: {
