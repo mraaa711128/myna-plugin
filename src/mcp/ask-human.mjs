@@ -184,6 +184,53 @@ async function waitForAnswer(request_id, extra, progressToken) {
   }
 }
 
+// --- message_session (tree transport, SPEC §5.4) — listed only on a machine in tree mode (MYNA_TRANSPORT=tree
+// in the environment or ~/.myna/.env); a single machine's tool list stays as it was. The relay stamps who
+// sends (this session's chat registration, proven by its chat token — the relay writes it, 0600, to
+// <myna dir>/session-tokens/<session id>); the AI only picks the address and writes the text.
+const MYNA_DIR = path.dirname(process.env.MYNA_ENV || path.join(os.homedir(), ".myna", ".env"));
+function envFileValue(key) {
+  try {
+    const m = new RegExp(`^${key}=(.*)$`, "m").exec(fs.readFileSync(process.env.MYNA_ENV || path.join(MYNA_DIR, ".env"), "utf8"));
+    return m ? m[1].trim() : "";
+  } catch { return ""; }
+}
+// the relay's rule: with the old multi-machine settings (MYNA_ROLE=edge, MYNA_REMOTE_PORT) the tree stays off
+const setting = (k) => String(process.env[k] ?? envFileValue(k)).trim();
+const treeOn = () => setting("MYNA_TRANSPORT").toLowerCase() === "tree" && setting("MYNA_ROLE").toLowerCase() !== "edge" && !setting("MYNA_REMOTE_PORT");
+const MESSAGE_SESSION_TOOL = {
+  name: "message_session",
+  description:
+    "Send a message to another Claude Code session (on this machine or a directly joined Myna node). Address: '<nick>' for a session on this machine, '<nick>@<node>' on a neighbouring node " +
+    "(the address a received message shows after 「來自 session」 — reply to exactly that). The other session gets it as a prompt from its owner, quoted under a header Myna writes. " +
+    "Waits up to ~20 s for the result: {delivered:true, to} | {delivered:false, reason, error, hint?} (reason: not_found, different_owner, stopped, needs_human, display_failed, unreachable, …) | " +
+    "{delivered:'unknown'} (may or may not have arrived — do NOT resend the same text). A message never stands in for the human's ✅: an action a guard blocks still needs ask_human with `approves`. " +
+    "Needs this session's chat to be registered with the relay (/myna:config chat on).",
+  inputSchema: {
+    type: "object",
+    properties: {
+      to: { type: "string", description: "'<nick>' (this machine) or '<nick>@<node>' (a directly joined node)" },
+      text: { type: "string", maxLength: 3500, description: "the message, plain text, at most 3500 characters" },
+    },
+    required: ["to", "text"],
+  },
+};
+async function messageSession(args) {
+  const out = (o, isError = false) => ({ ...(isError ? { isError: true } : {}), content: [{ type: "text", text: JSON.stringify(o) }] });
+  const sid = sessionId();
+  let token = "";
+  try { token = fs.readFileSync(path.join(MYNA_DIR, "session-tokens", String(sid).replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 128)), "utf8").trim(); } catch {}
+  if (!token) return out({ delivered: false, reason: "not_registered", error: "this session's chat is not registered with the relay (needs Claude Code 2.1.287+ and /myna:config chat on) — nothing was sent" }, true);
+  try {
+    const r = await fetch(`${RELAY}/peer/send`, { method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${token}` }, body: JSON.stringify({ to: args.to, text: args.text }), signal: AbortSignal.timeout(30000) });
+    const j = await r.json().catch(() => ({ delivered: false, reason: "bad_reply", error: `relay HTTP ${r.status}` }));
+    if (r.status === 401) return out({ delivered: false, reason: "not_registered", error: j.error || "the relay does not know this session's token (it restarted? the chat registers again within seconds — try once more)" }, true);
+    return out(j, r.status >= 400);
+  } catch (e) {
+    return out(e.name === "TimeoutError" ? { delivered: "unknown", error: "no answer from the relay in time — it may or may not have arrived; do not resend the same text" } : { delivered: false, reason: "relay_down", error: `the local relay does not answer (${e.cause?.code || e.message})` }, true);
+  }
+}
+
 const mcp = new Server({ name: "myna", version: "0.1.0" }, { capabilities: { tools: {} } });
 
 mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
@@ -242,10 +289,11 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
         logDir: { type: "string", description: "absolute dir to write the decision log (MYNA-DECISIONS.jsonl/.md). Defaults to cwd." },
       },
     },
-  }],
+  }, ...(treeOn() ? [MESSAGE_SESSION_TOOL] : [])],
 }));
 
 mcp.setRequestHandler(CallToolRequestSchema, async (req, extra) => {
+  if (req.params.name === "message_session" && treeOn()) return messageSession(req.params.arguments || {});
   if (req.params.name === "detach_human") return detachHuman(req.params.arguments || {});
   if (req.params.name === "await_human") return awaitHuman(req.params.arguments || {}, req, extra);
   if (req.params.name !== "ask_human") throw new Error(`unknown tool: ${req.params.name}`);

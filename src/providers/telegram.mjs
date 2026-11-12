@@ -831,7 +831,39 @@ export function create(cfg, ctx) {
     return new Set([...[...questionMsg].filter(([, q]) => at(q)), ...[...awaiting].filter(([, w]) => at(w))].map(([rid]) => rid));
   };
 
+  // --- tree transport (SPEC §5.4): a copy of a session-to-session message, with ⏹ / ▶️ -------------
+  // Its buttons live in memory only (after a restart they say "已過期"; each new message brings new ones).
+  const peerTokens = new Map(); // token -> {op: "stop" | "resume", pair}
+  function peerButton(op, pair) {
+    const tk = newToken();
+    peerTokens.set(tk, { op, pair });
+    if (peerTokens.size > 2000) peerTokens.delete(peerTokens.keys().next().value);
+    return { inline_keyboard: [[{ text: op === "stop" ? "⏹ 停止這段對話" : "▶️ 恢復這段對話", callback_data: tk }]] };
+  }
+  // in the session's chat topic when it has one here, else the main chat → whether Telegram took it
+  async function peerShow({ sid, text, pair }) {
+    if (!CHAT_ID) return false;
+    const c = sid ? chatOf(sid) : null;
+    const res = await tg("sendMessage", inTopic(c?.thread ?? undefined, { chat_id: CHAT_ID, text: c && !c.thread ? `[${c.nick}] ${text}` : text, ...(pair ? { reply_markup: peerButton("stop", pair) } : {}) }));
+    return !!res.ok;
+  }
+  // a line to the main chat (a binding done, a pair stopped at its limit)
+  async function notify(text) {
+    if (!CHAT_ID) return false;
+    return !!(await tg("sendMessage", { chat_id: CHAT_ID, text })).ok;
+  }
+
   async function handleUpdate(u) {
+    if (u.callback_query && peerTokens.has(u.callback_query.data)) {
+      const cq = u.callback_query, p = peerTokens.get(cq.data);
+      if (!fromOurChat(cq.message?.chat)) { await tg("answerCallbackQuery", { callback_query_id: cq.id, text: "你沒有權限" }); return; }
+      const r = ctx.node?.peerControl?.(p.op, p.pair) || { ok: false, text: "這台沒有開 tree 模式" };
+      await tg("answerCallbackQuery", { callback_query_id: cq.id, text: r.ok ? "" : r.text.slice(0, 190) });
+      if (!r.ok) return;
+      peerTokens.delete(cq.data);
+      await tg("sendMessage", inTopic(cq.message?.message_thread_id, { chat_id: cq.message.chat.id, text: r.text, reply_markup: peerButton(r.stopped ? "resume" : "stop", p.pair) }));
+      return;
+    }
     if (u.callback_query) {
       const cq = u.callback_query;
       const info = tokens.get(cq.data);
@@ -848,7 +880,12 @@ export function create(cfg, ctx) {
       const chatId = cq.message.chat.id;
       const topic = info.topic;
       if (info.kind === "selection") {
-        ctx.resolve(info.request_id, { kind: "selection", value: info.value }); // resolve FIRST
+        const verdict = ctx.resolve(info.request_id, { kind: "selection", value: info.value }, cq.from); // resolve FIRST
+        // tree mode: an important button pressed by an account not bound to the owner — nothing was resolved
+        if (verdict?.refused) {
+          await tg("sendMessage", inTopic(topic, { chat_id: chatId, text: `🔐 ${verdict.refused}，這次沒有算，按鈕還在。${verdict.link ? `\n要綁定的話，用開著 Tailscale 的手機打開這個連結（10 分鐘內、用一次）：\n${verdict.link}` : "\n在這裡傳 !bind 取得綁定連結。"}` }));
+          return;
+        }
         const r = await tg("sendMessage", inTopic(topic, { chat_id: chatId, text: `✅ 你選了:${mdToPlain(info.value)}` }));
         if (r.ok && r.result?.message_id) { closeMsg(`${chatId}:${r.result.message_id}`, { request_id: info.request_id, kind: "selection" }); ctx.persist?.(); }
       } else if (info.kind === "abort") {
@@ -871,6 +908,15 @@ export function create(cfg, ctx) {
       const msg = u.message;
       const pm = /^[!！]pair(?:\s+(\S+))?\s*$/i.exec(msg.text.trim());
       if (pm) { await takePairing(msg, pm[1]); return; }
+      // tree mode (M4): "!bind" in the paired chat → a one-time link that binds this Telegram account to the
+      // Tailscale account of whoever opens it (only inside the tailnet). Without the tree listener, "!bind"
+      // is left to the chat sessions as before.
+      if (/^[!！]bind\s*$/i.test(msg.text.trim()) && ctx.node?.listening?.() && fromOurChat(msg.chat)) {
+        const r = ctx.node.bindStart(msg.from);
+        await tg("sendMessage", { chat_id: msg.chat.id, ...(msg.message_thread_id ? { message_thread_id: msg.message_thread_id } : {}), reply_parameters: { message_id: msg.message_id, allow_sending_without_reply: true },
+          text: r.link ? `🔐 用開著 Tailscale 的手機打開這個連結，把你的 Telegram 帳號綁到你的 Tailscale 帳號（10 分鐘內、用一次）：\n${r.link}` : `🔐 沒辦法綁定：${r.error}` });
+        return;
+      }
       // the old "/pair <code>": Myna takes no "/" commands on Telegram any more — say how it is typed now
       const oldPair = /^\/pair(?:@\w+)?(?:\s+(\S+))?\s*$/i.exec(msg.text.trim());
       if (oldPair) {
@@ -1166,7 +1212,7 @@ export function create(cfg, ctx) {
 
   return {
     name, start, stop, sendQuestion, sendNotice, closeSession, endRound, cancelQuestion, transferRequest, startPairing, pairStatus,
-    chatOpen, chatProgress, chatTaken, chatClose,
+    chatOpen, chatProgress, chatTaken, chatClose, peerShow, notify,
     onResolve(request_id, result) {
       for (const [t, v] of tokens) if (v.request_id === request_id) tokens.delete(t);
       awaiting.delete(request_id);

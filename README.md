@@ -30,6 +30,7 @@
 - [決策輔助 artifact(gate-brief)](#決策輔助-artifactgate-brief預設開)
 - [Autopilot(自動採用建議 + 決策 log)](#autopilot自動採用建議--決策-log)
 - [多台機器共用一支 bot(v0.20.0)](#多台機器共用一支-botv0200)
+- [不同機器的 session 互傳訊息:tree 模式(第 0 批)](#不同機器的-session-互傳訊息tree-模式第-0-批v0260)
 - [指令速查](#指令速查)
 - [設定檔與路徑](#設定檔與路徑)
 - [純手動安裝(不裝 plugin)](#純手動安裝不裝-plugin)
@@ -724,6 +725,42 @@ MYNA_MACHINE_NAME=win        # 選填,topic 前面的短名稱(預設 hostname)
 
 ---
 
+## 不同機器的 session 互傳訊息:tree 模式(第 0 批,v0.26.0)
+
+新的多機傳輸,走 **Tailscale**(不用 Cloudflare)。每台的 relay 是一個**節點**,下層接到上層;這一版(第 0 批)只做**直接接在一起的兩台**、以及同一台裡的 session 互傳。上面「多台機器共用一支 bot」的 hub/edge 完全沒變,`/myna:hub`、`/myna:join` **不帶 `tree`** 時意思跟以前一樣;同一台只能用其中一種。協定細節見 [SPEC §5.4](SPEC.md)。
+
+**身分**:身分證是你的 Tailscale 帳號(`tailscale:you@example.com`)。每台 relay 的 owner 就是那台登入 Tailscale 的帳號,不用另外設定;貼了 tag 的機器(沒有使用者)由它加入時按 ✅ 的人當 owner。Telegram 帳號只是「按鈕的地方」,要綁一次。
+
+**前置需求**:每台都裝好 Tailscale、登入、在同一個 tailnet,tailnet 開了 MagicDNS 和 HTTPS 憑證;Windows 要開 [unattended mode](https://tailscale.com/kb/1088/run-unattended)。
+
+**上層**(收下層的那台,例如 `mac`):
+
+1. `/myna:hub tree on` — 寫 `MYNA_NODE_PORT`(預設 7802)、開這台自己的一條 `tailscale serve --bg --proxy-protocol=1 --tls-terminated-tcp=8443 tcp://127.0.0.1:7802`、重啟 relay。這台有 bot 時會先停下來,請你綁定:
+2. 在 bot 的聊天室傳 `!bind`,用**開著 Tailscale 的手機**打開 bot 回的連結(只有 tailnet 裡打得開),按「確認綁定」。
+3. 再跑一次 `/myna:hub tree on` → `.env` 寫 `MYNA_TRANSPORT=tree`,tree 模式開了。`/myna:hub tree` 看狀態,`/myna:hub tree off` 關掉(只關自己那一條 serve,`node-children.json` 和綁定留著)。
+
+**下層**(例如 `win`):`/myna:join tree https://mac.<你的 tailnet>.ts.net:8443 --name win`。終端機顯示核對碼;上層 owner 的手機出現「🆕 新節點要接到這台下面」,裡面有那台的**裝置名稱和 Tailscale 帳號**(Tailscale 查的,不是那台自己說的),核對碼一樣再按 ✅(只認綁定過的 Telegram 帳號)。上層沒有 bot 時,在上層跑 `/myna:machines approve <核對碼>`。下層有自己的 bot 時,加入前也要先綁定(同上 1、2 步)。下層沒有 bot 也可以:relay 照樣啟動,它的 session 照樣能收發。
+
+**傳訊息**:tree 模式的機器上,Claude Code 多一個 tool `message_session({to, text})`。地址是 `nick`(同一台)或 `nick@節點`(直接相鄰的那台),例如 `egret@win`。收到的 session 看到:
+
+```
+[Myna · 來自 session kite@mac（tailscale:you@example.com · owner/repo）] 要回覆就用 message_session(to: "kite@mac")
+> 內文每一行都是引用
+```
+
+寄件人、owner、專案(git `origin` 的 `owner/repo`,沒有就 `dir:<資料夾>`)、機器都是 relay 蓋的章,AI 只能寫收件地址和內文。結果有三種:送到了、沒送到(原因:找不到、不同 owner、被 ⏹、自動來回到上限、bot 貼不出去、連不上…)、不確定(等太久,可能送到也可能沒有 — 不要重送同一段)。
+
+- **只收同一個 owner 的 session**:寄件和收件的 owner 是同一張 Tailscale 身分證才交付(你自己的機器之間);跨人的等權限設計好再開。
+- **看得到、停得了**:經過的每台有 bot 就把訊息貼一份(收件那台貼在收件 session 的 topic),附 ⏹。「先給你看才送出」在有 bot 的 relay 預設開:貼不出去就不交付;`.env` 設 `MYNA_PEER_SHOW_FIRST=off` 改成直接交付(沒 bot 的 relay 一律直接交付)。按 ⏹ 兩個方向都停,▶️ 恢復。
+- **防迴圈**:同一對自動來回 20 則就停(`MYNA_PEER_PAIR_MAX`),在那個 session 打字(終端機或 Telegram)才繼續。
+- **`/clear` 之後**:同一個 Claude Code 視窗 `/clear`(或在 app 裡 `/resume` 到別的 session)換來的 session 沒有可信的專案章,只能收、不能送;要傳訊息請開新的 session。
+- **按鈕**:tree 模式下,要緊的鈕 — 帶 `approves` 的 ✅、權限轉手機的允許、新節點加入 — 只認綁到這台 owner 的 Telegram 帳號;別人按了不算,bot 會說要怎麼綁。沒有綁定(或沒有 bot、bot 不是 Telegram)時,這類題目不送手機,直接回終端機確認。其他按鈕、打字不變。別的 session 傳來的訊息**永遠不能代替你的 ✅**。
+- `/myna:bind` 列出、移除綁定;`/myna:machines` 也列出 tree 的下層,`revoke <名稱>` 撤銷(下一個請求就失效)。
+
+**還沒做**(之後的批次):多層(孫節點)、手機上回話往下送、跨節點的 ✅、Discord／Slack 的綁定、拿掉 Cloudflare。**沒驗證**:兩台真機之間(真的 `tailscale serve`、跨機 whois、手機打開綁定連結)。
+
+---
+
 ## 指令速查
 
 | 指令 | 作用 |
@@ -751,7 +788,11 @@ MYNA_MACHINE_NAME=win        # 選填,topic 前面的短名稱(預設 hostname)
 | `/myna:review` | 發一頁決策 Artifact digest |
 | `/myna:hub [status\|on [--name <名稱>]\|off]` | (主節點)`on` = 開遠端 listener(`.env` 沒有 `MYNA_REMOTE_PORT` 時寫入 7801)並重啟 relay;`off` = 關掉並重啟(`machines.json` 保留);`status`(預設)= 看 `role`、`remote`、已加入幾台機器(v0.20.1) |
 | `/myna:join <主節點網址> [--name <名稱>]` | (遠端)加入主節點:終端機顯示核對碼,手機按 ✅ 允許後這台改成 edge,題目轉到主節點(v0.20.0)。開著遠端 listener 的主節點會擋下,先 `/myna:hub off`(v0.20.2) |
-| `/myna:machines [list\|revoke <名稱>]` | (主節點)列出加入的機器(含每台的 Myna 版本)/ 撤銷一台(token 馬上失效、它的題目收回、聊天 topic 改 🔒)(v0.20.0) |
+| `/myna:machines [list\|revoke <名稱>]` | (主節點)列出加入的機器(含每台的 Myna 版本)/ 撤銷一台(token 馬上失效、它的題目收回、聊天 topic 改 🔒)(v0.20.0);也列出、撤銷 tree 的下層(v0.26.0) |
+| `/myna:hub tree [status\|on\|off]` | (tree 上層)開、關收下層的 listener 和這台自己的 `tailscale serve`、進入 tree 模式;有 bot 時先綁定(v0.26.0) |
+| `/myna:join tree <上層網址> [--name <名稱>]` | (tree 下層)接到上層:核對碼 + 上層 owner 按 ✅(或上層 `/myna:machines approve <核對碼>`)(v0.26.0) |
+| `/myna:machines approve [核對碼]` | (tree 上層,沒有能確認的 bot 時)列出等待中的加入要求 / 核准一筆(v0.26.0) |
+| `/myna:bind [list\|remove <…>]` | (tree)列出、移除「哪個 Telegram 帳號可以替哪個 Tailscale 身分按要緊的鈕」;新增只能從手機 `!bind`(v0.26.0) |
 | `/myna:files [status\|keep <天數>\|keep default]` | 手機傳給聊天 session 的檔案在這台保留幾天(收檔後算起,預設 7 天,1～90);不帶參數 = 看設定和目前有幾個檔(v0.22.0) |
 | `/myna:hold [status\|on\|off\|max <30m\|6h\|1d>]` | 別名,改用 `/myna:config hold …`:(遠端)主節點連不上時題目要不要先排著、恢復後送到手機(**預設開**,上限預設 1 天);不帶參數 = 看設定和排著幾題(v0.21.0) |
 

@@ -38,6 +38,11 @@ import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
 import { fileText, FID_RE } from "./inbox.mjs";
+import { projectOf } from "./project.mjs";
+import { writePrivate } from "./remote.mjs";
+
+// a session token file's name (src/node.mjs, src/mcp/ask-human.mjs use the same rule)
+const sessionTokenName = (sid) => String(sid).replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 128);
 
 const NICK_MAX = 24;
 // "!name args" (or full-width "！name") — a command typed on the phone (run as a command in the session,
@@ -61,7 +66,9 @@ export function takeBatch(inbox, max) {
   }
   return out;
 }
-export const takeView = (m) => ({ id: m.id, text: m.text, from: m.from, at: m.at, ...(m.reply_to ? { reply_to: m.reply_to } : {}) });
+// via "session": a message another session sent (tree transport, SPEC §5.4) — `from` is its address and
+// `peer` the stamps its relay put on it; the mod quotes it under a header line of its own
+export const takeView = (m) => ({ id: m.id, text: m.text, from: m.from, at: m.at, ...(m.reply_to ? { reply_to: m.reply_to } : {}), ...(m.via ? { via: m.via } : {}), ...(m.peer ? { peer: m.peer } : {}) });
 // what a local chat mod gets (SPEC §5.3): a message with a file has the file's local path at the front of
 // its text, and file_path (the mod lets the session Read exactly that file without a prompt)
 export const takeLocal = (m) => {
@@ -82,7 +89,10 @@ const takeRemote = (m, files) => {
 // topicMachine(scope): the machine-name prefix of a session's topic ("" = none; see MYNA_TOPIC_MACHINE)
 // progressPerSec: progress posts per second one remote session may make (more → 429)
 // registerNote(): a line for the registering mod to show (an edge whose hub is too old to forward chat)
-export function createChat({ cfg, log, dir, topicMachine = () => "", progressPerSec = 5, registerNote = () => "" }) {
+// tree (tree transport on, SPEC §5.4): () → {tokenDir, onHuman(sid), onClose(sid)} or null. With it a session
+// registers without a bot (no topic — the bot is an add-on, M8), its project stamp is locked at the first
+// registration (2.5), and its token is also written to <tokenDir>/<sid> (0600) for its MCP server's /peer/send
+export function createChat({ cfg, log, dir, topicMachine = () => "", progressPerSec = 5, registerNote = () => "", tree = () => null }) {
   const SECRET_FILE = cfg.MYNA_RELAY_SECRET_FILE || path.join(dir, "relay-secret");
   const FILE = cfg.MYNA_CHAT_FILE || path.join(dir, "chat-sessions.json");
   // a session that has not polled for this long is probably stuck or gone — the sender is told
@@ -152,6 +162,7 @@ export function createChat({ cfg, log, dir, topicMachine = () => "", progressPer
   const ctx = {
     isLive: live,
     get: (sid) => sessions.get(sid),
+    list: () => [...sessions.values()].filter((s) => !s.closed).map((s) => s.nick),
     byNick: (nick) => { const n = normNick(nick); for (const [sid, s] of sessions) if (!s.closed && s.nick === n) return sid; return null; },
     // queue a message for the session → {queued, closed?, stale?} (stale: say so to the sender, once in a while)
     deliver(sid, m) {
@@ -205,7 +216,8 @@ export function createChat({ cfg, log, dir, topicMachine = () => "", progressPer
     for await (const c of req) { chunks.push(c); size += c.length; if (size > MAX_BODY) { reply(413, { error: "body too large" }); return true; } }
     let body;
     try { body = JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}"); } catch (e) { reply(400, { error: `bad JSON: ${e.message}` }); return true; }
-    if (!provider?.chatOpen) { reply(501, { error: `chat is Telegram-only for now (provider: ${provider?.name})` }); return true; }
+    const T = remote ? null : tree();
+    if (!provider?.chatOpen && !T) { reply(501, { error: `chat is Telegram-only for now (provider: ${provider?.name})` }); return true; }
 
     if (url.pathname === "/chat/register") {
       // a remote machine's token was checked by the remote listener; locally only the relay secret registers
@@ -213,6 +225,17 @@ export function createChat({ cfg, log, dir, topicMachine = () => "", progressPer
       const sid = body.session_id ? (remote ? scope.sid(body.session_id) : String(body.session_id)) : "";
       if (!sid) { reply(400, { error: "session_id required" }); return true; }
       const s = sessions.get(sid) || { inbox: [], registered: new Date().toISOString() };
+      if (T) {
+        // the project stamp: from what the session froze at its start (remote, root), locked once set
+        // project_untrusted: the mod froze nothing for this id before the AI ran (/clear, in-app /resume) —
+        // a stamp it had from its own start is kept; otherwise it gets none and cannot send (node.mjs)
+        if (body.project_untrusted === true) { if (!s.project) Object.assign(s, { project: null, project_source: "untrusted" }); }
+        else {
+          const pj = projectOf({ remote: body.project_remote, root: body.cwd });
+          if (s.project && s.project !== pj.project) { log(`chat: session ${sid} registered again with project ${pj.project} — locked to ${s.project}, refused`); reply(409, { error: `project_locked: this session is ${s.project}` }); return true; }
+          Object.assign(s, pj);
+        }
+      }
       const reopened = !!s.closed;
       s.nick = uniqueNick(body.nick || s.nick, sid);
       if (body.label !== undefined) s.label = String(body.label).slice(0, 80);
@@ -225,8 +248,9 @@ export function createChat({ cfg, log, dir, topicMachine = () => "", progressPer
       const token = crypto.randomBytes(24).toString("hex");
       tokens.set(token, sid); lastSeen.set(sid, Date.now());
       save();
+      if (T?.tokenDir) { try { writePrivate(path.join(T.tokenDir, sessionTokenName(sid)), `${token}\n`); } catch (e) { log("chat: could not write the session token file", e.message); } }
       let topic = null;
-      try { topic = await provider.chatOpen(sid, { nick: s.nick, label: s.label, machine: s.machine, reopened }); } catch (e) { log("chatOpen err", e.message); }
+      if (provider?.chatOpen) { try { topic = await provider.chatOpen(sid, { nick: s.nick, label: s.label, machine: s.machine, reopened }); } catch (e) { log("chatOpen err", e.message); } }
       log(`chat: session ${sid} registered as ${s.nick}${reopened ? " (reopened)" : ""}${remote ? ` (machine ${scope.name})` : ""}`);
       const note = remote ? "" : registerNote();
       reply(200, { token, nick: s.nick, topic: topic ?? null, queued: s.inbox.length, ...(note ? { note } : {}) });
@@ -282,13 +306,15 @@ export function createChat({ cfg, log, dir, topicMachine = () => "", progressPer
         if (recent.length >= progressPerSec) { posts.set(sid, recent); reply(429, { error: `too many progress posts (${progressPerSec} per second)`, retry_after_ms: Math.max(50, 1000 - (now - recent[0])) }); return true; }
         recent.push(now); posts.set(sid, recent);
       }
-      try { provider.chatProgress(sid, body, { cwd: s.cwd }); } catch (e) { log("chatProgress err", e.message); }
+      // a person typed (terminal, or the phone): the tree's per-pair auto-reply count starts over
+      if (body.event === "start" && (body.origin === "terminal" || body.origin === "phone")) T?.onHuman?.(sid);
+      try { provider.chatProgress?.(sid, body, { cwd: s.cwd }); } catch (e) { log("chatProgress err", e.message); }
       reply(200, { ok: true, queued: s.inbox.length });
       return true;
     }
     if (url.pathname === "/chat/nick") {
       s.nick = uniqueNick(body.nick, sid); save();
-      try { await provider.chatOpen(sid, { nick: s.nick, label: s.label, machine: s.machine }); } catch (e) { log("chatOpen err", e.message); }
+      if (provider?.chatOpen) { try { await provider.chatOpen(sid, { nick: s.nick, label: s.label, machine: s.machine }); } catch (e) { log("chatOpen err", e.message); } }
       reply(200, { nick: s.nick });
       return true;
     }
@@ -310,6 +336,9 @@ export function createChat({ cfg, log, dir, topicMachine = () => "", progressPer
     for (const [t, owner] of tokens) if (owner === sid) tokens.delete(t);
     save();
     wakeTakers(sid);
+    const T = tree();
+    if (T?.tokenDir) { try { fs.rmSync(path.join(T.tokenDir, sessionTokenName(sid)), { force: true }); } catch {} }
+    T?.onClose?.(sid);
     try { await provider.chatClose?.(sid); } catch (e) { log("chatClose err", e.message); }
     log(`chat: session ${sid} (${s.nick}) ${why}${unread ? ` — ${unread} unread message(s) dropped` : ""}`);
   }
@@ -317,6 +346,7 @@ export function createChat({ cfg, log, dir, topicMachine = () => "", progressPer
   return {
     ctx, handle,
     secretOk: (t) => sameSecret(t), // the relay secret (an edge forwarding chat to its hub checks it too)
+    sidOfToken: (t) => (t ? tokens.get(String(t)) || null : null), // a local session's own chat token → its id (/peer/send)
     attach(p) { provider = p; },
     count: () => [...sessions.values()].filter((s) => !s.closed).length,
     // a machine was revoked: every chat session of it ends (topics 🔒, inboxes cleared)

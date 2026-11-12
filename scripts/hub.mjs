@@ -24,6 +24,8 @@ const envPath = cfg.MYNA_ENV;
 const relayPort = Number(process.env.RELAY_PORT || 7800); // same as ensure-relay / stop-relay
 const argv = process.argv.slice(2);
 const cmd = String(argv[0] || "status").toLowerCase();
+// /myna:hub tree …: the tree transport (scripts/tree.mjs) — everything below is the old hub, unchanged
+if (cmd === "tree") await (await import("./tree.mjs")).hubTree(argv.slice(1));
 const USAGE = "用法：hub.mjs [status] | on [--name <名稱>] | off";
 const fail = (m) => { console.error(`myna hub：${m}`); process.exit(1); };
 

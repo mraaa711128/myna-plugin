@@ -101,6 +101,9 @@ jobs:
       - name: Smoke — chat through the hub + questions held while it is away (hub + edges, stubbed Telegram + tunnel)
         run: node test/smoke-edge-chat.mjs
 
+      - name: Smoke — tree transport batch 0 (four relays, fake tailscale CLI + serve stubs with PROXY lines, stubbed Telegram, never :7800/:7801/:7802)
+        run: node test/smoke-tree.mjs
+
       - name: Smoke — /myna:hold on / off / max / status (temp HOME, fake relay)
         run: node test/smoke-hold.mjs
 

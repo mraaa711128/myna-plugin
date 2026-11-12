@@ -1,6 +1,6 @@
 # Async Human-Gate Bridge — SPEC (v3, 定稿)
 
-> **Status:** 已實作並持續修訂(目前 v0.25.0;各版內容見下方各節的「後續修訂」;多機共用 relay 的協定見 §5.1,子節點轉送聊天和斷線排隊見 §5.2,從手機傳檔案給聊天 session 見 §5.3)
+> **Status:** 已實作並持續修訂(目前 v0.26.0;各版內容見下方各節的「後續修訂」;多機共用 relay 的協定見 §5.1,子節點轉送聊天和斷線排隊見 §5.2,從手機傳檔案給聊天 session 見 §5.3,tree 傳輸(第 0 批:相鄰節點的 session 互傳)見 §5.4)
 > **Type:** Flow tooling(AI agent 工作流程的基礎建設)
 > **Home:** 獨立 repo(Claude Code plugin「myna」)。
 
@@ -550,6 +550,107 @@ sequenceDiagram
 - `test/chat-mod-read.test.ts`:同一個 `tool.check` 在 Claude Code 自己的 mod 測試工具(`claude plugin test`)裡跑(大小寫不同但其實是另一個檔、舊 CLI 沒有 `realPath` 的退路、上層是 link、stat 被拒);需要 Claude Code CLI,不在 CI。
 - 兩支 smoke 都支援 `MYNA_TEST_ROOT=<另一份 checkout>`:指 0.21.1 時都會失敗。
 
+
+## 5.4 tree 傳輸:第 0 批,相鄰節點的 session 互傳(v0.26.0)
+
+每台 relay 是同一種**節點**,排成樹:下層主動連上層,每個節點只記自己的上層和直接下層。第 0 批只做**直接 join 的相鄰兩個節點**之間、以及同一個節點裡的 session 互傳,地址到 `nick@節點`。多層地址、`via`、`hop_limit`、拿掉 Cloudflare 是第 1 批;手機回話往下送是第 2 批;✅ 跨節點是第 3 批。
+
+**跟舊的 hub/edge 並存**:§5.1~§5.3 的程式、7801 listener、`/machines/*`、`machines.json`、`machine-token`、Cloudflare 路徑、`/myna:hub`／`/myna:join` 不帶 `tree` 時的行為都沒動。同一台只能用一種:舊的多機設定(`MYNA_ROLE=edge` 或 `MYNA_REMOTE_PORT`)和 tree 設定同時在時,tree 關掉、舊的照常(`/health` 的 `node.off` 寫原因),`/myna:hub tree`、`/myna:join tree` 會擋下、不改 `.env`。沒有任何 tree 設定的單機,`/health` 沒有 `node`、沒有 `/peer/send`、MCP 沒有 `message_session`,行為不變。
+
+### 身分(誰是誰)
+
+- **身分證**＝Tailscale 帳號,寫成 `tailscale:<login>`(`tailscale whois --json` 的 `UserProfile.LoginName`,不分大小寫)。
+- **relay 的 owner**＝這台登入 Tailscale 的帳號(啟動時 whois 自己的 tailnet 位址)。**tagged 裝置**沒有使用者:owner 由它加入時在上層按 ✅ 的人指派(上層 `node-children.json` 記著,join 成功時告訴下層,存在下層的 `node-parent.json`)。
+- **IM 帳號**只是按鈕的地方:Telegram 帳號用一次性連結綁到身分證(`bindings.json`,0600)。
+- 所有 `tailscale` 呼叫都經過 `src/tailscale.mjs`(`MYNA_TAILSCALE_CLI` 可換成別的 CLI;`.mjs` 用 node 跑,測試用假的)。relay 只讀(`status --json`、`whois --json`);改設定的只有 `/myna:hub tree on|off` 開關**自己那一條** `tailscale serve`,從不 `serve reset`。
+
+### 設定和檔案(都在 `~/.myna/`)
+
+| 名稱 | 誰寫 | 內容 |
+|---|---|---|
+| `.env` `MYNA_TRANSPORT=tree` | `/myna:hub tree on`、`/myna:join tree` | tree 模式(要緊的鈕只認綁定、`message_session`、沒 bot 也啟動) |
+| `.env` `MYNA_NODE_PORT`(預設 7802)、`MYNA_NODE_SERVE_PORT`(預設 8443) | `/myna:hub tree on` | 節點 listener(收下層、綁定連結)和它前面的 `tailscale serve` port |
+| `node-children.json`(0600) | 上層 | 下層:`{id, name, sha256, tailnet:{stable_id, name, addrs}, login, tags, owner, bot_id, …, revoked_at?}`,token 只存雜湊;格式和 `machines.json` 相同(同一套 `machineStore`),但是另一個檔 |
+| `node-token`(0600)、`node-parent.json` | 下層 | 上層發的 token(`myna_m_<id>_…`);上層網址、自己的名稱、指派的 owner、上層的 `{name, stable_id, owner}` |
+| `bindings.json`(0600) | 綁定頁、`/myna:bind remove` | `{bindings:[{im:"telegram:<id>", identity:"tailscale:<login>", name, at}]}` |
+| `session-tokens/<session id>`(0600) | relay(tree 模式) | 那個 session 的 chat token,讓同一個 session 的 MCP server 呼叫 `/peer/send` |
+| `peer-pairs.json` | relay | 被 ⏹ 停住的對 |
+| `peer-results.json` | relay | 1 小時內交付成功的 `<寄件裝置 StableID>:<id>`(重啟後同一封再來不會再交付一次) |
+
+### 節點 listener(`127.0.0.1:MYNA_NODE_PORT`)
+
+只接在 `tailscale serve --bg --proxy-protocol=1 --tls-terminated-tcp=<serve port> tcp://127.0.0.1:<port>` 後面:每條連線第一行一定是 PROXY v1(`PROXY TCP4|TCP6 <src> <dst> <sport> <dport>\r\n`,≤ 107 bytes、5 秒內),沒有或格式錯就直接關掉連線、不回 HTTP。來源位址在每條連線第一次驗證時 `tailscale whois` 一次(不沿用別條連線的結果),同一條連線的 keep-alive 請求共用;401 時連線一起關掉。whois 既沒有使用者(`tagged-devices` 不算)也沒有 tag 的裝置一律不收。
+
+| endpoint | 驗證 | 用途 |
+|---|---|---|
+| `POST /node/join`、`GET /node/join/<id>` | 不用 token(whois 一定要查得到) | 加入:同 §5.1 的核對碼、enroll secret 只送雜湊、long-poll 等結果、token 只給一次(回程掉了 TTL 內可以重拿) |
+| `GET|POST /bind/<code>` | 不用 token(whois,要有使用者帳號) | GET 顯示「把哪個 Telegram 帳號綁到哪張身分證」並發一次性 nonce(表單裡一份、`SameSite=Strict` cookie 一份);POST 兩份都要對、身分跟 GET 一樣、不是別的網站送來的(`Origin`／`Sec-Fetch-Site`)才綁 |
+| `GET /node/health` | token＋裝置 | 上層的名稱、StableID、owner,`bot_id`,`node_protocol: 1` |
+| `POST /node/send` | token＋裝置 | 下層往上送一封信,回應就是結果 |
+| `POST /node/take {wait_ms ≤ 25000, ack}` | token＋裝置 | 下層等上層要給它的信(long-poll)。下層只 ack 已經回報結果的;沒結果的信 20 秒後再給一次(下層去重) |
+| `POST /node/result {id, result}` | token＋裝置 | 下層回報它拿走的信的結果 |
+
+**token＋裝置**(M3):`Authorization: Bearer <node token>` 對到 `node-children.json` 的一筆(撤銷的不算),**而且**這條連線 whois 出來的 `StableID` 跟那筆一樣、帳號(tagged:沒有帳號、tags 一樣)跟 join 時一樣;少一個就 401。token 外流到別台裝置、或那台換了登入帳號,都不能用。
+
+下層確認上層:上層網址只收 `https://<主機>:<port>`,主機要在本機 tailnet 的 MagicDNS 網域底下(TLS 憑證是 Tailscale 替那個名稱申請的);join 時記下上層的 `StableID`,之後每次上層名稱解析到新的位址就 whois 一次,對不上就停用往上送(`/health` 的 `node.parent.reason`)。
+
+### 加入(M2):`/myna:join tree <上層網址> [--name <n>]`
+
+1. 上層對 PROXY 來源 whois:查不到、或沒有使用者也沒有 tag → 403。新的加入要求每 `MYNA_JOIN_INTERVAL_MS`(預設 60 秒)一筆、同時最多 3 筆(同 `/machines/join`),在發題目之前檢查。名稱跟上層自己、已加入的下層、等待中的重複 → 409;下層的 `bot_id` 跟上層一樣 → 409。上層查不到自己的 owner → 503。
+2. 核准:
+   - 上層的 bot 是 Telegram、而且有 Telegram 帳號綁到上層 owner → 手機題目「🆕 新節點要接到這台下面」,寫出**裝置名稱和 Tailscale 帳號**(tagged:「tagged：`tag:…`，按 ✅ 後 owner 會是你（tailscale:…）」)和核對碼。只有綁到上層 owner 的帳號按 `✅ 允許` 才算。
+   - 否則在上層終端機 `/myna:machines approve <核對碼>`(先列出 whois 結果);tagged 的上層不能用終端機核准(那等於裝置自己同意自己)。
+3. 核准後 `node-children.json` 多一筆,下層拿到 token、`{name, owner(指派或自己的帳號), parent:{name, stable_id, owner}}`。
+- 核准後 TTL 內沒取走 token → 那筆下層撤銷(同 `/machines/join`)。
+- `/myna:hub tree on` 先確認 Myna 自己的 listener 拿到 `MYNA_NODE_PORT`,才建 `tailscale serve`(port 被別的程式佔用時不會把它開到 tailnet);serve 是不是自己的,精確比對 `TCPForward`、`ProxyProtocol`、`TerminateTLS`,`serve status` 讀不到就停。
+- 撤銷:上層 `/myna:machines revoke <名稱>`(同時查 `machines.json` 和 `node-children.json`,同名的都撤),下一個請求就 401;等著往下送的信回 `unreachable`、排著和已發出還沒結果的信丟掉,正在等的 take 醒來也只回 401。
+- 沒有 bot 的最上層:`/myna:hub tree on` 一次寫 `MYNA_NODE_PORT` 和 `MYNA_TRANSPORT=tree`(沒有綁定這一步);`off` 時直接停掉 relay。`off` 只關「還指到這個節點」的那條 serve,關不掉就在改設定之前結束。
+
+### 綁定(M4)
+
+- 在 bot 的聊天室傳 `!bind`(只在開著節點 listener 的 relay 才攔;沒開時照舊交給聊天 session)→ bot 回 `https://<這台的 MagicDNS 名稱>:<serve port>/bind/<code>`(10 分鐘、用一次,綁著傳 `!bind` 的那個 Telegram 帳號)。用 tailnet 裡的裝置打開 → whois → 確認頁 → POST 才寫入。tagged 裝置、whois 查不到的位址打開 → 403。
+- **要緊的鈕**(tree 模式才檢查):帶 `approves` 的那個 ✅ 選項、權限轉手機(`kind:"permission"`)的 ✅ 選項、加入的 `✅ 允許`。按的人(`callback_query.from`)要綁到這台 owner;`is_bot`、匿名管理員、沒綁的都不算 — 題目不 resolve、按鈕留著,bot 回一句原因和綁定連結。其他按鈕、打字、訊息格式都不變。
+- tree 模式下帶 `approves` 或 `kind:"permission"` 的 `/ask`:這台沒有 bot、bot 不是 Telegram(Discord／Slack 這批不做綁定)、或 owner 沒有綁定 → 不送手機,馬上 `{kind:"unreachable"}`,交給終端機。
+- `/myna:bind [list | remove …]` 列出、移除綁定。
+
+### session 登記和專案章(M8、2.4、2.5)
+
+- tree 模式下 `/chat/register` 不需要 bot(沒有 bot 時 `topic: null`,一樣有 nick、inbox、token)。
+- chat mod 在 `session.start` 回傳前就在本機凍結 `$.session.root()` 和 `$.session.repo()` 的 `remote`,之後每次註冊都送這份(`project_remote`);註冊照舊不等。
+- 同一個程序之後換成別的 session id(`/clear`、in-app `/resume`,沒有 `session.start`)時,那個 id 沒有在 AI 跑工具前凍結過:註冊帶 `project_untrusted`,relay 不給它專案章(之前有可信的就保留),這種 session 能收、不能送(`no_project`,開新的 session)。
+- relay 把 remote 正規化成 `owner/repo`(不看 host、不分大小寫;Azure DevOps 是 `org/project/repo`),沒有 remote 是 `dir:<資料夾名>`,記在 session 紀錄(`project`、`project_source`)。同一個 session id 之後註冊帶不同的專案 → 409(tree 模式才檢查)。
+- tree 模式下註冊成功時,relay 把 session 的 chat token 寫到 `session-tokens/<session id>`(0600),關閉時刪掉。
+
+### 送訊息:`message_session({to, text})` → `POST /peer/send`
+
+- MCP tool 只在 tree 模式列出(環境變數或 `.env` 的 `MYNA_TRANSPORT=tree`,而且沒有 `MYNA_ROLE=edge`、`MYNA_REMOTE_PORT` — 跟 relay 同一條規則)。它讀自己 session 的 token 檔,`Authorization: Bearer <token>` 呼叫本機 relay。沒 token → 401。
+- `to`:`<nick>`(這台)或 `<nick>@<節點>`。字元只有 a-z 0-9 `_` `-`(nick)和節點名稱規則,`.`、第二個 `@` 都不收(`bad_address`)。內文去掉看不見的字元,≤ 3500 字。
+- relay 蓋章(M6),AI 只寫 `to` 和內文:
+
+```json
+{ "v": 1, "id": "<16 hex>", "kind": "chat", "to": "egret@c", "from": "kite@p",
+  "owner": "tailscale:stanley@example.com", "project": "owner/repo", "project_source": "git",
+  "machine": { "name": "p", "stable_id": "<StableID>" }, "session": "<session id>",
+  "budget_ms": 20000, "body": { "text": "…" } }
+```
+
+- 路由:節點部分是自己 → 本機;是某個直接下層 → 往下(那個下層的 take);是上層 → 往上(`/node/send`);都不是 → `not_found`(hint 列這台的 session、直接下層、上層)。上層收到下層送來、收件不是自己的 → `not_found`(第 0 批不轉)。
+- **上層核對章**(只核對直接鄰居):`from` 的節點、`machine.name` 是那個下層的名稱,`machine.stable_id` 是那條連線的裝置,`owner` 是那條連線 whois 出來的帳號(tagged:上層記的指派 owner)。對不上 → `bad_stamp`。下層收到上層的信:`from` 的節點是上層名稱、`machine.stable_id` 是 join 時記的上層、`owner` 是上層的帳號。
+- **收件那台**:① 收件 session 存在;② 規則(Q7):寄件 `owner` 要等於這台的 owner,不然 `different_owner`;③ 這一對的 ⏹、自動來回上限;④ 顯示:這台有 bot 就把信貼一份(收件 session 的 topic,沒有就主聊天室,附 ⏹)。「**先給你看才送出**」(`MYNA_PEER_SHOW_FIRST`,有 bot 時預設開,`off` 關;沒 bot 一律直接交付):開著時貼不出去 → `display_failed`,不交付,`/health` 的 `node.display_failed` 加一。寄件那台有 bot 也貼一份(不擋)。⑤ 放進 inbox(`via:"session"`、`from`、`peer:{owner, project, project_source, machine}`)。
+- chat mod 把 `via:"session"` 的訊息寫成 `[Myna · 來自 session kite@p（owner · project）] 要回覆就用 message_session(to: "kite@p")`,內文每行前面加 `> `。只有其他 session 的訊息時,這個回合在手機上標「🔗 其他 session 的訊息」,不算人打字。
+- **結果原路回去**:`{delivered:true, to}`/`{delivered:false, reason, error, hint?}`/`{delivered:"unknown"}`。每一跳等下一跳的結果;`budget_ms`(`MYNA_PEER_BUDGET_MS`,預設 20000)用完 → `unknown`。
+- **在不在線**:下層有一條開著的 take,或上一條結束不到 3 秒;都不是 → 立刻 `unreachable`,不排隊。
+- **去重**:每台記 1 小時的 `<寄件裝置 StableID>:<id> → 結果`;同一封再來拿同一個結果,只交付一次。交付成功的那筆在寫進 inbox 的同一步寫到 `peer-results.json`,relay 重啟後還在。
+- **⏹ 和上限**:每一對(這台的 session,對方地址)的狀態放在兩端各一份;名額在檢查的同一步就先佔(同時送很多則也越不過上限),沒送到才還回去,「不確定」的照算;兩個方向都經過兩端,所以停一端就兩個方向都擋。⏹ 按在哪一則 📨 上就停那台那一份(▶️ 恢復、計數歸零),停住的存在 `peer-pairs.json`。自動來回 `MYNA_PEER_PAIR_MAX`(預設 20)則 → `needs_human`(🛑 貼一次);那一端的 session 有人打字(終端機或手機,`/chat/progress` 的 `origin` 是 `terminal`／`phone`)才歸零,另一端要在它那邊打字。
+- 不管規則怎麼放行,受護欄管的動作還是只認 ✅(`/attest` 不變);別的 session 傳來的訊息不能代替核准。
+
+### 測試
+
+`test/smoke-tree.mjs`:四個真的 relay(暫存 HOME、隨機 port)、假的 tailscale CLI(`test/helpers/fake-tailscale.mjs`,每台一個「裝置」)、每條連線一個代替 `tailscale serve` 的 TCP stub(先送 PROXY 行)、Telegram stub。不碰真的 Tailscale、`~/.myna`、7800/7801/7802。
+
+### 後續修訂
+
+- **v0.26.0**:第 0 批(上面全部)。沒有跨兩台機器實測(真的 `tailscale serve`、跨機 whois、手機打開綁定連結都沒驗)。
 
 ## 6. Telegram UX
 

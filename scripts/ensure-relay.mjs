@@ -53,7 +53,8 @@ if (role === "edge") {
   const configured =
     cfg.TELEGRAM_BOT_TOKEN || // no chat yet is fine: the relay has to be up to take /myna:pair
     (cfg.DISCORD_BOT_TOKEN && cfg.DISCORD_CHANNEL_ID) ||
-    (cfg.SLACK_BOT_TOKEN && cfg.SLACK_APP_TOKEN && cfg.SLACK_CHANNEL_ID);
+    (cfg.SLACK_BOT_TOKEN && cfg.SLACK_APP_TOKEN && cfg.SLACK_CHANNEL_ID) ||
+    String(cfg.MYNA_TRANSPORT || "").trim().toLowerCase() === "tree"; // a tree node runs without a bot of its own (SPEC §5.4)
   if (!configured) {
     console.log("myna: not configured — relay not started. Run /myna:setup <token> (Telegram) or /myna:configure discord|slack … (see README).");
     process.exit(0);

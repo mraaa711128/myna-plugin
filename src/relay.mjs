@@ -73,6 +73,7 @@ import { validateAskArgs, normalizeCommand, isApproveOption, approveOptionOf, on
 import { createChat } from "./chat.mjs";
 import { createEdgeChat } from "./edge-chat.mjs";
 import { applyNetAttemptTimeout } from "./net.mjs";
+import { createNode, treeSettings, nodeFiles, JOIN_ALLOW as NODE_JOIN_ALLOW } from "./node.mjs";
 import {
   PROTOCOL, PROTOCOL_HEADER, ENROLL_SECRET_HEADER, REQUEST_ID_HEADER, VERSION_HEADER, FEATURES, LOCAL_ID, NAME_RE, CODE_RE, ASK_MAX_BYTES_DEFAULT,
   roleOf, machinesFile, seenFile, machineStore, newMachineId, newMachineToken, sha256hex, sameHex, bearerOf,
@@ -187,6 +188,14 @@ const APPROVAL_TTL_MS = (() => {
   return n;
 })();
 
+// Tree transport (SPEC §5.4, src/node.mjs): MYNA_TRANSPORT=tree, MYNA_NODE_PORT, ~/.myna/node-parent.json.
+// One machine runs the old hub/edge or the tree, never both: with the old settings present the old path
+// runs exactly as before and the tree stays off (said in the log and /health).
+const TREE_CFG = treeSettings(cfg);
+const TREE_CONFIGURED = TREE_CFG.tree || !!TREE_CFG.portRaw || fs.existsSync(nodeFiles(cfg, path.dirname(ENV_PATH)).parent);
+const TREE_CONFLICT = TREE_CONFIGURED && MULTI ? `the old multi-machine settings are on (${EDGE ? "MYNA_ROLE=edge" : "MYNA_REMOTE_PORT"}) — one machine runs either the old hub/edge or the tree` : "";
+// a tree node may run without a bot of its own (it forwards; its sessions still talk) — M8
+const TREE_NO_BOT_OK = TREE_CFG.tree && !TREE_CONFLICT;
 // pick the provider: explicit MYNA_PROVIDER, else the first configured one
 const want = String(cfg.MYNA_PROVIDER || "").trim().toLowerCase();
 let mod;
@@ -197,13 +206,14 @@ if (want) {
     // an edge needs no IM of its own (SPEC §5.1): a provider named without its keys (an .env from before
     // the join) means it has none — forward only, do not refuse to run
     if (EDGE) { log(`MYNA_PROVIDER=${want} but its keys are missing in ${ENV_PATH} — this edge has no bot of its own, forwarding only`); mod = undefined; }
+    else if (TREE_NO_BOT_OK) { log(`MYNA_PROVIDER=${want} but its keys are missing in ${ENV_PATH} — this tree node has no bot of its own`); mod = undefined; }
     else { log(`MYNA_PROVIDER=${want} but its keys are missing in ${ENV_PATH} — see .env.example`); process.exit(1); }
   }
 } else {
   // a fully configured provider first; else one that only waits to be paired (telegram: token, no chat yet)
   mod = PROVIDERS.find((p) => p.configured(cfg)) || PROVIDERS.find((p) => p.pairable?.(cfg));
-  // an edge needs no IM of its own: without one it only forwards to the hub
-  if (!mod && !EDGE) { log(`no IM provider configured (telegram/discord/slack keys all missing in ${ENV_PATH}) — see .env.example`); process.exit(1); }
+  // an edge needs no IM of its own: without one it only forwards to the hub (a tree node: the same)
+  if (!mod && !EDGE && !TREE_NO_BOT_OK) { log(`no IM provider configured (telegram/discord/slack keys all missing in ${ENV_PATH}) — see .env.example`); process.exit(1); }
 }
 
 // state
@@ -347,7 +357,21 @@ const approvalExpired = (a, now = Date.now()) => { const t = Date.parse(a.answer
 // The command comes from p.approves, set by /ask in THIS process and never journaled: a question
 // adopted from the journal (asked before a restart) records nothing even when its ✅ is tapped —
 // otherwise an edited journal could pair a button the human sees with a different command.
-function resolveFromIM(request_id, result) {
+// who: the IM user who pressed (Telegram passes callback_query.from). Tree mode only (M4): an important
+// button — the ✅ of an ask with `approves`, a permission prompt's allow, a join's allow — counts only when
+// that user is bound to this relay's owner; otherwise nothing is resolved and {refused, link?} goes back
+// to the provider (the buttons stay; it tells the human how to bind).
+function resolveFromIM(request_id, result, who) {
+  if (node.active && result?.kind === "selection") {
+    const q = pending.get(request_id);
+    const important = node.isJoinQuestion(request_id) ? result.value === NODE_JOIN_ALLOW
+      : !!q && q.result === undefined && ((typeof q.approves === "string" && result.value === q.approveOption) || (q.meta?.kind === "permission" && isApproveOption(result.value)));
+    if (important) {
+      const g = node.mayPress(who);
+      if (!g.ok) { log(`request ${request_id}: important button pressed by ${who?.id ? `telegram:${who.id}` : "an unknown user"} — not bound to the owner, not counted`); return { refused: g.why, ...(g.link ? { link: g.link } : {}) }; }
+    }
+  }
+  if (node.onTap(request_id, result)) return;
   // a tap on a join request's buttons (not a question of any session — never in `pending`)
   if (joinByQ.has(request_id)) return joinAnswered(joinByQ.get(request_id), result);
   const p = pending.get(request_id);
@@ -567,7 +591,11 @@ const chat = createChat({
   cfg, log, dir: path.dirname(ENV_PATH), topicMachine: (scope) => topicMachine(scope || LOCAL_SCOPE),
   // an edge chatting on its own bot because its hub is older than 0.21.0: the mod says so
   registerNote: () => (EDGE && CHAT_FORWARD && hub.features && !hub.features.includes("chat") ? `${OLD_HUB_CHAT}，聊天改用這台自己的 bot` : ""),
+  tree: () => (node?.active ? { tokenDir: node.sessionTokenDir, onHuman: node.onHuman, onClose: node.onSessionClosed } : null),
 });
+// the tree transport (inert unless configured); provider is read at call time — it may change on an edge
+let node = null;
+node = createNode({ cfg, log, dir: path.dirname(ENV_PATH), version: VERSION, machineName: MACHINE_NAME, chat, provider: () => provider, botId: () => (provider && provider.name !== "none" ? botIdentity(provider.name, cfg) : null), conflict: TREE_CONFLICT });
 // an edge whose hub forwards chat relays /chat/* there (src/edge-chat.mjs); its state rides in edge-state.json
 const edgeChat = EDGE ? createEdgeChat({ hub, log, secretOk: chat.secretOk, save: () => hub.save(), dir: path.dirname(ENV_PATH), cfg }) : null;
 if (edgeChat) {
@@ -581,8 +609,8 @@ if (edgeChat) {
 const chatMode = () => (CHAT_FORWARD && hub.features?.includes("chat") ? (hub.reachable ? "forwarded" : "down") : ownBot.on ? "own-bot" : "unsupported");
 const OLD_HUB_CHAT = "主節點的 Myna 版本不支援轉送聊天（要 0.21.0 以上）";
 let provider;
-if (!EDGE || ownBot.on) {
-  try { provider = mod.create(cfg, { resolve: resolveFromIM, log, persist, chat: chat.ctx }); }
+if (mod && (!EDGE || ownBot.on)) {
+  try { provider = mod.create(cfg, { resolve: resolveFromIM, log, persist, chat: chat.ctx, ...(node.active || node.listenerConfigured ? { node } : {}) }); }
   catch (e) { log(e.message); process.exit(1); }
 } else provider = NO_IM;
 chat.attach(provider);
@@ -751,6 +779,17 @@ async function handleAsk(req, res, scope, pre) {
   // a remote machine's /cancel waits for this send to finish (entry.sending): an edge that gave the
   // question up may cancel it while Telegram is still sending it, and only a sent message can be retracted
   entry.inFlight = true; // runtime only: see cancelPermissions
+  // tree mode (M4): an important question (✅ that approves a command, a permission prompt) goes to the
+  // phone only when someone there can press it — the provider tells who pressed (Telegram) and an IM
+  // account is bound to this relay's owner. Otherwise the asker gets unreachable at once and falls back
+  // to the terminal (deliberate: no bound account, no ✅ on the phone).
+  if (node.active && (typeof args.approves === "string" || args.kind === "permission") && !(provider.name === "telegram" && node.ownerBound())) {
+    const why = provider.name !== "telegram" ? `tree mode: ${provider.name === "none" ? "this relay has no bot" : `${provider.name} cannot tell who pressed a button`}` : "tree mode: no Telegram account is bound to this relay's owner (send !bind in the chat)";
+    log(`request ${request_id}: important question not sent to the phone — ${why}`);
+    resolveRequest(request_id, { kind: "unreachable", error: why });
+    delete entry.inFlight; entry.lastPoll = Date.now();
+    return send(res, 200, { request_id });
+  }
   try {
     const sending = provider.sendQuestion(request_id, args);
     // a remote /cancel, or an edge giving its own bot up (hub.onBot), waits for the send to finish
@@ -1246,6 +1285,7 @@ const server = http.createServer(async (req, res) => {
   const refused = localRefusal(req, { checkOrigin: !url.pathname.startsWith("/chat/"), checkProxy: MULTI });
   if (refused) { log(`local: 403 ${req.method} ${url.pathname} — ${refused}`); return send(res, 403, { error: refused }); }
   if (EDGE && await edgeRoute(req, res, url)) return;
+  if (await node.handleLocal(req, res, url)) return; // tree: /peer/send, /node/joins, /node/approve
   if (await chat.handle(req, res, url)) return;
   if (req.method === "GET" && url.pathname === "/health") {
     // identity + liveness for ensure-relay / `/myna:relay status`. `pending` = gates still waiting
@@ -1254,7 +1294,8 @@ const server = http.createServer(async (req, res) => {
     if (EDGE) open += hub.forwarded.size + hub.queued.size; // questions waiting on (or held for) the hub count too
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({ ok: true, name: "myna-relay", version: VERSION, provider: provider.name, pid: process.pid, root: ROOT, started_at: STARTED_AT, pending: open, detached: [...pending.values()].filter((p) => p.detached).length, handoff: true, attest: true, approval_ttl_ms: APPROVAL_TTL_MS, journal: PENDING_FILE, chat: !!provider.chatOpen, chat_sessions: chat.count(), net_attempt_ms: NET_ATTEMPT_MS,
-      role: ROLE, protocol: PROTOCOL, machine: MACHINE_NAME, ...(EDGE ? edgeHealth() : {}), remote: REMOTE_PORT ? { port: REMOTE_PORT, listening: remoteListening, machines: machines.active().length, joining: [...joins.values()].filter((j) => j.status === "pending").length } : null }));
+      role: ROLE, protocol: PROTOCOL, machine: MACHINE_NAME, ...(EDGE ? edgeHealth() : {}), remote: REMOTE_PORT ? { port: REMOTE_PORT, listening: remoteListening, machines: machines.active().length, joining: [...joins.values()].filter((j) => j.status === "pending").length } : null,
+      ...(TREE_CONFIGURED ? { node: node.health() } : {}) }));
     return;
   }
   // pairing (Telegram): /myna:pair asks for a one-time code; the human sends `/pair <code>` from the
@@ -1375,6 +1416,9 @@ server.listen(PORT, "127.0.0.1", () => {
   if (adopted && (adopted.open || adopted.answered)) log(`adopted ${adopted.open} open gate(s) + ${adopted.answered} answered-uncollected (${adopted.detached} detached) from the previous relay (v${adopted.from || "?"}, journal ${adopted.saved_at}) — buttons already on the phone stay valid`);
   if (EDGE) log(`edge → hub ${hub.url} (${hub.reachable ? "reachable" : `not reachable: ${hub.reason}`}; CF Access headers ${hub.cf ? "on" : "off"}); own bot: ${ownBot.on ? `${ownBot.id || provider.name} — fallback while the hub is away` : ownBot.reason}`);
   provider.start();
+  // the tree transport (its own listener on MYNA_NODE_PORT, the link to its parent) — only once this
+  // process owns the local port, like the remote listener below
+  node.start().catch((e) => log("node: start failed:", e.message));
   // machines revoked while no relay ran: checked once this process owns the port (a second relay that
   // exits above never touches the journal) — now, or at the first good read of machines.json
   listening = true;
