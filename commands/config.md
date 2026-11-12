@@ -1,5 +1,5 @@
 ---
-description: Myna 設定 — 一個指令看和改所有開關（autopilot、intercept、stopcatch、brief、perm、murmur、hold、chat）和常用的 .env 設定（topics、perm-delay）
+description: Myna 設定 — 一個指令看和改所有開關（autopilot、godmode、intercept、stopcatch、brief、perm、murmur、hold、chat）和常用的 .env 設定（topics、perm-delay）
 argument-hint: "[項目] [值]"
 ---
 Show or change a Myna setting and report the result.
@@ -13,6 +13,7 @@ Run: `node "${CLAUDE_PLUGIN_ROOT}/scripts/config.mjs" $ARGUMENTS`
 | item | values | stored in | takes effect |
 |---|---|---|---|
 | `autopilot` | `on` / `off` | `~/.myna/autopilot` | at once |
+| `godmode` | `on` / `off` | `~/.myna/godmode` | at once |
 | `intercept` | `on` / `off` | `~/.myna/intercept` | at once |
 | `stopcatch` | `on` / `off` | `~/.myna/stopcatch` | at once |
 | `brief` | `on` / `off` | `~/.myna/brief` | at once |
@@ -23,6 +24,6 @@ Run: `node "${CLAUDE_PLUGIN_ROOT}/scripts/config.mjs" $ARGUMENTS`
 | `topics` | `auto` / `off` | `TELEGRAM_TOPICS` in `~/.myna/.env` | after `/myna:relay restart` |
 | `perm-delay` | seconds (0 or more) | `MYNA_PERMISSION_DELAY` in `~/.myna/.env` | the next permission dialog |
 
-A switch is changed by the same script as its own command (`/myna:autopilot` and so on), so both read and write the same setting. `chat` is answered by Myna's chat mod before this text is used; if the script says the chat mod is not loaded, pass that on as is.
+A switch is changed by the same script as its own command (`/myna:autopilot`, `/myna:godmode` and so on), so both read and write the same setting. Turn `godmode` on only when the user has just asked for it in this conversation — never by yourself. `chat` is answered by Myna's chat mod before this text is used; if the script says the chat mod is not loaded, pass that on as is.
 
 Show the script's output to the user, in Traditional Chinese, in one or two lines (the whole list, or the single item's lines, as is when no value was given). When `topics` changed, say the relay has to be restarted for it to apply (`/myna:relay restart`) — do not restart it yourself. If the script refused the value, say what it accepts; do not retry with another value.

@@ -4,7 +4,7 @@
 //                                line on what it is for
 //   config.mjs <item>            that item only, in full: also where it is kept and when a change applies
 //   config.mjs <item> <value>    change it:
-//     a switch (autopilot, intercept, stopcatch, brief, perm, murmur, hold) → its own script
+//     a switch (autopilot, godmode, intercept, stopcatch, brief, perm, murmur, hold) → its own script
 //       (scripts/<item>.mjs) with the value, its output as is: same flag files, same reading
 //     topics / perm-delay → ~/.myna/.env (TELEGRAM_TOPICS / MYNA_PERMISSION_DELAY): the line replaced, or
 //       added. The value is checked first; a bad one changes nothing.
@@ -93,6 +93,12 @@ const INFO = {
     more: "題目要有建議選項（recommendedIndex），沒有就照常送到手機；決定記在專案的 MYNA-DECISIONS.jsonl / .md",
     applies: "馬上生效",
   },
+  godmode: {
+    values: "on / off",
+    purpose: "所有權限確認自動同意並送通知到 IM（含 FRIDAY 護欄攔下的動作），不再問你",
+    more: "整台機器一起開，關掉前一直有效；只允許那一次，不寫永久規則；AskUserQuestion 不算（交給 intercept／autopilot）；通知送不出去時照樣同意，記在 ~/.myna/godmode-unsent.jsonl（/myna:status 看得到筆數）；通知目前只有 Telegram；也可以用 /myna:godmode",
+    applies: "馬上生效",
+  },
   intercept: {
     values: "on / off",
     purpose: "AI 用 AskUserQuestion 問的選擇題改送到手機（relay 連不上時照常在終端機選）",
@@ -147,7 +153,7 @@ const INFO = {
 };
 
 // --- one line per item ----------------------------------------------------------------------------------
-const ORDER = ["autopilot", "intercept", "stopcatch", "brief", "perm", "murmur", "hold", "chat", "topics", "perm-delay"];
+const ORDER = ["autopilot", "godmode", "intercept", "stopcatch", "brief", "perm", "murmur", "hold", "chat", "topics", "perm-delay"];
 const pad = (k) => k.padEnd(11);
 function line(item) {
   if (item === "chat") {

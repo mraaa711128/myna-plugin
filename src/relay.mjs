@@ -765,6 +765,25 @@ async function handleAsk(req, res, scope, pre) {
   send(res, 200, { request_id });
 }
 
+// POST /notify {text, session_id?, agent_id?} (v0.25.0, God mode): a one-way notice to the bound chat's
+// main view — no buttons, no topic, no journal, no retry, no queue. 200 = sent; 501 = this provider has no
+// notices (only Telegram has sendNotice); 502 = the IM refused / could not be reached. A remote machine's
+// notice gets its machine name, as /ask gets it on the topic (topicMachine).
+async function handleNotify(req, res, scope, pre) {
+  const { body, tooLarge } = pre || await readBody(req, ASK_MAX_BYTES);
+  if (tooLarge) { log(`rejecting /notify (413): body over ${ASK_MAX_BYTES} bytes${scope.remote ? ` from machine=${scope.name}` : ""}`); return refuseTooLarge(req, res, `request body over ${ASK_MAX_BYTES} bytes`); }
+  const { v: args, err } = jsonOf(body);
+  if (err) return send(res, 400, { error: `bad JSON: ${err.message}` });
+  if (!args || typeof args.text !== "string" || !args.text.trim()) return send(res, 400, { error: "text (a non-empty string) required" });
+  const who = `${scope.remote ? ` from machine=${scope.name}` : ""}${args.session_id ? ` session ${scope.sid(args.session_id)}` : ""}`;
+  if (typeof provider.sendNotice !== "function") { log(`notify${who}: ${provider.name} cannot send notices (501)`); return send(res, 501, { error: `${provider.name} cannot send notices` }); }
+  const label = topicMachine(scope);
+  try { await provider.sendNotice(label ? `${args.text}\n機器：${label}` : args.text); }
+  catch (e) { log(`notify${who}: not sent — ${e.message}`); return send(res, 502, { error: `notice not sent: ${e.message}` }); }
+  log(`notify${who}: sent`);
+  send(res, 200, { ok: true });
+}
+
 // body (optional JSON) {why: "answered", text}: the asker took the human's answer another way (e.g. a reply to the
 // message it posted before the question) — the phone says so instead of "handled in the terminal"
 async function handleCancel(res, id, scope, body = "") {
@@ -1033,13 +1052,14 @@ async function handleRemote(req, res) {
     // bot_id: which bot this hub polls (Telegram: getMe's numeric id, the part of the token before ":")
     // — an edge with the same bot must not poll it too
     // features (0.21.0): what this hub takes beyond protocol 1 — "chat" when its provider has chat topics
-    return send(res, 200, { ok: true, name: "myna-relay", version: VERSION, protocol: PROTOCOL, role: "hub", machine: { id: m.id, name: m.name }, bot_id: botIdentity(provider.name, cfg), features: FEATURES.filter((f) => f !== "chat" || !!provider.chatOpen) });
+    return send(res, 200, { ok: true, name: "myna-relay", version: VERSION, protocol: PROTOCOL, role: "hub", machine: { id: m.id, name: m.name }, bot_id: botIdentity(provider.name, cfg), features: FEATURES.filter((f) => (f !== "chat" || !!provider.chatOpen) && (f !== "notify" || typeof provider.sendNotice === "function")) });
   }
   // chat through the hub (SPEC §5.2): an edge relays its sessions' /chat/* — scoped to its machine
   if (req.method === "POST" && /^\/chat\/(register|take|progress|nick|close)$/.test(url.pathname)) { await chat.handle(req, res, url, scope); return; }
   // a file of one of its chat sessions (SPEC §5.3): the edge keeps its own copy for the session there
   if (req.method === "GET" && /^\/chat\/file\/[^/]+$/.test(url.pathname)) { await chat.handle(req, res, url, scope); return; }
   if (req.method === "POST" && url.pathname === "/ask") return handleAsk(req, res, scope);
+  if (req.method === "POST" && url.pathname === "/notify") return handleNotify(req, res, scope);
   const am = url.pathname.match(/^\/answer\/([a-f0-9]+)$/);
   if (req.method === "GET" && am) return handleAnswer(res, am[1], scope);
   const cm = url.pathname.match(/^\/cancel\/([a-f0-9]+)$/);
@@ -1161,6 +1181,20 @@ async function edgeRoute(req, res, url) {
     if (ownBot.on) { log(`hub away (${hub.reason}) — asking on this machine's own bot`); await handleAsk(req, res, LOCAL_SCOPE, pre); return true; }
     dropConn(req); return true;
   }
+  if (M === "POST" && p === "/notify") {
+    // God mode's notice (v0.25.0): the hub's bot when the hub is reachable and takes notices (its /health
+    // features has "notify"); else — or when the hub could not send it — this machine's own bot; else none:
+    // the connection is dropped and the hook keeps the notice in its unsent file. Never held (by the time
+    // a held notice went out the action would long be done; the unsent file is the record).
+    const pre = await readBody(req, ASK_MAX_BYTES);
+    if (pre.tooLarge) { refuseTooLarge(req, res, `request body over ${ASK_MAX_BYTES} bytes`); return true; }
+    let r = { ok: false };
+    if (hub.reachable && hub.features?.includes("notify")) r = await edgeForward(req, "/notify", pre.body, 3000);
+    if (r.ok && r.status === 200) { relayBack(res, r); return true; }
+    if (ownBot.on) { log(`notify: ${r.ok ? `the hub answered HTTP ${r.status}` : hub.reachable ? (hub.features?.includes("notify") ? "the hub could not be reached" : "the hub takes no notices (older than 0.25.0)") : `hub away (${hub.reason})`} — sending on this machine's own bot`); await handleNotify(req, res, LOCAL_SCOPE, pre); return true; }
+    if (r.ok) { relayBack(res, r); return true; }
+    dropConn(req); return true;
+  }
   if (M === "POST" && (p === "/session/close" || p === "/session/round-end")) {
     // both places may hold this session's topics: the hub's and this machine's own bot's
     const pre = await readBody(req, SMALL_BODY_BYTES);
@@ -1260,6 +1294,7 @@ const server = http.createServer(async (req, res) => {
     return;
   }
   if (req.method === "POST" && url.pathname === "/ask") return handleAsk(req, res, LOCAL_SCOPE);
+  if (req.method === "POST" && url.pathname === "/notify") return handleNotify(req, res, LOCAL_SCOPE);
   const cm = url.pathname.match(/^\/cancel\/([a-f0-9]+)$/);
   if (req.method === "POST" && cm) { const { body } = await readBody(req, SMALL_BODY_BYTES); return handleCancel(res, cm[1], LOCAL_SCOPE, body); }
   const m = url.pathname.match(/^\/answer\/([a-f0-9]+)$/);
@@ -1319,7 +1354,7 @@ const server = http.createServer(async (req, res) => {
     res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify({ requests: list }));
     return;
   }
-  res.writeHead(404); res.end(`relay(${provider.name} v${VERSION}): POST /ask | GET /answer/<id> | POST /cancel/<id> | POST /detach/<id> | POST /reattach/<id> | GET /requests?session_id= | POST /attest | POST /session/close | POST /session/round-end | POST /pair/start | GET /pair/status | GET /health | POST /chat/register|take|progress|nick|close | GET /chat/session?session_id=`);
+  res.writeHead(404); res.end(`relay(${provider.name} v${VERSION}): POST /ask | POST /notify | GET /answer/<id> | POST /cancel/<id> | POST /detach/<id> | POST /reattach/<id> | GET /requests?session_id= | POST /attest | POST /session/close | POST /session/round-end | POST /pair/start | GET /pair/status | GET /health | POST /chat/register|take|progress|nick|close | GET /chat/session?session_id=`);
 });
 // single relay per machine: if the port is already owned, another relay is running — exit
 // (do NOT start the IM connection, which would conflict on the shared bot).

@@ -121,10 +121,13 @@ const cell = (s) => {
   if (s.key === "perm") return `perm ${s.on ? "開" : "關"}（${s.isDefault ? "預設，" : ""}${s.delay_s} 秒${s.delayDefault ? "" : "，MYNA_PERMISSION_DELAY"}）`;
   if (s.key === "hold" && s.unsupported) return "hold：這版 relay 不支援斷線排隊（0.21.0 起），主節點連不上時由這台自己的 bot 接手";
   if (s.key === "hold") return `hold ${s.on ? "開" : "關"}，上限 ${human(s.max_s)}（${s.isDefault ? "預設；" : ""}${s.from === "relay" ? "relay 在用的" : "設定檔／這個 session"}）`;
+  if (s.key === "godmode" && s.on) return "⚠ godmode 開（權限確認全部自動同意）";
   return `${s.label} ${s.on ? "開" : "關"}${dflt(s)}`;
 };
 const cells = d.switches.map(cell);
 for (let i = 0; i < cells.length; i += 4) L.push(`  ${cells.slice(i, i + 4).join("  ")}`);
+const gm = d.switches.find((s) => s.key === "godmode");
+if (gm?.on) L.push(`  God mode：${gm.unsent ? `這次開啟之後有 ${gm.unsent} 則通知沒送出去，記在 ${p(gm.unsent_file)}` : "這次開啟之後的通知都送出去了"}；關掉：/myna:godmode off`);
 const cd = d.chat_default;
 L.push(`  chat：新 session 預設${cd.value === "default" ? "開（終端機）" : cd.value === "on" ? `開（MYNA_CHAT=on，${SRC[cd.source]}）` : `關（MYNA_CHAT=off，${SRC[cd.source]}）`}；每個 session 的狀態用 /myna:chat 看`);
 

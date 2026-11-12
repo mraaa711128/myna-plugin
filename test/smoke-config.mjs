@@ -99,11 +99,11 @@ for (const args of [["autopilot", "yes"], ["intercept", "status"], ["brief", "on
 {
   const a = newHome();
   const r = await cfg([], a);
-  const items = ["autopilot", "intercept", "stopcatch", "brief", "perm", "murmur", "hold", "chat", "topics", "perm-delay"];
-  ok(r.rc === 0 && items.every((k) => new RegExp(`^  ${k} `, "m").test(r.out)) && same(snap(a), {}), "no argument → one line per item (all 10), nothing written");
-  ok(/autopilot\s+off（預設）/.test(r.out) && /intercept\s+on（預設）/.test(r.out) && /topics\s+auto（預設）/.test(r.out) && /perm-delay\s+30 秒（預設）/.test(r.out), "defaults: autopilot off, intercept on, topics auto, perm-delay 30 s");
+  const items = ["autopilot", "godmode", "intercept", "stopcatch", "brief", "perm", "murmur", "hold", "chat", "topics", "perm-delay"];
+  ok(r.rc === 0 && items.every((k) => new RegExp(`^  ${k} `, "m").test(r.out)) && same(snap(a), {}), "no argument → one line per item (all 11), nothing written");
+  ok(/autopilot\s+off（預設）/.test(r.out) && /godmode\s+off（預設）/.test(r.out) && /intercept\s+on（預設）/.test(r.out) && /topics\s+auto（預設）/.test(r.out) && /perm-delay\s+30 秒（預設）/.test(r.out), "defaults: autopilot off, intercept on, topics auto, perm-delay 30 s");
   // every item: "可設：…" on its line and a purpose line under it (Stanley 2026-11-11, after trying it)
-  const VALUES = { autopilot: "on / off", intercept: "on / off", stopcatch: "on / off", brief: "on / off", perm: "on / off", murmur: "on / off",
+  const VALUES = { autopilot: "on / off", godmode: "on / off", intercept: "on / off", stopcatch: "on / off", brief: "on / off", perm: "on / off", murmur: "on / off",
     hold: "on / off / max <時間> / status", chat: "on / off（只改目前這個 session）", topics: "auto / off", "perm-delay": "0 以上的整數（秒）" };
   const ls = r.out.trimEnd().split("\n");
   const missing = items.filter((k) => {
@@ -256,7 +256,7 @@ for (const args of [["autopilot", "yes"], ["intercept", "status"], ["brief", "on
 {
   const a = newHome();
   let r = await cfg(["nope", "on"], a);
-  ok(r.rc === 1 && /不認得的項目「nope」/.test(r.err) && /autopilot、intercept/.test(r.err) && same(snap(a), {}), "unknown item → error with the item list, nothing written");
+  ok(r.rc === 1 && /不認得的項目「nope」/.test(r.err) && /autopilot、godmode、intercept/.test(r.err) && same(snap(a), {}), "unknown item → error with the item list, nothing written");
   r = await cfg(["chat", "on"], a);
   ok(r.rc === 1 && /沒有載入聊天模組/.test(r.out) && same(snap(a), {}), "chat reaching config.mjs (no chat mod) → says the mod is not loaded, nothing written");
   r = await cfg(["chat"], a);

@@ -21,8 +21,9 @@ export const ENROLL_SECRET_HEADER = "x-myna-enroll-secret";
 export const REQUEST_ID_HEADER = "x-myna-request-id";
 // the plugin version of the edge sending a request (0.21.0+; informational — /myna:machines lists it)
 export const VERSION_HEADER = "x-myna-version";
-// the hub's remote features (its remote /health `features`); "chat": an edge may forward /chat/* (SPEC §5.2)
-export const FEATURES = ["chat"];
+// the hub's remote features (its remote /health `features`); "chat": an edge may forward /chat/* (SPEC §5.2);
+// "notify" (0.25.0): an edge may forward God mode's POST /notify (only when the hub's provider has notices)
+export const FEATURES = ["chat", "notify"];
 export const CF_ID_HEADER = "CF-Access-Client-Id";
 export const CF_SECRET_HEADER = "CF-Access-Client-Secret";
 
