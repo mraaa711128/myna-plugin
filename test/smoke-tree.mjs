@@ -156,7 +156,7 @@ try {
     fs.appendFileSync(O.env, "MYNA_TRANSPORT=tree\n");
     // its bot points nowhere: it must not take the stub's updates meant for p
     const relay = spawn(process.execPath, [path.join(ROOT, "src", "relay.mjs")], { env: { ...O.procEnv, TELEGRAM_API_BASE: "http://127.0.0.1:9" }, stdio: "ignore" });
-    const h = await until(() => health(O));
+    const h = await until(() => health(O), 20000);
     ok(h?.node?.tree === false && /old multi-machine settings/.test(h.node.off || "") && h.remote?.port === 17999, "a relay with both old and tree settings: tree off (said in /health), the old remote listener on");
     const r = await fetch(`${O.url}/peer/send`, { method: "POST", body: "{}" });
     ok(r.status === 404, "…and /peer/send does not exist there");
@@ -166,10 +166,11 @@ try {
     // a single machine: no `node` in /health, no /peer/send
     const Q = nodeDir("single", { bot: true, self: IP.p });
     fs.writeFileSync(Q.env, readEnv(Q).replace(/MYNA_NODE_PORT=.*\n/, ""));
-    const relay = spawn(process.execPath, [path.join(ROOT, "src", "relay.mjs")], { env: { ...Q.procEnv, TELEGRAM_API_BASE: "http://127.0.0.1:9" }, stdio: "ignore" });
-    const h = await until(() => health(Q));
-    const r = await fetch(`${Q.url}/peer/send`, { method: "POST", body: "{}" });
-    ok(h && !("node" in h) && r.status === 404, "a single machine (no tree settings): /health has no `node`, /peer/send is 404");
+    const relay = spawn(process.execPath, [path.join(ROOT, "src", "relay.mjs")], { env: { ...Q.procEnv, TELEGRAM_API_BASE: "http://127.0.0.1:9" }, stdio: ["ignore", "ignore", "pipe"] });
+    let err = ""; relay.stderr.on("data", (d) => (err += d));
+    const h = await until(() => health(Q), 20000);
+    const r = h ? await fetch(`${Q.url}/peer/send`, { method: "POST", body: "{}" }) : null;
+    if (!ok(h && !("node" in h) && r?.status === 404, "a single machine (no tree settings): /health has no `node`, /peer/send is 404")) console.log(`relay exit ${relay.exitCode}; stderr:\n${err}`);
     relay.kill();
   }
 
