@@ -82,15 +82,17 @@ const chatOf = async (sid) => (await fetch(`${RELAY}/chat/session?session_id=${s
 
 // --- the engine: a stub `$` and the events --------------------------------------------------------
 const ROOT = "/work/example-app";
-function engine({ sid, env = {}, interactive = true, store = new Map(), root = ROOT }) {
+// repo: what $.session.repo() answers ({root, remote}); the stub leaves it out unless given (an older CLI)
+function engine({ sid, env = {}, interactive = true, store = new Map(), root = ROOT, repo }) {
   const hooks = [];
   register((event, a, b) => { const [match, hook] = b ? [a, b] : [null, a]; hooks.push({ event, match, hook }); return { catch() { return this; } }; });
-  const S = { sid, status: undefined, submits: [], runs: [], timers: new Set(), store };
+  const S = { sid, status: undefined, submits: [], runs: [], timers: new Set(), store, posts: [], repo };
   const $ = {
     plugin: { name: "myna", root: "/x" },
-    http: { fetch: async (url, init = {}) => { const r = await fetch(url, { method: init.method, headers: init.headers, body: init.body }); return { status: r.status, ok: r.ok, headers: {}, text: await r.text() }; } },
+    http: { fetch: async (url, init = {}) => { S.posts.push({ url, body: init.body }); const r = await fetch(url, { method: init.method, headers: init.headers, body: init.body }); return { status: r.status, ok: r.ok, headers: {}, text: await r.text() }; } },
     fs: { read: async (p) => fs.readFileSync(p, "utf8") },
     session: {
+      ...(repo ? { repo: async () => S.repo } : {}),
       id: async () => S.sid, root: async () => root, cwd: async () => root,
       usage: async () => ({ startedAt: 0, context: { tokens: 84000, window: 200000, percent: 42 }, rateLimits: [{ kind: "five_hour", percentUsed: 23.5, resetsAt: "2026-10-17T07:00:00Z" }, { kind: "seven_day", percentUsed: 7 }], cost: { usd: 1.234 } }),
     },
@@ -441,6 +443,23 @@ ok(await until(() => /🔧 Bash: npm test/.test(latest(tprog) || "")) && await u
   const back = await until(async () => { const x = await chatOf("s-a"); return x.chat && x; });
   ok(!(await chatOf("s-a2")).chat && back?.nick === "heron", `in-app /resume back to the first session → it chats again as "${back?.nick}"`);
   await A.end(); A.stop();
+}
+
+// 9b) the project stamp's input (tree transport): the git origin is frozen at session start — a remote changed
+// afterwards (the AI editing .git/config) never reaches a registration, not even a later one
+{
+  const G = engine({ sid: "s-g", repo: { root: ROOT, remote: "git@github.com:owner/repo.git" } });
+  await G.start();
+  G.S.repo = { root: ROOT, remote: "https://github.com/someone/else.git" };
+  await until(async () => (await chatOf("s-g")).chat);
+  const regs = () => G.S.posts.filter((p) => p.url.endsWith("/chat/register")).map((p) => JSON.parse(p.body));
+  await stopRelay(); await startRelay(); // the relay forgets the token → the mod registers again
+  await until(() => regs().length >= 2, 10000);
+  ok(regs().length >= 2 && regs().every((b) => b.project_remote === "git@github.com:owner/repo.git"), "registration sends the remote frozen at session start (also after a re-registration)");
+  const N = engine({ sid: "s-n" }); await N.start();
+  await until(async () => (await chatOf("s-n")).chat);
+  ok(N.S.posts.filter((p) => p.url.endsWith("/chat/register")).every((p) => !("project_remote" in JSON.parse(p.body))), "no $.session.repo (an older CLI) → registers as before, without project_remote");
+  await G.end(); await N.end(); G.stop(); N.stop();
 }
 
 // 10) no relay / no secret: nothing breaks, the status line says why

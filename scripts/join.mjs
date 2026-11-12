@@ -26,6 +26,8 @@ import {
 } from "../src/remote.mjs";
 
 const argv = process.argv.slice(2);
+// /myna:join tree …: the tree transport (scripts/tree.mjs) — everything below is the old join, unchanged
+if (argv[0] === "tree") await (await import("./tree.mjs")).joinTree(argv.slice(1));
 const flag = (f) => argv.includes(f);
 const opt = (f) => { const i = argv.indexOf(f); return i >= 0 ? argv[i + 1] : undefined; };
 const USAGE = "usage: join.mjs <hub URL> [--name <name>] [--no-wait] [--no-start]   |   join.mjs --wait [--no-start]";

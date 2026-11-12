@@ -172,6 +172,16 @@ export function readKey(p) {
   return win ? p.replace(/\//g, "\\").toLowerCase() : p;
 }
 export const parentOf = (p) => String(p).replace(/[\\/][^\\/]*$/, "");
+
+// A message another session sent (relay ≥ 0.25.0, tree transport: via "session"): the header line is made
+// here from what the relay stamped (its address, owner, project) and the text goes under it quoted, every
+// line "> " — so nothing in the text can pass for a header of its own.
+export function peerText(m) {
+  const p = m?.peer && typeof m.peer === "object" ? m.peer : {};
+  const meta = [p.owner, p.project].filter((x) => typeof x === "string" && x).join(" · ");
+  const body = String(m?.text ?? "").split(/\r?\n/).map((l) => `> ${l}`).join("\n");
+  return `[Myna · 來自 session ${m?.from || "?"}${meta ? `（${meta}）` : ""}] 要回覆就用 message_session(to: "${m?.from || "?"}")\n${body}`;
+}
 const MAY_READ_MAX = 500;
 
 export const register = (on) => {
@@ -191,6 +201,8 @@ export const register = (on) => {
   let sentAt = 0;
   let pendingCmd = null;  // {mark, name, at}: a phone command that printed nothing — a turn or nothing to come
   let submitted = [];     // {text, origin, at}: prompts submitted while idle, oldest first, until their turn starts
+  let peerSent = new Set(); // texts in `sent` made only of other sessions' messages (their turn is not a person's)
+  let frozen = null;      // {root, remote}: taken at session.start, before the AI runs anything (the project stamp)
   let chain = Promise.resolve(); // progress posts, in order
   const mayRead = new Map();     // readKey -> path of a file the relay handed this session (memory only: a reload asks again)
   const allowRead = (p) => {
@@ -292,12 +304,13 @@ export const register = (on) => {
     let secret = "";
     try { secret = String(await io.read(cfg.secretFile)).trim(); } catch {}
     if (!secret) return backoff("找不到 relay 密鑰"), false;
-    const root = (await io.root().catch(() => "")) || (await io.cwd().catch(() => ""));
+    const root = frozen?.root || (await io.root().catch(() => "")) || (await io.cwd().catch(() => ""));
     const label = basename(root);
     const mine = await saved(id);
     let r;
     try {
-      r = await call("/chat/register", { session_id: id, nick: mine.nick || cfg.nick || birdFor(label), label, cwd: root }, secret);
+      // project_remote: the git origin as it was when the session started (the relay stamps owner/repo from it)
+      r = await call("/chat/register", { session_id: id, nick: mine.nick || cfg.nick || birdFor(label), label, cwd: root, ...(frozen?.remote ? { project_remote: frozen.remote } : {}) }, secret);
     } catch { return backoff("relay 沒有回應"), false; }
     // an old relay (< 0.12) — SessionStart's ensure-relay is likely swapping it right now: normal retry pace
     if (r.status === 404) return backoff("relay 版本太舊"), false;
@@ -355,9 +368,10 @@ export const register = (on) => {
 
   // phone messages → one prompt; one the human sent as a Telegram reply carries the message it replied to
   function submitText(msgs) {
-    const text = msgs.map((m) => `[Telegram${m.from ? ` · ${m.from}` : ""}] ${replyLine(m.reply_to)}${m.text}`).join("\n\n");
-    const forget = () => { sent = sent.filter((t) => t !== text); };
+    const text = msgs.map((m) => (m.via === "session" ? peerText(m) : `[Telegram${m.from ? ` · ${m.from}` : ""}] ${replyLine(m.reply_to)}${m.text}`)).join("\n\n");
+    const forget = () => { sent = sent.filter((t) => t !== text); peerSent.delete(text); };
     sent.push(text); sentAt = now();
+    if (msgs.every((m) => m.via === "session")) peerSent.add(text);
     io.submit(text).then((res) => { if (res?.drop) forget(); }, forget);
   }
   // a reply that is not a model turn (a command's output) goes to the phone as this "turn"'s answer
@@ -467,6 +481,12 @@ export const register = (on) => {
       const mine = await saved(await $.session.id());
       if (typeof mine.on === "boolean") want = mine.on;
       enabled = want;
+      // the registration's root and git origin, frozen now — before the AI runs any tool, so it cannot
+      // change .git/config to get another project stamp; registering itself still does not wait (2.4)
+      frozen = { root: "", remote: "" };
+      try { frozen.root = (await $.session.root()) || ""; } catch {}
+      if (!frozen.root) { try { frozen.root = (await $.session.cwd()) || ""; } catch {} }
+      try { const repo = await $.session.repo(); if (typeof repo?.remote === "string") frozen.remote = repo.remote; } catch {}
       if (enabled) start();
       await recordState();
     } catch {}
@@ -511,6 +531,8 @@ export const register = (on) => {
     // we sent (the hook that submitted it can't mark it at prompt.submit — that frame is skipped)
     const mine = sent.find((t) => text.includes(t));
     if (mine) sent = sent.filter((t) => t !== mine);
+    // only other sessions' messages: nobody typed this turn (the relay keeps counting their exchange)
+    const peerOnly = !!mine && peerSent.delete(mine);
     // the prompts this turn carries (framed, or several queued ones in one turn): oldest first, one per text
     const origins = [], seen = new Set();
     submitted = submitted.filter((s) => {
@@ -519,7 +541,8 @@ export const register = (on) => {
       return false;
     });
     const label = mine ? null : turnSource(text, origins);
-    progress(mine ? { event: "start", origin: "phone" }
+    progress(peerOnly ? { event: "start", origin: "background", label: PEER }
+      : mine ? { event: "start", origin: "phone" }
       : label ? { event: "start", origin: "background", label }
       : { event: "start", origin: "terminal", ...(text ? { prompt: text.slice(0, 2000) } : {}) });
     return r;

@@ -38,6 +38,8 @@ if (r.other) {
   const cmp = r.compare === 0 ? "跟 plugin 同版" : r.compare < 0 ? `比 plugin v${d.plugin_version} 舊` : r.compare > 0 ? `比 plugin v${d.plugin_version} 新` : "版本看不懂";
   L.push(`  在跑：v${r.version}（${cmp}）${r.started_at ? `，${when(r.started_at)} 啟動` : ""}`);
   L.push(`  角色：${r.role === "edge" ? "子節點（edge）" : "主節點（hub）"}；provider：${r.provider ?? "這版 relay 沒回報"}；等待中的題目 ${r.pending ?? "?"}`);
+  // tree transport (SPEC §5.4): only when this machine has tree settings
+  if (r.node) L.push(`  tree 模式：${r.node.tree ? `開（節點 ${r.node.name}，owner ${r.node.owner || "查不到"}${r.node.parent ? `，上層 ${r.node.parent.name}${r.node.parent.reachable ? "" : "（連不上）"}` : ""}，下層 ${r.node.children} 台，owner 的 IM 綁定 ${r.node.owner_bound ? "有" : "沒有（傳 !bind）"}）` : `關${r.node.off ? `（${r.node.off}）` : ""}`}；詳細：/myna:hub tree`);
   if (d.relay_differs?.role) L.push(`  ⚠ 角色：relay 用的是 ${r.role}，照設定檔／這個 session 會是 ${d.role_config}：/myna:relay restart 後才會照設定`);
   if (d.relay_differs?.provider) L.push(`  ⚠ provider：relay 用的是 ${r.provider}，照設定檔／這個 session 會是 ${d.expected_provider}：/myna:relay restart 後才會照設定`);
 }

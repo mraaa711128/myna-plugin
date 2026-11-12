@@ -29,7 +29,7 @@ export const LOG_TAIL_BYTES = 256 * 1024;
 
 export const CREDENTIAL_KEYS = ["TELEGRAM_BOT_TOKEN", "DISCORD_BOT_TOKEN", "SLACK_BOT_TOKEN", "SLACK_APP_TOKEN", "MYNA_MACHINE_TOKEN", "MYNA_CF_ACCESS_CLIENT_ID", "MYNA_CF_ACCESS_CLIENT_SECRET"];
 // the keys whose values the environment section shows — full names, no prefixes
-export const ENV_KEYS = ["MYNA_PROVIDER", "MYNA_ROLE", "MYNA_REMOTE_PORT", "MYNA_MACHINE_NAME", "MYNA_TOPIC_MACHINE", "MYNA_UPSTREAM", "TELEGRAM_CHAT_ID", "TELEGRAM_TOPICS", "TELEGRAM_TOPIC_SCOPE", "TELEGRAM_TOPIC_ON_END", "TELEGRAM_TOPIC_ROUND_GRACE", "DISCORD_CHANNEL_ID", "SLACK_CHANNEL_ID", "RELAY_PORT", "MYNA_CHAT", "MYNA_CHAT_FORWARD", "MYNA_UPSTREAM_HOLD", "MYNA_UPSTREAM_HOLD_MAX", "MYNA_NET_ATTEMPT_MS", "MYNA_PERMISSION_DELAY"];
+export const ENV_KEYS = ["MYNA_PROVIDER", "MYNA_ROLE", "MYNA_REMOTE_PORT", "MYNA_MACHINE_NAME", "MYNA_TOPIC_MACHINE", "MYNA_UPSTREAM", "TELEGRAM_CHAT_ID", "TELEGRAM_TOPICS", "TELEGRAM_TOPIC_SCOPE", "TELEGRAM_TOPIC_ON_END", "TELEGRAM_TOPIC_ROUND_GRACE", "DISCORD_CHANNEL_ID", "SLACK_CHANNEL_ID", "RELAY_PORT", "MYNA_CHAT", "MYNA_CHAT_FORWARD", "MYNA_UPSTREAM_HOLD", "MYNA_UPSTREAM_HOLD_MAX", "MYNA_NET_ATTEMPT_MS", "MYNA_PERMISSION_DELAY", "MYNA_TRANSPORT", "MYNA_NODE_PORT", "MYNA_NODE_SERVE_PORT", "MYNA_PEER_SHOW_FIRST"];
 export const SECRET_NAME_RE = /TOKEN|SECRET|PASSWORD|PRIVATE_KEY|API_KEY|CLIENT_ID/i;
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -271,13 +271,13 @@ export async function collect(cfg, opts = {}) {
     relay.running = true; relay.legacy = true;
   } else {
     const h = health.h;
-    Object.assign(relay, { running: true, version: h.version, started_at: h.started_at || null, role: h.role || "hub", provider: h.provider, pending: h.pending, machine: h.machine });
+    Object.assign(relay, { running: true, version: h.version, started_at: h.started_at || null, role: h.role || "hub", provider: h.provider, pending: h.pending, machine: h.machine, ...(h.node ? { node: h.node } : {}) });
     relay.compare = h.version ? Math.sign(compareVersions(h.version, version)) : null; // -1 older, 0 same, 1 newer
   }
   if (!relay.running) {
     // ensure-relay's own test (scripts/ensure-relay.mjs): would a SessionStart start it?
     relay.autostart = role === "edge" ? has("MYNA_UPSTREAM")
-      : role === "hub" ? !!(has("TELEGRAM_BOT_TOKEN") || (has("DISCORD_BOT_TOKEN") && has("DISCORD_CHANNEL_ID")) || (has("SLACK_BOT_TOKEN") && has("SLACK_APP_TOKEN") && has("SLACK_CHANNEL_ID")))
+      : role === "hub" ? !!(has("TELEGRAM_BOT_TOKEN") || (has("DISCORD_BOT_TOKEN") && has("DISCORD_CHANNEL_ID")) || (has("SLACK_BOT_TOKEN") && has("SLACK_APP_TOKEN") && has("SLACK_CHANNEL_ID")) || String(cfg.MYNA_TRANSPORT || "").trim().toLowerCase() === "tree")
       : false;
   }
   data.relay = relay;

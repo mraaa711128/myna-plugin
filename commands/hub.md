@@ -1,7 +1,13 @@
 ---
-description: 把這台設成 Myna 主節點（其他機器用 /myna:join 加入）— 開、關遠端 listener，或看狀態
-argument-hint: "[status | on [--name <名稱>] | off]"
+description: 把這台設成 Myna 主節點（其他機器用 /myna:join 加入）— 開、關遠端 listener，或看狀態；tree 模式用 /myna:hub tree
+argument-hint: "[status | on [--name <名稱>] | off | tree [status | on [--name <名稱>] | off]]"
 ---
+**第一個參數是 `tree` 時**（新的 tree 傳輸，走 Tailscale，見 README「不同機器的 session 互傳訊息」）：執行 `node "${CLAUDE_PLUGIN_ROOT}/scripts/hub.mjs" $ARGUMENTS`，下面舊的說明都不適用。
+- `tree`／`tree status`（唯讀）— tree 模式開關、節點名稱和 owner、Tailscale、listener、上層、下層、IM 綁定。
+- `tree on [--name <名稱>]` — 寫 `MYNA_NODE_PORT`（沒有時 7802）、開這台自己的一條 `tailscale serve`、重啟 relay。`--name` 是這台在地址裡的名稱（`nick@<名稱>`，寫進 `MYNA_MACHINE_NAME`；只有最上層用得到，接在上層下面的節點名稱由上層核發）。這台有 bot 而 owner 還沒綁定 Telegram 帳號時，指令以狀態 **2** 結束並印出綁定步驟（在 bot 聊天室傳 `!bind`、用開著 Tailscale 的手機打開連結）：照著告訴使用者，綁好後再跑一次 `tree on`，就會寫 `MYNA_TRANSPORT=tree` 並重啟。
+- `tree off` — 拿掉 `MYNA_TRANSPORT`、`MYNA_NODE_PORT`，只關這台自己那一條 serve，重啟。
+- 這台開著舊的多機設定（`MYNA_ROLE=edge`、`MYNA_REMOTE_PORT`）時會擋下，`.env` 不變。不要自己執行任何 `tailscale serve` 指令（尤其 `reset`）。
+
 在**主節點**（手機上那支 bot 所在的機器）執行 `node "${CLAUDE_PLUGIN_ROOT}/scripts/hub.mjs" $ARGUMENTS`（沒有參數時是 `status`）。
 
 - **status**（預設，唯讀，不改任何檔案）— 印出 relay `/health` 的 `role`、`remote`，以及 `~/.myna/machines.json` 裡已加入的機器數量，並提醒 tunnel 要指到實際使用的 port（預設 7801），不能指到 7800。
