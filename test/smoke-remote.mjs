@@ -356,8 +356,10 @@ ok(r?.json?.role === "edge" && r.json.upstream.machine === "mbp" && r.json.upstr
 // pc2: its OWN bot (id 222222) as the fallback; config from the environment (MYNA_MACHINE_TOKEN), no .env file
 const botB = await botStub();
 const EB = freePort(), EDGE_B = `http://127.0.0.1:${EB}`;
-fs.mkdirSync(path.join(TMP, "pc2"), { recursive: true });
-startEdge(EB, { MYNA_ENV: path.join(TMP, "pc2", ".env"), MYNA_ROLE: "edge", MYNA_UPSTREAM: tunnel.url, MYNA_MACHINE_TOKEN: bToken, ...CF_ENV,
+// pc2 in its own ~/.myna (HOME = TMP/pc2), as on a real machine: its recovery is timed below to the check, and on
+// Windows a file outside ~/.myna would cost an icacls run on every edge-state write (src/private-file.mjs)
+fs.mkdirSync(path.join(TMP, "pc2", ".myna"), { recursive: true });
+startEdge(EB, { HOME: path.join(TMP, "pc2"), USERPROFILE: path.join(TMP, "pc2"), MYNA_ENV: path.join(TMP, "pc2", ".myna", ".env"), MYNA_ROLE: "edge", MYNA_UPSTREAM: tunnel.url, MYNA_MACHINE_TOKEN: bToken, ...CF_ENV,
   TELEGRAM_BOT_TOKEN: "222222:PC2-SECRET", TELEGRAM_CHAT_ID: "42", TELEGRAM_API_BASE: botB.url, TELEGRAM_TOPIC_ROUND_GRACE: "0" });
 r = await until(async () => { const x = await req(`${EDGE_B}/health`); return x.json?.upstream?.active ? x : null; });
 ok(r?.json?.own_bot?.on === true && r.json.own_bot.id === "telegram:222222" && !!(await until(() => botB.polls > 0, 3000)), `pc2's edge keeps its own bot (telegram:222222) polling as the fallback`);
