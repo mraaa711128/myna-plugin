@@ -52,11 +52,21 @@ function bringAutopilot() {
   const before = ap.on && !ap.byGodmode ? "on" : "off";
   if (before === "off" && !ap.on) {
     try { fs.mkdirSync(path.dirname(AP), { recursive: true }); fs.writeFileSync(AP, autopilotMark()); }
-    catch (e) { return [before, `autopilot 沒打開：${tildePath(AP)} 寫不進去（${e.message}）；要開：/myna:autopilot on。`, false]; }
+    catch (e) { return [before, `autopilot 沒打開：${tildePath(AP)} 寫不進去（${e.message}）；修好之後再跑一次 /myna:godmode on 會重試。`, false]; }
   }
   return [before, before === "on" ? "autopilot 本來就開著，維持開著。" : "autopilot 也一起開了：帶 recommendedIndex 的題目自動選建議選項（記在 MYNA-DECISIONS）；關 God mode 時會一起關回去。", true];
 }
 let failed = false;
+// the flag with autopilot's earlier state — written only when autopilot was brought along (ok): without the second
+// line the next `on` tries again (as for a flag from before 0.26.2). The flag not written → a mark just written is
+// taken back, so autopilot is never left on by a God mode that did not turn on.
+function writeFlag(first, before, ok) {
+  try { fs.mkdirSync(path.dirname(FLAG), { recursive: true }); fs.writeFileSync(FLAG, `${first}\n${ok ? `autopilot-before: ${before}\n` : ""}`); }
+  catch (e) {
+    if (before === "off" && autopilotState().byGodmode) { try { fs.rmSync(AP, { force: true }); } catch {} }
+    console.log(`God mode 沒開：${tildePath(FLAG)} 寫不進去（${e.message}）。`); process.exit(1);
+  }
+}
 
 if (arg === "on") {
   // already on: the file (its time) is kept, so the unsent count since it was turned on stays whole
@@ -64,15 +74,15 @@ if (arg === "on") {
   let out;
   if (!already) {
     const [before, apNote, ok] = bringAutopilot();
-    fs.mkdirSync(path.dirname(FLAG), { recursive: true });
-    fs.writeFileSync(FLAG, `${new Date().toISOString()}\nautopilot-before: ${before}\n`);
+    writeFlag(new Date().toISOString(), before, ok);
     failed = !ok;
     out = [`God mode 開了 —— 這台每一個權限確認都會立刻自動允許（含護欄 hook 攔下來要問的動作），帶 ✅ 核准的 ask_human 題目由 relay 直接按 ✅，每一筆都送一則通知到 IM 的「🔓 God mode」topic。關掉：/myna:godmode off。旗標檔：${tildePath(FLAG)}`, apNote];
   } else if (!autopilotBefore()) {
-    // on since before 0.26.2 (the flag holds only its time): bring autopilot along now, the time kept
+    // on since before 0.26.2 (the flag holds only its time), or autopilot could not be brought along last time:
+    // bring it along now, the time kept
     const first = fs.readFileSync(FLAG, "utf8").split(/\r?\n/)[0];
     const [before, apNote, ok] = bringAutopilot();
-    fs.writeFileSync(FLAG, `${first}\nautopilot-before: ${before}\n`);
+    writeFlag(first, before, ok);
     failed = !ok;
     out = [`God mode 本來就開著（${when(godmodeSince())} 開的，0.26.2 以前開的）—— 現在補上 autopilot 的連動。關掉：/myna:godmode off。`, unsentLine(), apNote];
   } else out = [`God mode 本來就開著（${when(godmodeSince())} 開的），沒有改。關掉：/myna:godmode off。`, unsentLine(), autopilotLine()];

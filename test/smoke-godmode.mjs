@@ -437,6 +437,19 @@ const script = (name, args, extra = {}) => spawnSync(process.execPath, [src("scr
   ok(!!kb && pa.kind === "pending" && notices8(n).length === 0, `8: God mode on, a question without approves → sent to the phone with buttons, not answered (${pa.kind})`);
   await post(`/cancel/${plain.request_id}`, {});
 
+  // an edge whose hub is reachable forwards its ✅ question to the hub: not pressed there or here, it goes to the phone
+  {
+    const ePost = (p, body) => fetch(`http://127.0.0.1:${E1}${p}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body), signal: AbortSignal.timeout(8000) }).then(async (r) => ({ status: r.status, ...(await r.json().catch(() => ({}))) }));
+    await until(async () => (await health(E1))?.upstream?.active);
+    n = hubTg.sends().length;
+    const fe = await ePost("/ask", { ...Q, question: "子節點可以 push 嗎？" });
+    const kbE = await until(() => hubTg.sends().slice(n).find((m) => m.reply_markup && /子節點可以 push 嗎/.test(m.text || "")), 5000);
+    const paE = await (await fetch(`http://127.0.0.1:${E1}/answer/${fe.request_id}`, { signal: AbortSignal.timeout(8000) })).json();
+    const atE = await ePost("/attest", { command: "git push origin main", session_id: SID });
+    ok(!!kbE && paE.kind === "pending" && atE.approved === false && notices8(n).length === 0, `8: God mode on, an edge whose hub is reachable → its ✅ question goes to the phone through the hub, not pressed (${paE.kind}, ${atE.reason})`);
+    await ePost(`/cancel/${fe.request_id}`, {});
+  }
+
   // the notice cannot go out → the answer is the same, the notice kept in the unsent file
   fs.rmSync(UNSENT, { force: true });
   hubTg.refuse = true;
@@ -528,6 +541,18 @@ const script = (name, args, extra = {}) => spawnSync(process.execPath, [src("scr
   ok(/^godmode /.test(read(AP) || "") && read(GOD) === "2026-11-12T01:00:00.000Z\nautopilot-before: off\n" && /補上 autopilot 的連動/.test(out), `9: a flag from before 0.26.2 → on again brings autopilot along, its time kept (${JSON.stringify(read(GOD))})`);
   out = gm("off");
   ok(!fs.existsSync(AP) && /autopilot 也關回去了/.test(out), "9: …and off takes it back");
+
+  // autopilot cannot be written → God mode on without the second line, exit 1; the next `on` tries again
+  fs.rmSync(GOD, { force: true });
+  const BLOCK = path.join(TMP, "not-a-dir"); fs.writeFileSync(BLOCK, "x");
+  let rf = script("godmode.mjs", ["on"], { MYNA_AUTOPILOT_FILE: path.join(BLOCK, "autopilot") });
+  ok(rf.status === 1 && /autopilot 沒打開/.test(rf.stdout) && fs.existsSync(GOD) && !/autopilot-before/.test(read(GOD)), `9: autopilot cannot be written → exit 1, God mode on, nothing recorded about autopilot (${JSON.stringify(read(GOD))})`);
+  out = gm("on");
+  ok(/^godmode /.test(read(AP) || "") && /^autopilot-before: off$/m.test(read(GOD) || ""), "9: …the next on brings autopilot along");
+  gm("off");
+  // the God mode flag cannot be written → God mode stays off and the autopilot it just turned on is taken back
+  rf = script("godmode.mjs", ["on"], { MYNA_GODMODE_FILE: path.join(BLOCK, "godmode") });
+  ok(rf.status === 1 && /God mode 沒開/.test(rf.stdout) && !fs.existsSync(AP), "9: the God mode flag cannot be written → exit 1, autopilot not left on");
 
   // /myna:config godmode does the same (it runs the same script)
   let r = script("config.mjs", ["godmode", "on"]);

@@ -789,8 +789,9 @@ export function create(cfg, ctx) {
         const res = await tg("createForumTopic", { chat_id: chat, name: GODMODE_TOPIC });
         const thread = res.ok ? res.result?.message_thread_id : undefined;
         if (thread) {
-          godTopic = { chat, thread, name: GODMODE_TOPIC, created: new Date().toISOString() }; saveGodTopic();
-          log(`godmode: topic "${GODMODE_TOPIC}" created (thread ${thread})`);
+          // re-paired to another chat while this create was under way: never let it replace the current chat's topic
+          if (chat === CHAT_ID) { godTopic = { chat, thread, name: GODMODE_TOPIC, created: new Date().toISOString() }; saveGodTopic(); }
+          log(`godmode: topic "${GODMODE_TOPIC}" created (thread ${thread})${chat === CHAT_ID ? "" : ` in chat ${chat}, which is no longer the paired one — not kept`}`);
           return thread;
         }
         // refused (no Threaded Mode, not a forum, no rights) → wait before trying again; unreachable → next notice tries
