@@ -48,7 +48,10 @@ const baseEnv = (() => {
   for (const k of Object.keys(e)) if (/^(MYNA_|TELEGRAM_|DISCORD_|SLACK_|RELAY_PORT$|CLAUDE_CODE_SESSION_ID$)/.test(k)) delete e[k];
   return e;
 })();
-const dirOf = (name) => { const d = path.join(TMP, name); fs.mkdirSync(d, { recursive: true }); return d; };
+// each relay's own ~/.myna (HOME = <TMP>/<name>), the layout of a real machine: on Windows its files are private
+// through the folder (src/private-file.mjs), not by an icacls run per write
+const dirOf = (name) => { const d = path.join(TMP, name, ".myna"); fs.mkdirSync(d, { recursive: true }); return d; };
+const homeOf = (d) => ({ HOME: path.dirname(d), USERPROFILE: path.dirname(d) });
 
 // --- Telegram API stubs ----------------------------------------------------------------------------
 function tgStub() {
@@ -94,7 +97,7 @@ const up = (url) => until(async () => { try { await fetch(url, { signal: AbortSi
 async function startHub() {
   hub = spawn(process.execPath, [src("src", "relay.mjs")], {
     env: {
-      ...baseEnv, MYNA_ENV: path.join(HUB_DIR, ".env"), MYNA_PROVIDER: "telegram", TELEGRAM_BOT_TOKEN: "111111:HUB", TELEGRAM_CHAT_ID: "42", TELEGRAM_API_BASE: hubTg.url,
+      ...baseEnv, ...homeOf(HUB_DIR), MYNA_ENV: path.join(HUB_DIR, ".env"), MYNA_PROVIDER: "telegram", TELEGRAM_BOT_TOKEN: "111111:HUB", TELEGRAM_CHAT_ID: "42", TELEGRAM_API_BASE: hubTg.url,
       RELAY_PORT: String(H), MYNA_REMOTE_PORT: String(R), MYNA_MACHINES_FILE: MACHINES, MYNA_MACHINE_NAME: "win", MYNA_ANSWER_HOLD_MS: "1000",
       TELEGRAM_TOPIC_ROUND_GRACE: "0", MYNA_CHAT_PROGRESS_MS: "200", MYNA_PROGRESS_FILE: path.join(HUB_DIR, "chat-progress"),
     },
@@ -132,7 +135,7 @@ const TIMING = { MYNA_UPSTREAM_CHECK_MS: "250", MYNA_UPSTREAM_GRACE: "2", MYNA_U
 const edgeLogs = {};
 function startEdge(name, port, env) {
   const d = dirOf(name);
-  const c = spawn(process.execPath, [src("src", "relay.mjs")], { env: { ...baseEnv, MYNA_ENV: path.join(d, ".env"), MYNA_ROLE: "edge", RELAY_PORT: String(port), MYNA_PROGRESS_FILE: path.join(d, "chat-progress"), ...TIMING, ...env }, stdio: ["ignore", "ignore", "pipe"] });
+  const c = spawn(process.execPath, [src("src", "relay.mjs")], { env: { ...baseEnv, ...homeOf(d), MYNA_ENV: path.join(d, ".env"), MYNA_ROLE: "edge", RELAY_PORT: String(port), MYNA_PROGRESS_FILE: path.join(d, "chat-progress"), ...TIMING, ...env }, stdio: ["ignore", "ignore", "pipe"] });
   children.push(c); edgeLogs[name] = edgeLogs[name] || []; c.stderr.on("data", (d2) => edgeLogs[name].push(String(d2)));
   return c;
 }
@@ -155,7 +158,7 @@ const chatApi = (base, secretDir) => ({
   register: (body) => req(`${base}/chat/register`, { method: "POST", headers: { authorization: `Bearer ${secretOf(secretDir)}` }, body }),
   call: (p, token, body = {}) => req(`${base}/chat/${p}`, { method: "POST", headers: { authorization: `Bearer ${token}` }, body }),
 });
-const mbpChat = chatApi(EDGE, path.join(TMP, "mbp"));
+const mbpChat = chatApi(EDGE, dirOf("mbp"));
 const ask = (base, body) => req(`${base}/ask`, { method: "POST", body });
 const answerOf = async (base, id, ms = 15000) => { const t0 = Date.now(); for (;;) { const r = await req(`${base}/answer/${id}`, { timeout: 10000 }); if (r.status !== 200 || r.json?.kind !== "pending" || Date.now() - t0 > ms) return r; } };
 const hubChatFile = () => { try { return JSON.parse(fs.readFileSync(path.join(HUB_DIR, "chat-sessions.json"), "utf8")).sessions || {}; } catch { return {}; } };
@@ -234,11 +237,11 @@ const topicA = A.json?.topic;
   startEdge("pc3", P3, { MYNA_UPSTREAM: FAKE, MYNA_MACHINE_TOKEN: PC2.token });
   await up(`${E2}/health`); await up(`${E3}/health`);
   await until(async () => (await health(E2))?.upstream?.reachable && (await health(E3))?.upstream?.reachable);
-  const r2 = await chatApi(E2, path.join(TMP, "pc2")).register({ session_id: "p2", nick: "heron", label: "pc2-app" });
+  const r2 = await chatApi(E2, dirOf("pc2")).register({ session_id: "p2", nick: "heron", label: "pc2-app" });
   ok(r2.status === 200 && /不支援轉送聊天/.test(r2.json?.note || "") && /自己的 bot/.test(r2.json?.note || "") && pc2Tg.of("createForumTopic").some((t) => /heron/.test(t.name)),
     `4: an old hub + an own bot → chat on this machine's own bot, the mod is told: "${r2.json?.note}"`);
   ok((await health(E2))?.upstream?.chat === "own-bot", "4: …upstream.chat \"own-bot\"");
-  const r3 = await chatApi(E3, path.join(TMP, "pc3")).register({ session_id: "p3", nick: "ibis" });
+  const r3 = await chatApi(E3, dirOf("pc3")).register({ session_id: "p3", nick: "ibis" });
   ok(r3.status === 501 && /不支援轉送聊天/.test(r3.json?.hint || ""), `4: an old hub, no own bot → register 501 with a hint for the mod: "${r3.json?.hint}"`);
   const q3 = await ask(E3, { question: "舊主節點也照樣轉送題目?", options: ["是", "否"], session_id: "p3" });
   ok(q3.status === 200 && fake.asks.includes(q3.json?.request_id), "4: …its questions are still forwarded to that hub");
@@ -248,7 +251,7 @@ const topicA = A.json?.topic;
 // === 5. an old edge against this hub (optional: MYNA_OLD_ROOT=<a 0.20.x checkout>) ==========================
 if (process.env.MYNA_OLD_ROOT) {
   const P = freePort(), E = `http://127.0.0.1:${P}`, d = dirOf("old");
-  const c = spawn(process.execPath, [path.join(path.resolve(process.env.MYNA_OLD_ROOT), "src", "relay.mjs")], { env: { ...baseEnv, MYNA_ENV: path.join(d, ".env"), MYNA_ROLE: "edge", RELAY_PORT: String(P), MYNA_UPSTREAM: TUNNEL, MYNA_MACHINE_TOKEN: PC2.token, ...TIMING }, stdio: ["ignore", "ignore", "ignore"] });
+  const c = spawn(process.execPath, [path.join(path.resolve(process.env.MYNA_OLD_ROOT), "src", "relay.mjs")], { env: { ...baseEnv, ...homeOf(d), MYNA_ENV: path.join(d, ".env"), MYNA_ROLE: "edge", RELAY_PORT: String(P), MYNA_UPSTREAM: TUNNEL, MYNA_MACHINE_TOKEN: PC2.token, ...TIMING }, stdio: ["ignore", "ignore", "ignore"] });
   children.push(c);
   await up(`${E}/health`); await until(async () => (await health(E))?.upstream?.active);
   const reg = await chatApi(E, d).register({ session_id: "o1", nick: "old" });
@@ -277,7 +280,7 @@ if (process.env.MYNA_OLD_ROOT) {
   mbp.kill(); await until(async () => !(await health(EDGE)), 5000);
   mbp = startEdge("mbp", EM, mbpEnv);
   await up(`${EDGE}/health`);
-  const state = JSON.parse(fs.readFileSync(path.join(TMP, "mbp", "edge-state.json"), "utf8"));
+  const state = JSON.parse(fs.readFileSync(path.join(dirOf("mbp"), "edge-state.json"), "utf8"));
   ok(Array.isArray(state.chat) && state.chat.some(([sid, v]) => sid === "s-1" && v.queue?.length === 2), `6: edge-state.json keeps s-1's unsent progress cut to the turn's latest state (${JSON.stringify(state.chat?.find(([sid]) => sid === "s-1")?.[1]?.queue?.map((e) => e.event))})`);
   const sentBefore = tunnel.log.length;
   tunnel.down = false;
@@ -347,7 +350,7 @@ if (process.env.MYNA_OLD_ROOT) {
 
 // === 8. revoke: the machine's chat topics 🔒, then 401 =====================================================
 {
-  const rv = spawnSync(process.execPath, [src("scripts", "machines.mjs"), "revoke", "mbp"], { env: { ...baseEnv, MYNA_ENV: path.join(HUB_DIR, ".env"), MYNA_MACHINES_FILE: MACHINES }, encoding: "utf8" });
+  const rv = spawnSync(process.execPath, [src("scripts", "machines.mjs"), "revoke", "mbp"], { env: { ...baseEnv, ...homeOf(HUB_DIR), MYNA_ENV: path.join(HUB_DIR, ".env"), MYNA_MACHINES_FILE: MACHINES }, encoding: "utf8" });
   const locked = await until(() => hubTg.of("editForumTopic").find((e) => e.message_thread_id === topicA && /^mbp · 🔒/.test(e.name || "")), 12000);
   ok(rv.status === 0 && !!locked, `8: machines.mjs revoke mbp → its chat topic is closed: "${locked?.name}"`);
   const sess = hubChatFile()[sidAtHub];
@@ -369,8 +372,8 @@ const E7 = freePort(), EDGE7 = `http://127.0.0.1:${E7}`;
 const pc7Env = { MYNA_UPSTREAM: TUNNEL, MYNA_MACHINE_TOKEN: PC7.token, TELEGRAM_BOT_TOKEN: "777777:PC7-OWN", TELEGRAM_CHAT_ID: "42", TELEGRAM_API_BASE: pc7Tg.url };
 let pc7 = startEdge("pc7", E7, pc7Env);
 await up(`${EDGE7}/health`); await until(async () => (await health(EDGE7))?.upstream?.active);
-const HOLD_FILE = path.join(TMP, "pc7", "upstream-hold");
-const holdStatus = () => spawnSync(process.execPath, [src("scripts", "hold.mjs"), "status"], { env: { ...baseEnv, MYNA_ENV: path.join(TMP, "pc7", ".env"), MYNA_ROLE: "edge", RELAY_PORT: String(E7) }, encoding: "utf8" }).stdout || "";
+const HOLD_FILE = path.join(dirOf("pc7"), "upstream-hold");
+const holdStatus = () => spawnSync(process.execPath, [src("scripts", "hold.mjs"), "status"], { env: { ...baseEnv, ...homeOf(dirOf("pc7")), MYNA_ENV: path.join(dirOf("pc7"), ".env"), MYNA_ROLE: "edge", RELAY_PORT: String(E7) }, encoding: "utf8" }).stdout || "";
 {
   // a question forwarded before the outage waits past the grace (2 s here) instead of being given up
   const f = await ask(EDGE7, { question: "斷線前就送出的題(第 10 項)", options: ["一", "二"], session_id: "q-1" });
@@ -407,7 +410,7 @@ const holdStatus = () => spawnSync(process.execPath, [src("scripts", "hold.mjs")
   // over the cap: a question held for 2 hours, with max=1h → unreachable
   pc7.kill(); await until(async () => !(await health(EDGE7)), 5000);
   tunnel.down = true;
-  const sf = path.join(TMP, "pc7", "edge-state.json"), s = JSON.parse(fs.readFileSync(sf, "utf8"));
+  const sf = path.join(dirOf("pc7"), "edge-state.json"), s = JSON.parse(fs.readFileSync(sf, "utf8"));
   s.queued = [["abcdef0123", { body: JSON.stringify({ question: "排太久的題", options: ["A", "B"], session_id: "q-old" }), at: Date.now() - 2 * 3600 * 1000 }]];
   fs.writeFileSync(sf, JSON.stringify(s));
   fs.writeFileSync(HOLD_FILE, `on\nmax=3600\n${new Date().toISOString()}\n`);

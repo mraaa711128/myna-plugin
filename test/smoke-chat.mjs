@@ -18,6 +18,7 @@ import { fileURLToPath } from "node:url";
 import path from "node:path";
 import os from "node:os";
 import fs from "node:fs";
+import { eventualPrivateProblem, sddlOf } from "./helpers/private-mode.mjs";
 
 const relayPath = fileURLToPath(new URL("../src/relay.mjs", import.meta.url));
 const root = path.dirname(path.dirname(relayPath));
@@ -95,10 +96,10 @@ const answerOf = async (id) => { for (;;) { const j = await (await fetch(`${RELA
 const ask = (body) => fetch(`${RELAY}/ask`, { method: "POST", body: JSON.stringify(body) }).then((r) => r.json());
 const SECRET = () => fs.readFileSync(SECRET_FILE, "utf8").trim();
 
-// 1) the relay secret: created 0600; registration needs it
+// 1) the relay secret: created 0600 (Windows: an ACL of this user only); registration needs it
 {
-  const mode = fs.statSync(SECRET_FILE).mode & 0o777;
-  ok(mode === 0o600 && SECRET().length >= 64, `relay secret created at start, mode ${mode.toString(8)}`);
+  const bad = await eventualPrivateProblem(SECRET_FILE); // Windows: set in the background as the relay starts
+  ok(!bad && SECRET().length >= 64, `relay secret created at start, this user's only${bad ? ` — ${bad}` : ""}`);
   const none = await api("/chat/register", { session_id: "s-a", nick: "egret" });
   const wrong = await api("/chat/register", { session_id: "s-a", nick: "egret" }, "nope");
   ok(none.status === 401 && wrong.status === 401, "register without / with a wrong relay secret → 401");
@@ -589,6 +590,49 @@ const takeSoon = async () => { for (let i = 0; i < 40; i++) { const t = (await a
   const R4 = await api("/chat/register", { session_id: "s-f", nick: "finch", label: "flat" }, SECRET());
   ok(t.message?.text === "topic 裡的訊息" && R4.topic === R3.topic && of("createForumTopic").length === 0,
     "text in the new topic reaches finch; a later registration keeps that topic (no new create)");
+}
+
+// last) owner-only files that cannot be made so: GET /health says so (private_files → /myna:status), the relay
+// keeps running. Windows: icacls failing (MYNA_ICACLS pointed at a program that is not there)
+{
+  // the chat-sessions file is rewritten on every take: on Windows its ACL is set in the background, just after
+  const sessionsBad = await eventualPrivateProblem(path.join(tmp, "chat-sessions.json"));
+  ok(!sessionsBad, `the chat-sessions file is this user's only (0600; Windows: set right after each write)${sessionsBad ? ` — ${sessionsBad}` : ""}`);
+  const h0 = await (await fetch(`${RELAY}/health`)).json();
+  ok(h0.private_files === null, `/health: no owner-only file problem so far → ${JSON.stringify(h0.private_files)}`);
+  if (process.platform === "win32") {
+    const gone = new Promise((r) => relay.once("exit", r));
+    relay.kill(); await gone;
+    const secret2 = path.join(tmp, "elsewhere", "relay-secret"); // a folder not set up yet (the first relay set up tmp's)
+    await startRelay({ MYNA_ICACLS: path.join(tmp, "no-such-icacls.exe"), MYNA_RELAY_SECRET_FILE: secret2 });
+    let h;
+    for (let i = 0; i < 100; i++) { h = await (await fetch(`${RELAY}/health`)).json(); if (h.private_files) break; await sleep(50); } // icacls runs in the background
+    ok(h.ok && /icacls/.test(h.private_files?.error || "") && typeof h.private_files?.file === "string",
+      `icacls failing → the relay still starts, /health reports it → ${JSON.stringify(h.private_files)}`);
+    const reg = await api("/chat/register", { session_id: "s-acl", nick: "acl" }, fs.readFileSync(secret2, "utf8").trim());
+    ok(!!reg.token, `…and keeps working (a chat session registers: ${reg.status})`);
+
+    // files a setting put in a folder others can read (Codex review X1, X2):
+    //   - a relay secret of an older version there, readable by Everyone (an explicit entry) → fixed at start
+    //   - a folder whose files Everyone inherits read access to → the chat file written there is this user's only
+    const icacls = (...a) => execFileSync(path.join(process.env.SystemRoot || "C:\\Windows", "System32", "icacls.exe"), a, { windowsHide: true });
+    const legacy = path.join(tmp, "legacy"), shared = path.join(tmp, "shared");
+    fs.mkdirSync(legacy); fs.mkdirSync(shared);
+    const oldSecret = path.join(legacy, "relay-secret");
+    fs.writeFileSync(oldSecret, `${"a".repeat(64)}\n`);
+    icacls(oldSecret, "/grant", "*S-1-1-0:R");
+    icacls(shared, "/grant", "*S-1-1-0:(OI)(CI)R");
+    ok(/WD/.test(sddlOf(oldSecret)) && /WD/.test(sddlOf(shared)), "setup: Everyone can read the old secret and what is created in the shared folder");
+    const gone2 = new Promise((r) => relay.once("exit", r));
+    relay.kill(); await gone2;
+    const chatFile = path.join(shared, "chat-sessions.json");
+    await startRelay({ MYNA_RELAY_SECRET_FILE: oldSecret, MYNA_CHAT_FILE: chatFile });
+    const legacyBad = await eventualPrivateProblem(oldSecret);
+    ok(!legacyBad, `an older version's secret elsewhere, readable by Everyone → this user's only once the relay starts${legacyBad ? ` — ${legacyBad}` : ""}`);
+    const reg2 = await api("/chat/register", { session_id: "s-shared", nick: "shared" }, "a".repeat(64));
+    const sharedBad = await eventualPrivateProblem(chatFile);
+    ok(!!reg2.token && !sharedBad, `a folder whose files Everyone could read → the chat file written there is this user's only${sharedBad ? ` — ${sharedBad}` : ""}`);
+  }
 }
 
 relay.kill(); stub.close(); clearTimeout(watchdog);
