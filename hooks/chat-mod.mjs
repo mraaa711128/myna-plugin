@@ -178,7 +178,7 @@ export const parentOf = (p) => String(p).replace(/[\\/][^\\/]*$/, "");
 const cpRange = (a, b) => `${String.fromCharCode(a)}-${String.fromCharCode(b)}`;
 const UNSAFE_RE = new RegExp(`[\\x00-\\x1f\\x7f-\\x9f${cpRange(0x200b, 0x200f)}${cpRange(0x2028, 0x202e)}${cpRange(0x2060, 0x2069)}${String.fromCharCode(0xfeff)}]`, "g");
 const LINE_BREAKS = new RegExp(`\\r\\n|[\\r\\n${String.fromCharCode(0x2028, 0x2029)}]`);
-// A message another session sent (relay ≥ 0.25.0, tree transport: via "session"): the header line is made
+// A message another session sent (relay ≥ 0.26.0, tree transport: via "session"): the header line is made
 // here from what the relay stamped (its address, owner, project) and the text goes under it quoted, every
 // line "> " — so nothing in the text can pass for a header of its own.
 export function peerText(m) {

@@ -1,6 +1,6 @@
 # Async Human-Gate Bridge — SPEC (v3, 定稿)
 
-> **Status:** 已實作並持續修訂(目前 v0.25.0;各版內容見下方各節的「後續修訂」;多機共用 relay 的協定見 §5.1,子節點轉送聊天和斷線排隊見 §5.2,從手機傳檔案給聊天 session 見 §5.3,tree 傳輸(第 0 批:相鄰節點的 session 互傳)見 §5.4)
+> **Status:** 已實作並持續修訂(目前 v0.26.0;各版內容見下方各節的「後續修訂」;多機共用 relay 的協定見 §5.1,子節點轉送聊天和斷線排隊見 §5.2,從手機傳檔案給聊天 session 見 §5.3,tree 傳輸(第 0 批:相鄰節點的 session 互傳)見 §5.4)
 > **Type:** Flow tooling(AI agent 工作流程的基礎建設)
 > **Home:** 獨立 repo(Claude Code plugin「myna」)。
 
@@ -551,7 +551,7 @@ sequenceDiagram
 - 兩支 smoke 都支援 `MYNA_TEST_ROOT=<另一份 checkout>`:指 0.21.1 時都會失敗。
 
 
-## 5.4 tree 傳輸:第 0 批,相鄰節點的 session 互傳(v0.25.0)
+## 5.4 tree 傳輸:第 0 批,相鄰節點的 session 互傳(v0.26.0)
 
 每台 relay 是同一種**節點**,排成樹:下層主動連上層,每個節點只記自己的上層和直接下層。第 0 批只做**直接 join 的相鄰兩個節點**之間、以及同一個節點裡的 session 互傳,地址到 `nick@節點`。多層地址、`via`、`hop_limit`、拿掉 Cloudflare 是第 1 批;手機回話往下送是第 2 批;✅ 跨節點是第 3 批。
 
@@ -650,7 +650,7 @@ sequenceDiagram
 
 ### 後續修訂
 
-- **v0.25.0**:第 0 批(上面全部)。沒有跨兩台機器實測(真的 `tailscale serve`、跨機 whois、手機打開綁定連結都沒驗)。
+- **v0.26.0**:第 0 批(上面全部)。沒有跨兩台機器實測(真的 `tailscale serve`、跨機 whois、手機打開綁定連結都沒驗)。
 
 ## 6. Telegram UX
 

@@ -2,7 +2,7 @@
 description: On the Myna hub — list the machines that joined, or revoke one (its token stops working at once); approve a tree node's join here
 argument-hint: "[list | revoke <name> | approve [code]]"
 ---
-Tree mode (v0.25.0): `list` also shows the tree nodes joined under this one (device, Tailscale account or tags and the assigned owner), `revoke <name>` revokes those too, and **approve [code]** — only for a join request that could not go to a phone (this relay has no Telegram bot, or no account is bound to its owner): without a code it lists what waits (with the device and account Tailscale reports — compare the code with the joining machine's terminal first); with a code it lets that node in. A tagged parent cannot approve here.
+Tree mode (v0.26.0): `list` also shows the tree nodes joined under this one (device, Tailscale account or tags and the assigned owner), `revoke <name>` revokes those too, and **approve [code]** — only for a join request that could not go to a phone (this relay has no Telegram bot, or no account is bound to its owner): without a code it lists what waits (with the device and account Tailscale reports — compare the code with the joining machine's terminal first); with a code it lets that node in. A tagged parent cannot approve here.
 
 Run on the **hub** (the machine whose relay owns the bot): `node "${CLAUDE_PLUGIN_ROOT}/scripts/machines.mjs" $ARGUMENTS` (default `list`).
 
