@@ -74,7 +74,7 @@ function transcript(entries = []) {
   return { file, add };
 }
 function runHook(input, { delay = 0, port = PORT, envFile } = {}) {
-  const env = { ...process.env, MYNA_ENV: envFile || path.join(tmp, "no-such-env"), RELAY_PORT: String(port), MYNA_RELAY_URL: "", MYNA_PERMISSION_FILE: FLAG, MYNA_PERMISSION_DELAY: String(delay), MYNA_PERMISSION_WATCH_MS: "200" };
+  const env = { ...process.env, MYNA_ENV: envFile || path.join(tmp, "no-such-env"), RELAY_PORT: String(port), MYNA_RELAY_URL: "", MYNA_PERMISSION_FILE: FLAG, MYNA_GODMODE_FILE: path.join(tmp, "godmode-never"), MYNA_GODMODE_UNSENT_FILE: path.join(tmp, "godmode-unsent.jsonl"), MYNA_PERMISSION_DELAY: String(delay), MYNA_PERMISSION_WATCH_MS: "200" };
   if (delay === null) delete env.MYNA_PERMISSION_DELAY; // read it from the env file instead
   const c = spawn(process.execPath, [hookPath], {
     env,

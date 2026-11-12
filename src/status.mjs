@@ -22,6 +22,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { mynaDir, roleOf, holdSettings } from "./remote.mjs";
 import { keepFile, readKeep } from "./inbox.mjs";
+import { godmodeFile, godmodeSince, unsentSince } from "./godmode.mjs";
 
 export const DEADLINE_MS = 6000;
 export const LOG_TAIL_BYTES = 256 * 1024;
@@ -112,6 +113,17 @@ export const SWITCHES = [
     key: "autopilot", label: "autopilot", command: "/myna:autopilot", script: "autopilot.mjs", default: false, envFile: "MYNA_AUTOPILOT_FILE", reader: "src/mcp/ask-human.mjs",
     file: (cfg, env) => homeFile(env, "MYNA_AUTOPILOT_FILE", "autopilot"),
     state(cfg, env) { const file = this.file(cfg, env), on = fs.existsSync(file); return { on, isDefault: !on, source: on ? "file" : "default", file }; },
+  },
+  {
+    // God mode (0.25.0): the flag file existing = on (src/godmode.mjs); while on, the unsent notices since it
+    // was turned on (godmode-unsent.jsonl lines dated after the time in the flag file)
+    key: "godmode", label: "godmode", command: "/myna:godmode", script: "godmode.mjs", default: false, envFile: "MYNA_GODMODE_FILE", reader: "scripts/permission-request.mjs",
+    file: (cfg, env) => godmodeFile(env),
+    state(cfg, env) {
+      const file = this.file(cfg, env), on = fs.existsSync(file);
+      const u = on ? unsentSince(godmodeSince(env), env) : null;
+      return { on, isDefault: !on, source: on ? "file" : "default", file, ...(u ? { unsent: u.count, unsent_file: u.file } : {}) };
+    },
   },
   {
     // the relay reads it — from its merged config, not only the environment

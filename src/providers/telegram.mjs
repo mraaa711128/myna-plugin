@@ -752,6 +752,23 @@ export function create(cfg, ctx) {
     return res;
   }
 
+  // God mode's one-way notice (relay POST /notify, v0.25.0): the bound chat's main view — no topic (a
+  // topic is deleted at its end, the notice with it), no buttons, plain text (no parse_mode: a command
+  // line is arbitrary content). Throws when it did not go out, so the relay answers 502.
+  const NOTICE_MAX = 4000; // Telegram's limit is 4096 characters
+  async function sendNotice(text) {
+    if (!CHAT_ID) throw new Error("no Telegram chat paired yet — run /myna:pair");
+    const t = String(text ?? "");
+    const res = await tg("sendMessage", { chat_id: CHAT_ID, text: t.length > NOTICE_MAX ? `${t.slice(0, NOTICE_MAX)}…` : t });
+    if (!res.ok) {
+      const e = new Error(`telegram sendMessage failed: ${res.error || res.description || JSON.stringify(res).slice(0, 200)}`);
+      // no answer from Telegram (transport error after the retries): it may have taken the message — the relay
+      // says so (504), and an edge does not send a second copy on another bot. An answer with ok:false is a refusal.
+      if (res.error_code === undefined) e.maybeSent = true;
+      throw e;
+    }
+  }
+
   async function sendQuestion(request_id, args = {}) {
     const s = { holds: [] };
     try { await sendQuestionHeld(request_id, args, s); } finally { release(s); }
@@ -1148,7 +1165,7 @@ export function create(cfg, ctx) {
   }
 
   return {
-    name, start, stop, sendQuestion, closeSession, endRound, cancelQuestion, transferRequest, startPairing, pairStatus,
+    name, start, stop, sendQuestion, sendNotice, closeSession, endRound, cancelQuestion, transferRequest, startPairing, pairStatus,
     chatOpen, chatProgress, chatTaken, chatClose,
     onResolve(request_id, result) {
       for (const [t, v] of tokens) if (v.request_id === request_id) tokens.delete(t);
