@@ -652,6 +652,51 @@ sequenceDiagram
 
 - **v0.26.0**:第 0 批(上面全部)。沒有跨兩台機器實測(真的 `tailscale serve`、跨機 whois、手機打開綁定連結都沒驗)。
 
+## 5.5 常駐:登入後自動啟動 relay(v0.27.0)
+
+需求(人 2026-11-12):常駐要能**手動開、關**;要有**不靠 Claude Code 的 CLI**(最上層可能不開 AI agent,slash command 只是包裝);**不用外部軟體**(不用 Servy 之類),只用 OS 內建的 macOS launchd LaunchAgent、Windows 工作排程器、Linux `systemd --user`;第一版只做**登入後**自動啟動。
+
+**做法:登入時跑一次 `ensure-relay`。** relay 本身、它的啟動方式(`ensure-relay` 把它 spawn 成 detached)都不變,只是多一個「登入」的觸發時機。OS 不看著 relay(不設 `KeepAlive`、`Restart=`、失敗重試),所以不需要「OS 管的 relay」旗標,也不會跟 SessionStart 搶 port:同一台只有一個 relay(第二個搶不到 port 就結束),誰先起來誰占 port,之後的 `ensure-relay` 照版本決定換不換(新版優先、同版不動、舊版不搶新版)。
+
+### `scripts/service.mjs on|off|status`(`/myna:service` 包一層)
+
+只用 Node 內建模組,`node <myna>/scripts/service.mjs …` 就能跑。
+
+- **`on`**:
+  1. 寫 `~/.myna/service/start.mjs`(固定位置、內容跟版本無關)和 `~/.myna/service/service.json` = `{root, version, node, env?}`:`root` 是跑 `on` 的那份 myna,`node` 是 `process.execPath`(登入時的 `PATH` 不一定有 nvm、Homebrew 的 node),`env` 只在 `on` 當下有 `MYNA_ENV` 時記它的絕對路徑(只存路徑)。兩個檔都用「暫存檔 + rename」寫。`~/.myna/service/` 不跟著 `MYNA_ENV`,start.mjs 才找得到它。
+  2. 向 OS 登記「登入時跑 `<node 絕對路徑> ~/.myna/service/start.mjs`」(下表);已經登記過就重新登記,重跑 `on` 結果一樣(也是換 node、換 checkout 的方法)。
+  3. 確保 relay 現在就在跑:macOS 的 `bootstrap` 搭 `RunAtLoad` 已經跑了一次 start.mjs,不再另外跑;Windows、Linux 的登記不會馬上執行,由 `on` 自己跑一次 start.mjs。最後用 `GET /health` 確認、印出結果(還沒設定 bot 時說明,exit 0)。登記失敗 → 印 OS 的錯誤、exit 1,`~/.myna/service/` 留著。
+- **`off`**:拿掉 OS 的登記;**拿掉成功、或確認本來就沒登記**,才刪 `~/.myna/service/`。OS 指令回錯誤 → 不刪檔、印出錯誤、exit 1。**不停正在跑的 relay**(它可能正在服務 session、題目、tree 轉送);要停用 `/myna:relay stop`(沒有 Claude Code:`stop-relay.mjs`),輸出會提醒。`~/.myna/.env`、`relay.log`、journal 都不碰。
+- **`status`**(預設,唯讀):登記在不在(問 OS;問不到時說「查不到」和原因)、登記檔在不在、`service.json` 的 `root`／`version`／`node`／`env` 和路徑還在不在、`/health` 的 `version`、`pid`、`started_at`,以及登入啟動失敗時去哪裡看。
+
+| OS | `on` | `off` | `status` |
+|---|---|---|---|
+| macOS | 寫 `~/Library/LaunchAgents/com.myna.relay.plist`(`ProgramArguments` = node + start.mjs,`RunAtLoad` true,不設 `KeepAlive`,`StandardErrorPath` = `~/.myna/service/launchd.err`);`launchctl print gui/<uid>/com.myna.relay` 成功(已載入)就先 `bootout`,再 `launchctl bootstrap gui/<uid> <plist>`(剛 bootout 完 bootstrap 可能暫時失敗,最多試 3 次) | 已載入就 `launchctl bootout gui/<uid>/com.myna.relay`,刪 plist | `launchctl print` 成功與否 |
+| Windows | `schtasks /Create /TN "Myna relay" /SC ONLOGON /TR "\"<node.exe>\" \"<start.mjs>\"" /F` | `schtasks /Query` 有才 `schtasks /Delete /TN "Myna relay" /F` | `schtasks /Query /TN "Myna relay"`(非零 = 沒有;訊息會依語系翻譯,不比對文字) |
+| Linux | 寫 `$XDG_CONFIG_HOME/systemd/user/myna-relay.service`(預設 `~/.config`;`Type=oneshot`、`RemainAfterExit=yes`、`ExecStart="<node>" "<start.mjs>"`、`WantedBy=default.target`),`systemctl --user daemon-reload`、`enable` | `systemctl --user disable`,刪檔、`daemon-reload`。**不 `stop`**:`RemainAfterExit` 的 unit 一 stop,cgroup 裡的 relay 會被一起清掉 | `systemctl --user is-enabled myna-relay.service`(輸出 `disabled`/`not-found` = 沒有;連不到 user bus = 查不到) |
+
+OS 指令一律 `execFile` 帶參數陣列,不經 shell。
+
+### start.mjs(登入時 OS 跑的)
+
+讀旁邊的 `service.json`;有 `env` 就設成 `MYNA_ENV`(登入環境沒有互動 shell 設的 `MYNA_ENV`);跑 `node <root>/scripts/ensure-relay.mjs`。失敗時在那個 `.env` 旁的 `relay.log` 寫**一行**(`myna service (login start): …`)、exit 1:`service.json` 讀不懂、`root` 不在、`ensure-relay` exit 非零、或 `ensure-relay` 說 `relay not started`(沒設定、`MYNA_ROLE` 不對)。成功時不寫自己的紀錄(relay 啟動那行就是紀錄)。
+
+### `ensure-relay` 更新 `service.json`
+
+`~/.myna/service/service.json` 存在時,**只有**「自己的版本比裡面記的新」(同一套 semver 比較),或「版本一樣、但記的 `root` 已經不在」→ 把 `root`、`version` 改成自己的(其他欄位不動;暫存檔 `service.json.<pid>-<亂數>.tmp` + rename)。比裡面記的舊、任一邊的版本看不懂、檔案不存在 → 不動(不倒退、不建檔)。**只處理同一個 `.env` 的 relay**:這次 `ensure-relay` 用的 `.env`(`MYNA_ENV` 或預設)跟 `service.json` 的 `env`(沒有就是預設)不同時不動,免得測試或另一套設定把登入啟動指到別的 checkout。這一步是**獨立的 best-effort**:每一個結束點(包括「沒設定」「同版本已在跑」)都會跑,包在自己的 try 裡;讀不到、JSON 壞掉、寫不進去、rename 失敗都只印一行 `warning`,relay 的啟動、替換照舊。好幾個 session 同時寫時最後一個 rename 的贏,寫的都是「比原本新」的版本。不碰 OS 的登記。
+
+### 刻意不做(第一版)
+
+開機不登入就啟動(LaunchDaemon、`/SC ONSTART`、`loginctl enable-linger`:要系統管理員);當掉自動重開(會跟 `/myna:relay stop` 打架);`off` 順便停 relay;登入啟動的成功標記、`status` 掃 log;`managed` 旗標;npm 發布、`npx`;Servy、NSSM、pm2 等外部軟體;Windows 隱藏主控台視窗(`wscript` 之類)。
+
+### 測試
+
+`test/smoke-service.mjs`:暫存 HOME(路徑有空白和 `&`)、隨機 port、假 bot token;`MYNA_SERVICE_LAUNCHCTL`/`_SCHTASKS`/`_SYSTEMCTL` 指到 `test/helpers/fake-service-os.mjs`(記錄參數、保存「已登記」狀態、可以指定哪個子指令失敗;假的 `launchctl bootstrap` 照 plist 的 `RunAtLoad` 跑 `ProgramArguments`),`MYNA_SERVICE_PLATFORM` 在同一台機器上輪流扮三種 OS。不碰真的 `~/.myna`、7800/7801,不真的登記。
+
+### 後續修訂
+
+- **v0.27.0**:上面全部。**沒有真機驗證**:三種 OS 的登記都只用假指令驗過參數。還沒實測的:Windows 一般使用者建 `/SC ONLOGON` 工作要不要系統管理員(被拒的話,候選是「啟動」資料夾或指定使用者的登入觸發);macOS launchd 結束 job 時會不會清掉 detached 的 relay(不行就加 `AbandonProcessGroup`);Linux `RemainAfterExit` 的 unit 下 relay 會不會留著;Windows 登入時主控台視窗閃一下。三種 OS 都要跑完手動 E2E(`on` → 登出再登入 → relay 在跑 → `off` → relay 還在 → 停掉 → 登出再登入 → 沒有自己起來)才算完成。
+
 ## 6. Telegram UX
 
 - **訊息格式:** `[機器A · PROJ-123 · gate② space-time]` +(有 `preamble` 時先顯示 preamble)+ question +**完整選項以編號列於內文**(`1. …` `2. …`)。
@@ -722,7 +767,7 @@ sequenceDiagram
   - **第 2 階段(0.21.0):** 遠端的 `/attest`(綁定機器與 session)、`/detach`、`/reattach`、`/requests`;手機上那一行改成「核准後在 <機器> 執行：」;還有沒用掉的核准時 `ensure-relay` 延後替換 relay。
   - **第 3 階段(0.22.0):** 遠端的 chat(`/chat/*` 轉送、per-session token 改放 `X-Myna-Chat-Token`、`/chat/take?wait=`)、手機上的 `!machines`、`!revoke`。
   - **第 4 階段:** `/machines/rotate`、新來源提醒、`doctor` 從外面檢查 `/health` 要回 401。
-  - **第 5 階段:** Windows 常駐(Task Scheduler)、`MYNA_OFFLINE=wait`(可選)。
+  - **第 5 階段:** 常駐、`MYNA_OFFLINE=wait`(可選)。常駐在 0.27.0 做成 `/myna:service`(§5.5):三種 OS 都是登入後自動啟動,不只 Windows。
 - **v3:** multiSelect、gate④ 的 Web App checklist、(bonus)同 server 宣告 `claude/channel/permission` 順便 relay Bash/Write/Edit 權限。
 
 ## 10. Test plan
