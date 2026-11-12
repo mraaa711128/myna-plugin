@@ -36,7 +36,7 @@ if (arg === "on") {
   fs.mkdirSync(path.dirname(FLAG), { recursive: true });
   fs.writeFileSync(FLAG, new Date().toISOString());
   const out = [
-    `God mode 開了 —— 這台每一個權限確認都會立刻自動允許（含 FRIDAY 護欄攔下的動作），每允許一筆就送一則通知到 IM。關掉：/myna:godmode off。旗標檔：${tildePath(FLAG)}`,
+    `God mode 開了 —— 這台每一個權限確認都會立刻自動允許（含護欄 hook 攔下來要問的動作），每允許一筆就送一則通知到 IM。關掉：/myna:godmode off。旗標檔：${tildePath(FLAG)}`,
   ];
   const note = imNote(); if (note) out.push(note);
   console.log(out.join("\n"));

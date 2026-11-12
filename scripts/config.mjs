@@ -95,7 +95,7 @@ const INFO = {
   },
   godmode: {
     values: "on / off",
-    purpose: "所有權限確認自動同意並送通知到 IM（含 FRIDAY 護欄攔下的動作），不再問你",
+    purpose: "所有權限確認自動同意並送通知到 IM（含護欄 hook 攔下來要問的動作），不再問你",
     more: "整台機器一起開，關掉前一直有效；只允許那一次，不寫永久規則；AskUserQuestion 不算（交給 intercept／autopilot）；通知送不出去時照樣同意，記在 ~/.myna/godmode-unsent.jsonl（/myna:status 看得到筆數）；通知目前只有 Telegram；也可以用 /myna:godmode",
     applies: "馬上生效",
   },

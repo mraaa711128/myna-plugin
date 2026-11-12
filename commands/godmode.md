@@ -6,7 +6,7 @@ Turn Myna God mode on or off, or show its state, and report the result.
 
 Run: `node "${CLAUDE_PLUGIN_ROOT}/scripts/godmode.mjs" $ARGUMENTS`
 
-- `on` → every permission dialog on this machine (every session, background subagents included, FRIDAY guard prompts included) is allowed at once — that one call only, no permanent rule — and each one is sent as a notice to the bound chat's main view. `AskUserQuestion` is not a permission and is left to intercept / autopilot. A notice that cannot be sent still allows; it is kept in `~/.myna/godmode-unsent.jsonl`. Notices are Telegram only for now.
+- `on` → every permission dialog on this machine (every session, background subagents included, prompts raised by guard hooks included) is allowed at once — that one call only, no permanent rule — and each one is sent as a notice to the bound chat's main view. `AskUserQuestion` is not a permission and is left to intercept / autopilot. A notice that cannot be sent still allows; it is kept in `~/.myna/godmode-unsent.jsonl`. Notices are Telegram only for now.
 - `off` → permission dialogs go back to the terminal (and to the phone when nobody answers, `/myna:perm`).
 - no argument / `status` → whether it is on, since when, and how many notices since then were not sent.
 
