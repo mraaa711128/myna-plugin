@@ -67,8 +67,9 @@ if (cmd === "list") {
 }
 if (cmd === "revoke") {
   if (!arg) { console.error("usage: machines.mjs revoke <name|id>"); process.exit(1); }
-  let hit = store.revoke(arg);
-  if (!hit.length && tree) hit = tree.revoke(arg); // a tree node: its token stops working; the relay ends its link within seconds
+  // both stores: an old machine and a tree node may share a name — both are revoked, each named below
+  // (a tree node's token stops working at once; the relay ends its link within seconds)
+  const hit = [...store.revoke(arg), ...(tree ? tree.revoke(arg).map((m) => ({ ...m, name: `${m.name} (tree)` })) : [])];
   if (!hit.length) { console.error(`no active machine named or with id "${arg}" — see machines.mjs list`); process.exit(1); }
   for (const m of hit) console.log(`revoked ${m.name} (${m.id}) — its token no longer works; the relay cancels its open questions within a few seconds`);
   process.exit(0);

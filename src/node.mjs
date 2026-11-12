@@ -34,7 +34,7 @@ import dns from "node:dns/promises";
 import { createTailscale, identityOf, normIp } from "./tailscale.mjs";
 import {
   machineStore, newMachineId, newMachineToken, sha256hex, sameHex, bearerOf, readBody, writePrivate,
-  NAME_RE, CODE_RE, ENROLL_SECRET_HEADER,
+  NAME_RE, CODE_RE, ENROLL_SECRET_HEADER, withFileLock,
 } from "./remote.mjs";
 import { normNick } from "./chat.mjs";
 import { oneLineSafe } from "./project.mjs";
@@ -54,6 +54,7 @@ export const nodeFiles = (cfg, dir) => ({
   children: cfg.MYNA_NODE_CHILDREN_FILE || path.join(dir, "node-children.json"),
   bindings: cfg.MYNA_BINDINGS_FILE || path.join(dir, "bindings.json"),
   pairs: path.join(dir, "peer-pairs.json"),
+  results: path.join(dir, "peer-results.json"),
   sessionTokens: path.join(dir, "session-tokens"),
 });
 const intOf = (v, dflt, min = 0) => { const n = Number(String(v ?? "").trim()); return String(v ?? "").trim() !== "" && Number.isInteger(n) && n >= min ? n : dflt; };
@@ -71,6 +72,9 @@ export function readBindings(file) {
   return Array.isArray(j?.bindings) ? j.bindings.filter((b) => b && typeof b.im === "string" && typeof b.identity === "string") : [];
 }
 export const saveBindings = (file, list) => writePrivate(file, JSON.stringify({ version: 1, bindings: list }, null, 2) + "\n");
+// read-modify-write of bindings.json under its lock (the relay's bind page and /myna:bind remove are two
+// processes): fn(list) → the new list, or undefined to leave the file as it is
+export const updateBindings = (file, fn) => withFileLock(file, () => { const next = fn(readBindings(file)); if (Array.isArray(next)) saveBindings(file, next); return next; });
 // a session token file's name (the MCP server of that session reads it to call /peer/send)
 export const sessionTokenName = (sid) => String(sid).replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 128);
 
@@ -191,7 +195,16 @@ export function createNode({ cfg, log, dir, version, machineName, chat, provider
   function onSessionClosed(sid) { let gone = false; for (const k of [...pairs.keys()]) if (k.startsWith(`${sid}\n`)) { if (pairs.get(k).stopped) gone = true; pairs.delete(k); } if (gone) savePairs(); }
 
   // --- delivery on this node (the message's address is a session here) -------------------------------
-  const results = new Map();  // `${sender stable id}:${id}` → {at, result}
+  // `${sender stable id}:${id}` → {at, result}. The delivered ones are also written to peer-results.json right
+  // after the inbox write: a relay that dies before its result reaches the sender gets the same message again
+  // after a restart, and must answer it from here instead of delivering it twice
+  const results = new Map();
+  for (const [k, v] of Object.entries(readJson(F.results) || {})) if (v && Date.now() - v.at < RESULT_KEEP_MS) results.set(k, v);
+  const saveResults = () => {
+    const keep = {}; const now = Date.now();
+    for (const [k, v] of results) if (v.result?.delivered === true && now - v.at < RESULT_KEEP_MS) keep[k] = v;
+    try { writePrivate(F.results, JSON.stringify(keep) + "\n"); } catch (e) { log("node: could not save", F.results, e.message); }
+  };
   const inflight = new Map();
   let displayFailed = 0, lastDisplayFailure = null;
   setInterval(() => { const now = Date.now(); for (const [k, v] of results) if (now - v.at > RESULT_KEEP_MS) results.delete(k); }, 600000).unref();
@@ -209,11 +222,11 @@ export function createNode({ cfg, log, dir, version, machineName, chat, provider
     const hit = results.get(k);
     if (hit) return Promise.resolve(hit.result);
     if (inflight.has(k)) return inflight.get(k);
-    const run = deliverNow(env).then((r) => { results.set(k, { at: Date.now(), result: r }); inflight.delete(k); return r; }, (e) => { inflight.delete(k); return { delivered: false, reason: "error", error: e.message }; });
+    const run = deliverNow(env, k).then((r) => { if (!results.has(k)) results.set(k, { at: Date.now(), result: r }); inflight.delete(k); return r; }, (e) => { inflight.delete(k); return { delivered: false, reason: "error", error: e.message }; });
     inflight.set(k, run);
     return run;
   }
-  async function deliverNow(env) {
+  async function deliverNow(env, k) {
     const a = parseAddress(env.to);
     if (!a || (a.node && a.node !== ownName)) return notFound(`第 0 批只送到這台（${ownName}）和直接相鄰的節點`);
     const sid = chat.ctx.byNick(a.nick);
@@ -225,16 +238,22 @@ export function createNode({ cfg, log, dir, version, machineName, chat, provider
     const blocked = pairBlock(sid, env.from);
     if (blocked) return blocked;
     const { key, st } = pairOf(sid, env.from);
+    // the pair's slot is taken now, in the same step as the check — concurrent messages cannot all slip under
+    // the limit; given back when this one is not delivered
+    st.count++;
+    const giveBack = (r) => { st.count = Math.max(0, st.count - 1); return r; };
     if (showFirst()) {
       const ok = await show(sid, showText(env, to), key);
-      if (!ok) { displayFailed++; lastDisplayFailure = new Date().toISOString(); log(`node: ${env.from} → ${to}: the copy could not be posted to this relay's bot — not delivered (show first is on)`); return { delivered: false, reason: "display_failed", error: "收件那台的 bot 貼不出這則訊息，先給人看才送出的設定開著，所以沒有交付" }; }
-      if (st.stopped) return pairBlock(sid, env.from); // ⏹ while it was being shown
+      if (!ok) { displayFailed++; lastDisplayFailure = new Date().toISOString(); log(`node: ${env.from} → ${to}: the copy could not be posted to this relay's bot — not delivered (show first is on)`); return giveBack({ delivered: false, reason: "display_failed", error: "收件那台的 bot 貼不出這則訊息，先給人看才送出的設定開著，所以沒有交付" }); }
+      if (st.stopped) return giveBack(pairBlock(sid, env.from)); // ⏹ while it was being shown
     } else if (hasBot()) show(sid, showText(env, to), key).catch(() => {});
     const r = chat.ctx.deliver(sid, { text: env.body.text, from: env.from, via: "session", peer: { owner: env.owner, project: env.project, project_source: env.project_source, machine: env.machine?.name } });
-    if (r.closed) return notFound(`${to} 已經結束`);
-    st.count++;
+    if (r.closed) return giveBack(notFound(`${to} 已經結束`));
+    const done = { delivered: true, to };
+    // recorded in the same step as the inbox write (see results above)
+    if (k) { results.set(k, { at: Date.now(), result: done }); saveResults(); }
     log(`node: ${env.from} → ${to} delivered (${env.body.text.length} chars)`);
-    return { delivered: true, to };
+    return done;
   }
 
   // --- downward: the child's long-poll take ------------------------------------------------------------
@@ -361,16 +380,21 @@ export function createNode({ cfg, log, dir, version, machineName, chat, provider
       project: s.project || null, project_source: s.project_source || null, machine: { name: ownName, stable_id: me?.stable_id || null }, session: sid,
       budget_ms: PEER_BUDGET_MS, body: { text },
     };
+    // a session whose project stamp cannot be trusted (it came from /clear or an in-app /resume — no
+    // session.start froze it) sends nothing; a new session can (design-v6 had the same rule for roles)
+    if (s.project_source === "untrusted") return reply(200, { delivered: false, reason: "no_project", error: "這個 session 是 /clear 或 /resume 換來的，沒有在開始時凍結專案章，不能傳給別的 session；開一個新的 session 再傳" });
     const blocked = pairBlock(sid, toFull);
     if (blocked) return reply(200, blocked);
+    // this end's slot is taken before anything waits (see deliverNow); given back unless delivered or unknown
+    const { key, st } = pairOf(sid, toFull);
+    st.count++;
     let r;
     if (node === ownName) r = await deliverLocal(env);
     else if (childByName(node)) r = await downSend(childByName(node), env, PEER_BUDGET_MS);
     else if (up && up.name === node) r = await upSend(env, PEER_BUDGET_MS);
     else r = notFound(`找不到節點 ${node}：第 0 批只送到這台（${ownName}）和直接相鄰的節點`);
+    if (r.delivered !== true && r.delivered !== "unknown") st.count = Math.max(0, st.count - 1);
     if (r.delivered === true || r.delivered === "unknown") {
-      const { key, st } = pairOf(sid, toFull);
-      if (r.delivered === true) st.count++;
       // a copy on this relay's bot too (the receiving end's copy covers a message within this node)
       if (node !== ownName && hasBot()) show(sid, showText(env, toFull, r.delivered === true ? "（已送到）" : "（不確定有沒有送到）"), key).catch(() => {});
     }
@@ -470,7 +494,11 @@ export function createNode({ cfg, log, dir, version, machineName, chat, provider
   // --- join (M2) ---------------------------------------------------------------------------------------------
   const shown = (s, n) => String(s ?? "").replace(/[\u0000-\u001f\u007f-\u009f​-‏‪-‮⁦-⁩﻿]/g, " ").trim().slice(0, n) || "?";
   const accountLine = (who, o) => (who.login ? `帳號：tailscale:${who.login}` : `tagged：${who.tags.join(", ")}，按 ✅ 後 owner 會是你（${o}）`);
-  function finishJoin(j, status, extra = {}) { clearTimeout(j.timer); Object.assign(j, { status, doneAt: Date.now(), ...extra }); joinByQ.delete(j.qid); for (const w of j.wake) w(); }
+  function finishJoin(j, status, extra = {}) {
+    clearTimeout(j.timer); Object.assign(j, { status, doneAt: Date.now(), ...extra }); joinByQ.delete(j.qid); for (const w of j.wake) w();
+    // a denied / expired request nobody comes back for is dropped a TTL later (an approved one: see approve)
+    if (status !== "approved") setTimeout(() => { for (const [k, x] of joins) if (x === j) joins.delete(k); }, JOIN_TTL_MS).unref?.();
+  }
   async function joinStart(req, res) {
     const { body, tooLarge } = await readBody(req, 4096);
     if (tooLarge) return send(res, 413, { error: "body too large" });
@@ -521,6 +549,16 @@ export function createNode({ cfg, log, dir, version, machineName, chat, provider
     try { children.add(rec); } catch (e) { log("node: could not save", F.children, e.message); return finishJoin(j, "denied", { reason: "save_failed" }); }
     log(`node: ${j.name} joined (${rec.owner}${j.who.login ? "" : ", assigned"}) — child ${id} in ${F.children}`);
     finishJoin(j, "approved", { token, rec });
+    // as /machines/join: a token nobody collects within the TTL is revoked; a collected one's record (for a
+    // reply lost on the way back) goes a TTL after its first hand-out
+    const t = setTimeout(() => {
+      const enrollId = [...joins].find(([, x]) => x === j)?.[0];
+      if (j.collectedAt === undefined) {
+        try { children.revoke(rec.id); log(`node: ${j.name}'s token was never collected — child ${rec.id} revoked`); } catch (e) { log(`node: could not revoke ${j.name}'s uncollected child (${e.message})`); }
+      }
+      if (enrollId) joins.delete(enrollId);
+    }, JOIN_TTL_MS);
+    t.unref?.();
   }
   // a tap on a join question's buttons (only important-button checked ones reach here for ✅)
   function onTap(qid, result) {
@@ -588,9 +626,8 @@ export function createNode({ cfg, log, dir, version, machineName, chat, provider
       return page(res, 403, "Myna 綁定", "<p>這個確認不是從綁定頁送出的（或來自別的網站）。請重新打開 bot 給的連結再按一次。</p>");
     }
     binds.delete(code);
-    const list = bindings().filter((x) => !(x.im === b.im && x.identity.toLowerCase() === identity));
-    list.push({ im: b.im, identity, name: b.name, at: new Date().toISOString() });
-    try { saveBindings(F.bindings, list); } catch (e) { return page(res, 500, "Myna 綁定", `<p>寫不進綁定檔：${esc(e.message)}</p>`); }
+    try { updateBindings(F.bindings, (list) => [...list.filter((x) => !(x.im === b.im && x.identity.toLowerCase() === identity)), { im: b.im, identity, name: b.name, at: new Date().toISOString() }]); }
+    catch (e) { return page(res, 500, "Myna 綁定", `<p>寫不進綁定檔：${esc(e.message)}</p>`); }
     log(`node: ${b.im} bound to ${identity}`);
     Promise.resolve(provider()?.notify?.(`🔐 已把 Telegram 帳號 ${b.name} 綁到 ${identity}。`)).catch(() => {});
     return page(res, 200, "Myna 綁定", `<p>✅ 已綁定：Telegram 帳號 <b>${esc(b.name)}</b> → <b>${esc(identity)}</b>。可以關掉這頁了。</p>`);

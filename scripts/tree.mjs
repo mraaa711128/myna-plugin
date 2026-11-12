@@ -38,7 +38,14 @@ const ts = createTailscale(cfg, { timeoutMs: 15000 });
 const STATE = path.join(dir, "node-join-pending.json");
 const fail = (m, code = 1) => { console.error(`myna tree：${m}`); process.exit(code); };
 const say = (m) => console.log(`myna tree：${m}`);
-const botKind = () => (cfg.TELEGRAM_BOT_TOKEN ? "telegram" : cfg.DISCORD_BOT_TOKEN && cfg.DISCORD_CHANNEL_ID ? "discord" : cfg.SLACK_BOT_TOKEN && cfg.SLACK_APP_TOKEN && cfg.SLACK_CHANNEL_ID ? "slack" : null);
+// which bot the relay will run — its own rule: MYNA_PROVIDER when set (null if its keys are missing), else the
+// first configured in the order telegram → discord → slack
+const KEYS = { telegram: () => !!cfg.TELEGRAM_BOT_TOKEN, discord: () => !!(cfg.DISCORD_BOT_TOKEN && cfg.DISCORD_CHANNEL_ID), slack: () => !!(cfg.SLACK_BOT_TOKEN && cfg.SLACK_APP_TOKEN && cfg.SLACK_CHANNEL_ID) };
+const botKind = () => {
+  const want = String(cfg.MYNA_PROVIDER || "").trim().toLowerCase();
+  if (want) return KEYS[want]?.() ? want : null;
+  return Object.keys(KEYS).find((k) => KEYS[k]()) || null;
+};
 function refuseOld() {
   if (roleOf(cfg) === "edge") fail(`這台是舊的 edge（MYNA_ROLE=edge，加入了 ${cfg.MYNA_UPSTREAM || "?"}），同一台只能用舊的 hub/edge 或 tree 其中一種。沒有改任何設定。`);
   if (String(cfg.MYNA_REMOTE_PORT ?? "").trim()) fail(`這台開著舊的主節點遠端 listener（MYNA_REMOTE_PORT=${String(cfg.MYNA_REMOTE_PORT).trim()}），同一台只能用舊的 hub/edge 或 tree 其中一種。先 /myna:hub off。沒有改任何設定。`);
@@ -74,14 +81,23 @@ async function me() {
   if (!s) fail(`問不到這台的 Tailscale（${ts.lastError() || "?"}）。確認 Tailscale 已安裝、登入、在線；CLI：${ts.cli()}（找不到時設 MYNA_TAILSCALE_CLI）。沒有改任何設定。`);
   return s;
 }
+// the serve entry on <serve port>, from `tailscale serve status --json` (TCP.<port>: {TCPForward, TerminateTLS,
+// ProxyProtocol}) → null (none) | the entry; status failing or not JSON stops the command (fail closed)
+async function serveEntry(servePort) {
+  const st = await ts.run(["serve", "status", "--json"]);
+  let cur;
+  try { cur = st.ok ? JSON.parse(st.out || "{}")?.TCP?.[String(servePort)] ?? null : undefined; } catch { cur = undefined; }
+  if (cur === undefined) fail(`讀不到 tailscale serve status（${(st.err || st.out).trim() || "not JSON"}），沒有改任何設定。`);
+  return cur;
+}
+// exactly this node's: TLS terminated, PROXY v1, forwarded to this very listener
+const ours = (cur, port) => !!cur && cur.TCPForward === `127.0.0.1:${port}` && Number(cur.ProxyProtocol) === 1 && !!cur.TerminateTLS;
 // this node's own `tailscale serve` entry: <serve port> (TLS) → PROXY v1 → 127.0.0.1:<port>. A port already
 // serving something else is refused (never overwritten); already ours → nothing to do.
 async function serveOn(port, servePort) {
-  const st = await ts.run(["serve", "status", "--json"]);
-  let cur = null;
-  if (st.ok) { try { cur = JSON.parse(st.out || "{}")?.TCP?.[String(servePort)] ?? null; } catch {} }
+  const cur = await serveEntry(servePort);
   if (cur) {
-    if (JSON.stringify(cur).includes(`127.0.0.1:${port}`)) { say(`tailscale serve :${servePort} → 127.0.0.1:${port} 已經在了`); return; }
+    if (ours(cur, port)) { say(`tailscale serve :${servePort} → 127.0.0.1:${port} 已經在了`); return; }
     fail(`tailscale serve 的 :${servePort} 已經被別的設定用了（${JSON.stringify(cur)}）。換一個 port：在 ${envPath} 設 MYNA_NODE_SERVE_PORT。`);
   }
   const args = ["serve", "--bg", "--proxy-protocol=1", `--tls-terminated-tcp=${servePort}`, `tcp://127.0.0.1:${port}`];
@@ -92,12 +108,9 @@ async function serveOn(port, servePort) {
 // turn off this node's own serve entry — only when it still is ours (the port may have been given to something
 // else since); a failure stops the command before any setting changes
 async function serveOff(port, servePort) {
-  const st = await ts.run(["serve", "status", "--json"]);
-  let cur;
-  try { cur = st.ok ? JSON.parse(st.out || "{}")?.TCP?.[String(servePort)] ?? null : undefined; } catch { cur = undefined; }
-  if (cur === undefined) fail(`讀不到 tailscale serve status（${(st.err || st.out).trim() || "?"}），沒有改任何設定。`);
+  const cur = await serveEntry(servePort);
   if (!cur) { say(`tailscale serve :${servePort} 本來就沒有設定`); return; }
-  if (!JSON.stringify(cur).includes(`127.0.0.1:${port}`)) { say(`tailscale serve :${servePort} 現在指到別的地方（${JSON.stringify(cur)}），不是這個節點的，不動它`); return; }
+  if (!ours(cur, port)) { say(`tailscale serve :${servePort} 現在指到別的地方（${JSON.stringify(cur)}），不是這個節點的，不動它`); return; }
   const r = await ts.run(["serve", `--tls-terminated-tcp=${servePort}`, "off"]);
   if (!r.ok) fail(`tailscale serve :${servePort} 關不掉（${(r.err || r.out).trim()}），沒有改任何設定。用 tailscale serve status 看一下。`);
   say(`tailscale serve :${servePort} 已關掉`);
@@ -106,11 +119,16 @@ async function serveOff(port, servePort) {
 // bind link opens through it). Exit 2 with how; the same command again continues.
 async function ensureListenerAndBinding(self, { requireBinding }) {
   const port = S.port || DEFAULT_NODE_PORT;
-  await serveOn(port, S.servePort);
   // without a bot there is nothing to bind and nothing else would start the relay: the mode goes on at once
   if (!S.port || !botKind()) editEnv({ MYNA_NODE_PORT: String(port), ...(botKind() ? {} : { MYNA_TRANSPORT: "tree" }) });
+  // the listener first — only once Myna itself holds the port does tailscale serve point the tailnet at it
+  // (a port another program holds would otherwise be opened to the tailnet)
   let h = await health();
-  if (!h?.node?.listener?.listening || h.node.listener.port !== port) h = await restart((x) => x.node?.listener?.listening, " 開好 tree 的 listener");
+  if (!h?.node?.listener?.listening || h.node.listener.port !== port) {
+    h = await restart((x) => x.node?.listener && (x.node.listener.listening || x.node.listener.error), " 開 tree 的 listener");
+    if (!h.node.listener.listening) fail(`這台的 node listener 開不起來（127.0.0.1:${port}：${h.node.listener.error}）— port 被別的程式佔用？在 ${envPath} 換 MYNA_NODE_PORT。tailscale serve 沒有動。`);
+  }
+  await serveOn(port, S.servePort);
   if (!requireBinding || !botKind()) return h;
   if (botKind() !== "telegram") { say(`這台的 bot 是 ${botKind()}：第 0 批只有 Telegram 能綁定，要緊的鈕（✅ 核准、權限、加入）會退回終端機。`); return h; }
   if (h.node.owner_bound) return h;

@@ -753,6 +753,7 @@ MYNA_MACHINE_NAME=win        # 選填,topic 前面的短名稱(預設 hostname)
 - **只收同一個 owner 的 session**:寄件和收件的 owner 是同一張 Tailscale 身分證才交付(你自己的機器之間);跨人的等權限設計好再開。
 - **看得到、停得了**:經過的每台有 bot 就把訊息貼一份(收件那台貼在收件 session 的 topic),附 ⏹。「先給你看才送出」在有 bot 的 relay 預設開:貼不出去就不交付;`.env` 設 `MYNA_PEER_SHOW_FIRST=off` 改成直接交付(沒 bot 的 relay 一律直接交付)。按 ⏹ 兩個方向都停,▶️ 恢復。
 - **防迴圈**:同一對自動來回 20 則就停(`MYNA_PEER_PAIR_MAX`),在那個 session 打字(終端機或 Telegram)才繼續。
+- **`/clear` 之後**:同一個 Claude Code 視窗 `/clear`(或在 app 裡 `/resume` 到別的 session)換來的 session 沒有可信的專案章,只能收、不能送;要傳訊息請開新的 session。
 - **按鈕**:tree 模式下,要緊的鈕 — 帶 `approves` 的 ✅、權限轉手機的允許、新節點加入 — 只認綁到這台 owner 的 Telegram 帳號;別人按了不算,bot 會說要怎麼綁。沒有綁定(或沒有 bot、bot 不是 Telegram)時,這類題目不送手機,直接回終端機確認。其他按鈕、打字不變。別的 session 傳來的訊息**永遠不能代替你的 ✅**。
 - `/myna:bind` 列出、移除綁定;`/myna:machines` 也列出 tree 的下層,`revoke <名稱>` 撤銷(下一個請求就失效)。
 

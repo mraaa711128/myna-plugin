@@ -298,6 +298,14 @@ try {
     ok(g.status === 403, "a device whois gives neither a user nor tags → join refused (403)");
   }
   {
+    // the node port held by another program: hub tree on stops before tailscale serve opens it to the tailnet
+    const Z = nodeDir("z", { self: IP.r });
+    const squatter = net.createServer(() => {}); await new Promise((ok2) => squatter.listen(Z.np, "127.0.0.1", ok2));
+    fs.writeFileSync(Z.env, `MYNA_MACHINE_NAME=z\nMYNA_NODE_PORT=${Z.np}\n`);
+    let zr = await run(Z, "hub.mjs", ["tree", "on"]);
+    ok(zr.status !== 0 && /開不起來/.test(zr.out) && !serveLog().includes(`tcp://127.0.0.1:${Z.np}`), "node port held by another program → hub tree on fails, no tailscale serve entry made for it");
+    await fetch(`${Z.url}/shutdown`, { method: "POST" }).catch(() => {});
+    squatter.close();
     // a bot-less top node from a clean .env: hub tree on works in one go; joins are rate-limited; off stops it
     const R = nodeDir("r", { self: IP.r });
     fs.writeFileSync(R.env, `MYNA_MACHINE_NAME=r\nMYNA_NODE_PORT=${R.np}\n`);
@@ -336,7 +344,8 @@ try {
   ok(relock.status === 409, "the same session registering with another project → 409 (locked)");
   const kiteTok = (await reg(P, "s-kite", "kite", { project_remote: "git@github.com:Owner/Repo.git" })).token;
   ok(fs.readFileSync(path.join(P.dir, "session-tokens", "s-kite"), "utf8").trim() === kiteTok, "the session's token is written for its MCP server (session-tokens/<sid>)");
-  const tok = { kite: kiteTok, finch: finch.token, egret: egret.token, wren: wren.token, alba: alba.token };
+  const cleared = await reg(P, "s-cleared", "lark", { project_untrusted: true });
+  const tok = { kite: kiteTok, finch: finch.token, egret: egret.token, wren: wren.token, alba: alba.token, lark: cleared.token };
   const sendAs = (n, who, to, text) => api(n, "/peer/send", { to, text, session_id: "s-kite" }, tok[who]);
   const takeAll = async (n, who) => (await api(n, "/chat/take", { max: 20 }, tok[who])).messages || [];
 
@@ -371,6 +380,18 @@ try {
   const long = await sendAs(P, "kite", "egret@c", "x".repeat(3501));
   const anon = await api(P, "/peer/send", { to: "egret@c", text: "hi" });
   ok(s.reason === "bad_address" && long.reason === "too_long" && anon.status === 401, "bad address → bad_address; over 3500 → too_long; no session token → 401");
+  s = await sendAs(P, "lark", "kite", "from a /clear-ed session");
+  const toLark = await sendAs(P, "kite", "lark", "to it");
+  ok(s.delivered === false && s.reason === "no_project" && toLark.delivered === true, "a session registered as project_untrusted (after /clear) cannot send — it still receives");
+  await takeAll(P, "lark");
+  // the pair limit holds against concurrent sends (the slot is taken before anything waits)
+  {
+    const burst = await Promise.all(Array.from({ length: 7 }, (_, i) => sendAs(P, "finch", "lark", `burst ${i}`)));
+    ok(burst.filter((x) => x.delivered === true).length === 4 && burst.filter((x) => x.reason === "needs_human").length === 3, "7 concurrent messages on one pair with the limit at 4 → exactly 4 delivered, 3 needs_human");
+    await takeAll(P, "lark");
+    await api(P, "/chat/progress", { event: "start", origin: "terminal" }, tok.finch);
+    await api(P, "/chat/progress", { event: "start", origin: "terminal" }, tok.lark);
+  }
 
   // show first: the copy cannot be posted → not delivered
   failNextPeer = 1;
@@ -450,12 +471,15 @@ try {
   const t0 = Date.now();
   s = await sendAs(P, "kite", "wren@t", "anyone?");
   ok(s.delivered === false && s.reason === "unreachable" && Date.now() - t0 < 1500, "t gone (no take open, past the 3 s gap) → unreachable at once, nothing queued");
+  // an old machine of the same name left in machines.json: both are revoked, not just the old one
+  fs.writeFileSync(path.join(P.dir, "machines.json"), JSON.stringify({ version: 1, machines: [{ id: "cccccccccccc", name: "c", sha256: "0".repeat(64), created_at: "2026-11-01T00:00:00.000Z" }] }));
   r = await run(P, "machines.mjs", ["revoke", "c"]);
-  ok(r.status === 0, "p: machines revoke c");
+  ok(r.status === 0 && /revoked c \(cccccccccccc\)/.test(r.out) && /revoked c \(tree\)/.test(r.out), "p: machines revoke c → the old machine AND the tree node of that name");
   await sleep(5500);
   ok((await nh(cToP, cToken)).status === 401, "…c's token is refused on its next request (401)");
+  await api(C, "/chat/progress", { event: "start", origin: "terminal" }, tok.egret); // that pair is at its limit at c's end by now
   s = await sendAs(C, "egret", "kite@p", "after revoke");
-  ok(s.delivered === false && s.reason === "unreachable", "…and c can no longer send up");
+  if (!ok(s.delivered === false && s.reason === "unreachable", "…and c can no longer send up")) console.log(JSON.stringify(s));
   ok(!/serve reset|\breset\b/.test(serveLog()), "no `tailscale serve reset` anywhere (only this node's own entry is turned on/off)");
 } catch (e) {
   console.error("❌ test crashed:", e.stack || e.message);

@@ -455,7 +455,12 @@ ok(await until(() => /🔧 Bash: npm test/.test(latest(tprog) || "")) && await u
   const regs = () => G.S.posts.filter((p) => p.url.endsWith("/chat/register")).map((p) => JSON.parse(p.body));
   await stopRelay(); await startRelay(); // the relay forgets the token → the mod registers again
   await until(() => regs().length >= 2, 10000);
-  ok(regs().length >= 2 && regs().every((b) => b.project_remote === "git@github.com:owner/repo.git"), "registration sends the remote frozen at session start (also after a re-registration)");
+  ok(regs().length >= 2 && regs().every((b) => b.project_remote === "git@github.com:owner/repo.git" && !b.project_untrusted), "registration sends the remote frozen at session start (also after a re-registration)");
+  // /clear: the process goes on under another id that had nothing frozen before the AI ran → untrusted, no remote
+  await G.end("clear"); G.S.sid = "s-g2";
+  await until(async () => (await chatOf("s-g2")).chat);
+  const last = regs().at(-1);
+  ok(last.session_id === "s-g2" && last.project_untrusted === true && !("project_remote" in last), "after /clear the new session id registers as project_untrusted, without the old remote");
   const N = engine({ sid: "s-n" }); await N.start();
   await until(async () => (await chatOf("s-n")).chat);
   ok(N.S.posts.filter((p) => p.url.endsWith("/chat/register")).every((p) => !("project_remote" in JSON.parse(p.body))), "no $.session.repo (an older CLI) → registers as before, without project_remote");

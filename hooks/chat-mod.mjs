@@ -318,8 +318,11 @@ export const register = (on) => {
     const mine = await saved(id);
     let r;
     try {
-      // project_remote: the git origin as it was when the session started (the relay stamps owner/repo from it)
-      r = await call("/chat/register", { session_id: id, nick: mine.nick || cfg.nick || birdFor(label), label, cwd: root, ...(frozen?.remote ? { project_remote: frozen.remote } : {}) }, secret);
+      // project_remote: the git origin as it was when the session started (the relay stamps owner/repo from it).
+      // A session id this process took over later (/clear, an in-app /resume — no session.start) had nothing
+      // frozen for it before the AI ran: project_untrusted, and the relay lets it receive but not send
+      const trusted = !frozen || frozen.sid === id;
+      r = await call("/chat/register", { session_id: id, nick: mine.nick || cfg.nick || birdFor(label), label, cwd: root, ...(trusted && frozen?.remote ? { project_remote: frozen.remote } : {}), ...(trusted ? {} : { project_untrusted: true }) }, secret);
     } catch { return backoff("relay 沒有回應"), false; }
     // an old relay (< 0.12) — SessionStart's ensure-relay is likely swapping it right now: normal retry pace
     if (r.status === 404) return backoff("relay 版本太舊"), false;
@@ -492,7 +495,7 @@ export const register = (on) => {
       enabled = want;
       // the registration's root and git origin, frozen now — before the AI runs any tool, so it cannot
       // change .git/config to get another project stamp; registering itself still does not wait (2.4)
-      frozen = { root: "", remote: "" };
+      frozen = { sid: await $.session.id(), root: "", remote: "" };
       try { frozen.root = (await $.session.root()) || ""; } catch {}
       if (!frozen.root) { try { frozen.root = (await $.session.cwd()) || ""; } catch {} }
       try { const repo = await $.session.repo(); if (typeof repo?.remote === "string") frozen.remote = repo.remote; } catch {}

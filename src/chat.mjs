@@ -227,9 +227,14 @@ export function createChat({ cfg, log, dir, topicMachine = () => "", progressPer
       const s = sessions.get(sid) || { inbox: [], registered: new Date().toISOString() };
       if (T) {
         // the project stamp: from what the session froze at its start (remote, root), locked once set
-        const pj = projectOf({ remote: body.project_remote, root: body.cwd });
-        if (s.project && s.project !== pj.project) { log(`chat: session ${sid} registered again with project ${pj.project} — locked to ${s.project}, refused`); reply(409, { error: `project_locked: this session is ${s.project}` }); return true; }
-        Object.assign(s, pj);
+        // project_untrusted: the mod froze nothing for this id before the AI ran (/clear, in-app /resume) —
+        // a stamp it had from its own start is kept; otherwise it gets none and cannot send (node.mjs)
+        if (body.project_untrusted === true) { if (!s.project) Object.assign(s, { project: null, project_source: "untrusted" }); }
+        else {
+          const pj = projectOf({ remote: body.project_remote, root: body.cwd });
+          if (s.project && s.project !== pj.project) { log(`chat: session ${sid} registered again with project ${pj.project} — locked to ${s.project}, refused`); reply(409, { error: `project_locked: this session is ${s.project}` }); return true; }
+          Object.assign(s, pj);
+        }
       }
       const reopened = !!s.closed;
       s.nick = uniqueNick(body.nick || s.nick, sid);

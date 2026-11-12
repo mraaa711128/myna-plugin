@@ -575,6 +575,7 @@ sequenceDiagram
 | `bindings.json`(0600) | 綁定頁、`/myna:bind remove` | `{bindings:[{im:"telegram:<id>", identity:"tailscale:<login>", name, at}]}` |
 | `session-tokens/<session id>`(0600) | relay(tree 模式) | 那個 session 的 chat token,讓同一個 session 的 MCP server 呼叫 `/peer/send` |
 | `peer-pairs.json` | relay | 被 ⏹ 停住的對 |
+| `peer-results.json` | relay | 1 小時內交付成功的 `<寄件裝置 StableID>:<id>`(重啟後同一封再來不會再交付一次) |
 
 ### 節點 listener(`127.0.0.1:MYNA_NODE_PORT`)
 
@@ -600,7 +601,9 @@ sequenceDiagram
    - 上層的 bot 是 Telegram、而且有 Telegram 帳號綁到上層 owner → 手機題目「🆕 新節點要接到這台下面」,寫出**裝置名稱和 Tailscale 帳號**(tagged:「tagged：`tag:…`，按 ✅ 後 owner 會是你（tailscale:…）」)和核對碼。只有綁到上層 owner 的帳號按 `✅ 允許` 才算。
    - 否則在上層終端機 `/myna:machines approve <核對碼>`(先列出 whois 結果);tagged 的上層不能用終端機核准(那等於裝置自己同意自己)。
 3. 核准後 `node-children.json` 多一筆,下層拿到 token、`{name, owner(指派或自己的帳號), parent:{name, stable_id, owner}}`。
-- 撤銷:上層 `/myna:machines revoke <名稱>`(同時查 `machines.json` 和 `node-children.json`),下一個請求就 401;等著往下送的信回 `unreachable`、排著和已發出還沒結果的信丟掉,正在等的 take 醒來也只回 401。
+- 核准後 TTL 內沒取走 token → 那筆下層撤銷(同 `/machines/join`)。
+- `/myna:hub tree on` 先確認 Myna 自己的 listener 拿到 `MYNA_NODE_PORT`,才建 `tailscale serve`(port 被別的程式佔用時不會把它開到 tailnet);serve 是不是自己的,精確比對 `TCPForward`、`ProxyProtocol`、`TerminateTLS`,`serve status` 讀不到就停。
+- 撤銷:上層 `/myna:machines revoke <名稱>`(同時查 `machines.json` 和 `node-children.json`,同名的都撤),下一個請求就 401;等著往下送的信回 `unreachable`、排著和已發出還沒結果的信丟掉,正在等的 take 醒來也只回 401。
 - 沒有 bot 的最上層:`/myna:hub tree on` 一次寫 `MYNA_NODE_PORT` 和 `MYNA_TRANSPORT=tree`(沒有綁定這一步);`off` 時直接停掉 relay。`off` 只關「還指到這個節點」的那條 serve,關不掉就在改設定之前結束。
 
 ### 綁定(M4)
@@ -614,6 +617,7 @@ sequenceDiagram
 
 - tree 模式下 `/chat/register` 不需要 bot(沒有 bot 時 `topic: null`,一樣有 nick、inbox、token)。
 - chat mod 在 `session.start` 回傳前就在本機凍結 `$.session.root()` 和 `$.session.repo()` 的 `remote`,之後每次註冊都送這份(`project_remote`);註冊照舊不等。
+- 同一個程序之後換成別的 session id(`/clear`、in-app `/resume`,沒有 `session.start`)時,那個 id 沒有在 AI 跑工具前凍結過:註冊帶 `project_untrusted`,relay 不給它專案章(之前有可信的就保留),這種 session 能收、不能送(`no_project`,開新的 session)。
 - relay 把 remote 正規化成 `owner/repo`(不看 host、不分大小寫;Azure DevOps 是 `org/project/repo`),沒有 remote 是 `dir:<資料夾名>`,記在 session 紀錄(`project`、`project_source`)。同一個 session id 之後註冊帶不同的專案 → 409(tree 模式才檢查)。
 - tree 模式下註冊成功時,relay 把 session 的 chat token 寫到 `session-tokens/<session id>`(0600),關閉時刪掉。
 
@@ -636,8 +640,8 @@ sequenceDiagram
 - chat mod 把 `via:"session"` 的訊息寫成 `[Myna · 來自 session kite@p（owner · project）] 要回覆就用 message_session(to: "kite@p")`,內文每行前面加 `> `。只有其他 session 的訊息時,這個回合在手機上標「🔗 其他 session 的訊息」,不算人打字。
 - **結果原路回去**:`{delivered:true, to}`/`{delivered:false, reason, error, hint?}`/`{delivered:"unknown"}`。每一跳等下一跳的結果;`budget_ms`(`MYNA_PEER_BUDGET_MS`,預設 20000)用完 → `unknown`。
 - **在不在線**:下層有一條開著的 take,或上一條結束不到 3 秒;都不是 → 立刻 `unreachable`,不排隊。
-- **去重**:每台記 1 小時的 `<寄件裝置 StableID>:<id> → 結果`;同一封再來拿同一個結果,只交付一次。
-- **⏹ 和上限**:每一對(這台的 session,對方地址)的狀態放在兩端各一份;兩個方向都經過兩端,所以停一端就兩個方向都擋。⏹ 按在哪一則 📨 上就停那台那一份(▶️ 恢復、計數歸零),停住的存在 `peer-pairs.json`。自動來回 `MYNA_PEER_PAIR_MAX`(預設 20)則 → `needs_human`(🛑 貼一次);那一端的 session 有人打字(終端機或手機,`/chat/progress` 的 `origin` 是 `terminal`／`phone`)才歸零,另一端要在它那邊打字。
+- **去重**:每台記 1 小時的 `<寄件裝置 StableID>:<id> → 結果`;同一封再來拿同一個結果,只交付一次。交付成功的那筆在寫進 inbox 的同一步寫到 `peer-results.json`,relay 重啟後還在。
+- **⏹ 和上限**:每一對(這台的 session,對方地址)的狀態放在兩端各一份;名額在檢查的同一步就先佔(同時送很多則也越不過上限),沒送到才還回去,「不確定」的照算;兩個方向都經過兩端,所以停一端就兩個方向都擋。⏹ 按在哪一則 📨 上就停那台那一份(▶️ 恢復、計數歸零),停住的存在 `peer-pairs.json`。自動來回 `MYNA_PEER_PAIR_MAX`(預設 20)則 → `needs_human`(🛑 貼一次);那一端的 session 有人打字(終端機或手機,`/chat/progress` 的 `origin` 是 `terminal`／`phone`)才歸零,另一端要在它那邊打字。
 - 不管規則怎麼放行,受護欄管的動作還是只認 ✅(`/attest` 不變);別的 session 傳來的訊息不能代替核准。
 
 ### 測試
