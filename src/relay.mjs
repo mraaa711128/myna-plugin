@@ -36,8 +36,10 @@
 //   records an approval {request_id, session_id, command (normalized), chosen, answered_at} ONLY when the
 //   human taps THE option starting with ✅ on the IM (provider callback; /ask allows exactly one such
 //   option and no invisible/control characters in `approves`) — never for a cancel, a terminal
-//   answer, a ✍️ reply or another option. A guard (e.g. a PreToolUse hook) then asks
-// POST /attest {command, session_id} → {approved:true, request_id, answered_at, chosen} for a matching
+//   answer, a ✍️ reply or another option. The one exception is God mode (v0.26.2): with it on, the relay
+//   presses that ✅ itself for this machine's own question (godmodeApprove) and the approval carries
+//   by:"godmode", which /attest returns too. A guard (e.g. a PreToolUse hook) then asks
+// POST /attest {command, session_id} → {approved:true, request_id, answered_at, chosen, by?} for a matching
 //   unused approval of that session no older than MYNA_APPROVAL_TTL_MS (default 15 min) — marked used in
 //   the same synchronous step, so each approval lets exactly one command through — else
 //   {approved:false, reason}. Approvals live ONLY in this process's memory: never written to the
@@ -74,6 +76,7 @@ import { createChat } from "./chat.mjs";
 import { createEdgeChat } from "./edge-chat.mjs";
 import { applyNetAttemptTimeout } from "./net.mjs";
 import { createNode, treeSettings, nodeFiles, JOIN_ALLOW as NODE_JOIN_ALLOW } from "./node.mjs";
+import { godmodeOn, appendUnsent } from "./godmode.mjs";
 import {
   PROTOCOL, PROTOCOL_HEADER, ENROLL_SECRET_HEADER, REQUEST_ID_HEADER, VERSION_HEADER, FEATURES, LOCAL_ID, NAME_RE, CODE_RE, ASK_MAX_BYTES_DEFAULT,
   roleOf, machinesFile, seenFile, machineStore, newMachineId, newMachineToken, sha256hex, sameHex, bearerOf,
@@ -770,6 +773,8 @@ async function handleAsk(req, res, scope, pre) {
   if (typeof args.approves === "string") { entry.approves = normalizeCommand(args.approves); entry.approveOption = approveOptionOf(args.options); }
   pending.set(request_id, entry);
   if (scope.remote) log(`remote ask from machine=${scope.name} (${scope.id}) → request ${request_id}${args.session_id ? ` session ${args.session_id}` : ""}`);
+  // God mode (v0.26.2): this machine's question carrying `approves` gets its ✅ pressed here instead of on the phone
+  if (!scope.remote && entry.approves && entry.approveOption && args.session_id && godmodeOn(process.env)) return godmodeApprove(res, request_id, entry, args, scope);
   // sendQuestion throws when the question/keyboard could not be delivered to the phone (after the
   // provider's own transient retries). Resolve the request as {kind:"unreachable"} so the client's
   // /answer poll returns immediately and the orchestrator falls back to the local picker — instead
@@ -804,10 +809,49 @@ async function handleAsk(req, res, scope, pre) {
   send(res, 200, { request_id });
 }
 
-// POST /notify {text, session_id?, agent_id?} (v0.25.0, God mode): a one-way notice to the bound chat's
-// main view — no buttons, no topic, no journal, no retry, no queue. 200 = sent; 501 = this provider has no
-// notices (only Telegram has sendNotice); 502 = the IM refused / could not be reached. A remote machine's
-// notice gets its machine name, as /ask gets it on the topic (topicMachine).
+// God mode and ✅ questions (v0.26.2; the human, 2026-11-12: everything God mode does stays inside myna).
+// With the flag file on (src/godmode.mjs, the same one the PermissionRequest hook reads), a question THIS
+// machine asks with `approves` never reaches the phone: its ✅ option counts as pressed at once —
+//   - the approval is recorded exactly as resolveFromIM records a tap (this session, this command, usable
+//     once within MYNA_APPROVAL_TTL_MS, memory only), plus by:"godmode", which /attest passes on (a guard
+//     that does not know the field ignores it);
+//   - the asker gets {kind:"selection", value: <the ✅ option>, by:"godmode"} (the MCP server logs it as
+//     mode "godmode" in MYNA-DECISIONS, as autopilot logs "auto");
+//   - a notice goes out like a permission's (the "🔓 God mode" topic); one that cannot go out is kept in the
+//     unsent file, as the hook keeps its own. The answer never waits for the notice.
+// Not God mode's: another machine's question (its own God mode decides, on its own relay — the hub never
+// presses for it), and a question without `approves` (the phone / autopilot answer it as before).
+const GODMODE_CMD_MAX = 1500; // as the permission notice cuts a command
+function godmodeApprove(res, request_id, entry, args, scope) {
+  const answered_at = new Date().toISOString();
+  approvals.set(request_id, { request_id, machine_id: machineOf(entry), session_id: entry.session_id, command: entry.approves, chosen: entry.approveOption, answered_at, by: "godmode" });
+  log(`request ${request_id}: God mode — ✅ pressed here, not sent to the phone; approval recorded for session ${entry.session_id} (usable once, ${APPROVAL_TTL_MS / 1000}s)`);
+  resolveRequest(request_id, { kind: "selection", value: entry.approveOption, by: "godmode" });
+  entry.lastPoll = Date.now();
+  send(res, 200, { request_id });
+  const sid = String(entry.session_id);
+  const cmd = entry.approves.length > GODMODE_CMD_MAX ? `${entry.approves.slice(0, GODMODE_CMD_MAX)}…` : entry.approves;
+  const label = topicMachine(scope);
+  const text = [
+    `🔓 God mode 已自動按 ✅${args.gate ? `｜${oneLine(args.gate, 80)}` : ""}`,
+    `題目：${oneLine(args.question, 200)}`,
+    `核准的指令：${cmd}`,
+    `session：${[oneLine(args.session_name, 80), sid.slice(0, 8)].filter(Boolean).join("・")}`,
+    ...(label ? [`機器：${label}`] : []),
+  ].join("\n");
+  const unsent = (reason) => appendUnsent({ at: new Date().toISOString(), session_id: sid, tool: "ask_human", request_id, reason, text }, process.env);
+  if (typeof provider.sendNotice !== "function") { log(`godmode notice for request ${request_id}: ${provider.name} cannot send notices — kept in the unsent file`); return unsent(`${provider.name} cannot send notices`); }
+  Promise.resolve(provider.sendNotice(text)).then(
+    (where) => log(`godmode notice for request ${request_id}: sent${where ? ` → ${where}` : ""}`),
+    (e) => { log(`godmode notice for request ${request_id}: ${e.maybeSent ? "no answer from the IM (may have been sent)" : "not sent"} — ${e.message}`); unsent(`${e.message}${e.maybeSent ? " (may still have been sent)" : ""}`); },
+  );
+}
+
+// POST /notify {text, session_id?, agent_id?} (v0.25.0, God mode): a one-way notice to the bound chat — its
+// fixed "🔓 God mode" topic since 0.26.2 (the main view without topics; the provider decides) — no buttons,
+// no journal, no retry, no queue. 200 = sent; 501 = this provider has no notices (only Telegram has
+// sendNotice); 502 = the IM refused / could not be reached. A remote machine's notice gets its machine name,
+// as /ask gets it on the topic (topicMachine).
 async function handleNotify(req, res, scope, pre) {
   const { body, tooLarge } = pre || await readBody(req, ASK_MAX_BYTES);
   if (tooLarge) { log(`rejecting /notify (413): body over ${ASK_MAX_BYTES} bytes${scope.remote ? ` from machine=${scope.name}` : ""}`); return refuseTooLarge(req, res, `request body over ${ASK_MAX_BYTES} bytes`); }
@@ -817,13 +861,14 @@ async function handleNotify(req, res, scope, pre) {
   const who = `${scope.remote ? ` from machine=${scope.name}` : ""}${args.session_id ? ` session ${scope.sid(args.session_id)}` : ""}`;
   if (typeof provider.sendNotice !== "function") { log(`notify${who}: ${provider.name} cannot send notices (501)`); return send(res, 501, { error: `${provider.name} cannot send notices` }); }
   const label = topicMachine(scope);
-  try { await provider.sendNotice(label ? `${args.text}\n機器：${label}` : args.text); }
+  let where;
+  try { where = await provider.sendNotice(label ? `${args.text}\n機器：${label}` : args.text); }
   catch (e) {
     // maybeSent: the IM gave no answer (it may have taken it) → 504, so nobody sends a second copy; else refused → 502
     log(`notify${who}: ${e.maybeSent ? "no answer from the IM (may have been sent)" : "not sent"} — ${e.message}`);
     return send(res, e.maybeSent ? 504 : 502, { error: `notice ${e.maybeSent ? "may or may not have gone out" : "not sent"}: ${e.message}` });
   }
-  log(`notify${who}: sent`);
+  log(`notify${who}: sent${where ? ` → ${where}` : ""}`);
   send(res, 200, { ok: true });
 }
 
@@ -965,7 +1010,8 @@ function noteSeen(m, req) {
 // joining machine polls GET /machines/join/<enroll_id> with its enroll secret (whose hash it sent) and
 // gets the token only after the ✅ tap (the same token again for a JOIN_TTL_MS after its first hand-out,
 // in case that reply was lost). Only the provider's button callback approves — the relay
-// never auto-answers, autopilot lives in the MCP client and never sees this question. Join requests
+// never auto-answers (God mode presses only a session's ✅ question, never this), autopilot lives in the
+// MCP client and never sees this question. Join requests
 // live in memory only: a relay restart drops them (the machine asks again).
 const JOIN_ALLOW = "✅ 允許", JOIN_DENY = "❌ 拒絕";
 const joins = new Map();   // enroll_id -> {qid, name, os, hostname, code, secretHash, expires, status, token?, machine?, wake, timer, doneAt?, collectedAt?}
@@ -1337,8 +1383,9 @@ const server = http.createServer(async (req, res) => {
         return reply(200, { approved: false, reason });
       }
       hit.used_at = new Date(now).toISOString(); // in memory only: a restart forgets it along with the approval itself
-      log(`attest approved: request ${hit.request_id} (session ${a.session_id}) — approval now used`);
-      return reply(200, { approved: true, request_id: hit.request_id, answered_at: hit.answered_at, chosen: hit.chosen });
+      log(`attest approved: request ${hit.request_id} (session ${a.session_id})${hit.by ? ` — pressed by ${hit.by}` : ""} — approval now used`);
+      // by: "godmode" when God mode pressed the ✅ (v0.26.2); absent for a human's tap
+      return reply(200, { approved: true, request_id: hit.request_id, answered_at: hit.answered_at, chosen: hit.chosen, ...(hit.by ? { by: hit.by } : {}) });
     });
     return;
   }

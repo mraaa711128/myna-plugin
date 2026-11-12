@@ -66,7 +66,9 @@ async function startRelay(extra = {}) {
       TELEGRAM_API_BASE: `http://127.0.0.1:${stub.address().port}`,
       RELAY_PORT: String(RELAY_PORT), MYNA_ANSWER_HOLD_MS: "1000", TELEGRAM_TOPICS: "off",
       MYNA_TOPICS_FILE: path.join(scratch, "topics.json"), MYNA_PENDING_FILE: PENDING,
-      MYNA_APPROVAL_TTL_MS: "60000", ...extra,
+      MYNA_APPROVAL_TTL_MS: "60000",
+      // God mode off whatever the developer's own ~/.myna/godmode says (it would press every ✅ here)
+      MYNA_GODMODE_FILE: path.join(scratch, "no-godmode"), ...extra,
     },
     stdio: ["ignore", "inherit", "inherit"],
   });

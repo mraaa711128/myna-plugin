@@ -19,6 +19,31 @@ export const godmodeFile = (env = process.env) => env.MYNA_GODMODE_FILE || path.
 export const unsentFile = (env = process.env) => env.MYNA_GODMODE_UNSENT_FILE || path.join(os.homedir(), ".myna", "godmode-unsent.jsonl");
 export const godmodeOn = (env = process.env) => { try { return fs.existsSync(godmodeFile(env)); } catch { return false; } };
 
+// God mode brings autopilot along (v0.26.2; the human, 2026-11-12: "godmode on的時候就順便autopilot也是on").
+// /myna:godmode on turns autopilot on when it is off: the autopilot flag file then holds "godmode <time>" (the
+// mark), and the God mode flag file's second line records what autopilot was before ("autopilot-before: on|off").
+// /myna:godmode off puts it back: it removes the autopilot flag only while it still holds the mark — a
+// /myna:autopilot on|off since then rewrote or removed it, and the human's last word stands.
+// The first line of the God mode flag file stays the time it was turned on (godmodeSince, the contract).
+export const autopilotFile = (env = process.env) => env.MYNA_AUTOPILOT_FILE || path.join(os.homedir(), ".myna", "autopilot");
+const AUTOPILOT_MARK = "godmode";
+const firstLine = (f) => { try { return fs.readFileSync(f, "utf8").split(/\r?\n/)[0].trim(); } catch { return null; } };
+// {on, byGodmode}: autopilot is on / it is on because /myna:godmode on turned it on (and nobody touched it since)
+export function autopilotState(env = process.env) {
+  const f = autopilotFile(env);
+  let on = false; try { on = fs.existsSync(f); } catch {}
+  const l = on ? firstLine(f) : null;
+  return { on, byGodmode: on && !!l && l.split(" ")[0] === AUTOPILOT_MARK };
+}
+export const autopilotMark = () => `${AUTOPILOT_MARK} ${new Date().toISOString()}\n`;
+// what autopilot was before God mode was turned on: "on" | "off" | null (unknown: a flag file written another way)
+export function autopilotBefore(env = process.env) {
+  try {
+    const m = fs.readFileSync(godmodeFile(env), "utf8").match(/^autopilot-before:\s*(on|off)\s*$/m);
+    return m ? m[1] : null;
+  } catch { return null; }
+}
+
 // when it was turned on: the time written in the file, else the file's mtime; null when off / unknown
 export function godmodeSince(env = process.env) {
   const f = godmodeFile(env);

@@ -15619,6 +15619,7 @@ function logDecision(rec, logDir) {
     log("logDecision failed:", e.message);
   }
 }
+var modeOf = (result) => result?.by === "godmode" ? "godmode" : "human";
 var partOf = (a) => a.questionNumber && a.questionTotal ? { questionNumber: a.questionNumber, questionTotal: a.questionTotal } : {};
 var relayPost = (p, body) => fetchRelayJson(`${RELAY}${p}`, {
   method: "POST",
@@ -15714,7 +15715,7 @@ var mcp = new Server({ name: "myna", version: "0.1.0" }, { capabilities: { tools
 mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [{
     name: "ask_human",
-    description: "Ask the human a gated decision. BLOCKS until they answer on their phone (Telegram/Discord/Slack); returns a discriminated result as JSON: {kind:'selection',value} | {kind:'message',text} | {kind:'aborted'} | {kind:'unreachable'} | {kind:'detached',request_id} (handed off with detach_human \u2014 another session takes it over with await_human). kind='message' means the human replied with free text (a clarifying question) \u2014 respond to it and call again with the SAME thread_id (put your reply in preamble) to continue the conversation. Tag each question with `gate` (the same short name for every question of one decision) so each gate gets its own IM topic. Several gates may be open at once (e.g. parallel calls): each keeps its own topic and every answer is tied to its own question. To get a guard-blocked command approved, pass it in `approves` and start the approving option \u2014 and only that one \u2014 with \"\u2705\": tapping it on the phone lets exactly that one command line through ONCE. In autopilot mode this auto-accepts the recommended option (needs recommendedIndex) and logs it instead of asking (never for a question with `approves`).",
+    description: "Ask the human a gated decision. BLOCKS until they answer on their phone (Telegram/Discord/Slack); returns a discriminated result as JSON: {kind:'selection',value} | {kind:'message',text} | {kind:'aborted'} | {kind:'unreachable'} | {kind:'detached',request_id} (handed off with detach_human \u2014 another session takes it over with await_human). kind='message' means the human replied with free text (a clarifying question) \u2014 respond to it and call again with the SAME thread_id (put your reply in preamble) to continue the conversation. Tag each question with `gate` (the same short name for every question of one decision) so each gate gets its own IM topic. Several gates may be open at once (e.g. parallel calls): each keeps its own topic and every answer is tied to its own question. To get a guard-blocked command approved, pass it in `approves` and start the approving option \u2014 and only that one \u2014 with \"\u2705\": tapping it on the phone lets exactly that one command line through ONCE. In autopilot mode this auto-accepts the recommended option (needs recommendedIndex) and logs it instead of asking (never for a question with `approves`). With Myna God mode on (/myna:godmode \u2014 the human's choice, never yours) the relay presses the \u2705 of a question with `approves` itself: the answer comes back at once with by:\"godmode\" and the approval works as a tap's would.",
     inputSchema: {
       type: "object",
       properties: {
@@ -15730,7 +15731,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
         ticket: { type: "string", description: "issue key this session is working on (e.g. 'PROJ-1234'); labels this session's IM topic (renamed in place when it changes). Falls back to MYNA_TICKET when omitted; never inferred from the branch or header." },
         preamble: { type: "string", description: "your reply to the human's last message, shown above the question" },
         logDir: { type: "string", description: "absolute dir to write the decision log (MYNA-DECISIONS.jsonl/.md); pass the run's worktree cwd so decisions travel with the branch. Defaults to cwd." },
-        approves: { type: "string", maxLength: 2e3, description: "OPTIONAL \u2014 when this question asks the human to approve running one command that a guard blocks (e.g. a push to main, merging a PR): the ONE full command line to run once approved, exactly as you will run it (\u22642000 chars; printable characters and newlines only \u2014 tabs, control characters and invisible/bidi characters such as U+200B or U+202E are rejected). EXACTLY ONE option, the approving one, MUST start with \"\u2705\" (e.g. '\u2705 \u6838\u51C6\u57F7\u884C'); no other option may (two \u2705 options are rejected). The phone shows the command verbatim under '\u6838\u51C6\u5F8C\u57F7\u884C\uFF1A'. If the human taps the \u2705 option on their phone, the relay records an approval that lets exactly this command (whitespace-normalized, same session) through the guard ONCE within its TTL (default 15 min); a \u270D\uFE0F reply, another option, a cancel or a terminal answer approves nothing. To run a different command, ask again. Autopilot never approves: a question with `approves` always goes to the human." }
+        approves: { type: "string", maxLength: 2e3, description: `OPTIONAL \u2014 when this question asks the human to approve running one command that a guard blocks (e.g. a push to main, merging a PR): the ONE full command line to run once approved, exactly as you will run it (\u22642000 chars; printable characters and newlines only \u2014 tabs, control characters and invisible/bidi characters such as U+200B or U+202E are rejected). EXACTLY ONE option, the approving one, MUST start with "\u2705" (e.g. '\u2705 \u6838\u51C6\u57F7\u884C'); no other option may (two \u2705 options are rejected). The phone shows the command verbatim under '\u6838\u51C6\u5F8C\u57F7\u884C\uFF1A'. If the human taps the \u2705 option on their phone, the relay records an approval that lets exactly this command (whitespace-normalized, same session) through the guard ONCE within its TTL (default 15 min); a \u270D\uFE0F reply, another option, a cancel or a terminal answer approves nothing. To run a different command, ask again. Autopilot never approves: a question with \`approves\` always goes to the human \u2014 except with God mode on, where the relay presses the \u2705 itself (answer by:"godmode").` }
       },
       required: ["question", "options"]
     }
@@ -15814,7 +15815,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req, extra) => {
     const result = await waitForAnswer(request_id, extra, req.params?._meta?.progressToken);
     const answered_at = (/* @__PURE__ */ new Date()).toISOString();
     if (result.kind === "selection") {
-      logDecision({ ts, answered_at, machine, mode: "human", ...args.gate ? { gate: args.gate } : {}, ...partOf(args), header: args.header, question: args.question, options: args.options, chosen: result.value, ...args.approves !== void 0 ? { approves: args.approves } : {} }, args.logDir);
+      logDecision({ ts, answered_at, machine, mode: modeOf(result), ...args.gate ? { gate: args.gate } : {}, ...partOf(args), header: args.header, question: args.question, options: args.options, chosen: result.value, ...args.approves !== void 0 ? { approves: args.approves } : {} }, args.logDir);
     }
     return textResult(result);
   } catch (e) {
@@ -15860,7 +15861,7 @@ async function awaitHuman(args, req, extra) {
     const result = await waitForAnswer(id, extra, req.params?._meta?.progressToken);
     const answered_at = (/* @__PURE__ */ new Date()).toISOString();
     if (result.kind === "selection") {
-      logDecision({ ts, answered_at, machine: os.hostname(), mode: "human", ...info.gate ? { gate: info.gate } : {}, header: info.header, question: info.question, options: info.options, chosen: result.value, ...info.approves !== void 0 ? { approves: info.approves } : {}, reattached: id }, args.logDir);
+      logDecision({ ts, answered_at, machine: os.hostname(), mode: modeOf(result), ...info.gate ? { gate: info.gate } : {}, header: info.header, question: info.question, options: info.options, chosen: result.value, ...info.approves !== void 0 ? { approves: info.approves } : {}, reattached: id }, args.logDir);
     }
     return textResult({ ...result, request_id: id });
   } catch (e) {
