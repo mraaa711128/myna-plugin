@@ -61,7 +61,9 @@ const req = async (url, { method = "GET", headers = {}, body } = {}) => {
 
 // === 1. machines.json: two writers in two processes ====================================================
 {
-  const file = path.join(dir("store"), "machines.json");
+  // in the workers' ~/.myna (HOME is TMP/home), where machines.json lives: on Windows a file a setting moved
+  // elsewhere costs an icacls run per write (src/private-file.mjs), 300 of them under the lock here
+  const file = path.join(dir(path.join("home", ".myna")), "machines.json");
   const seeded = Array.from({ length: 150 }, (_, i) => newMachine(`r${i}`).rec);
   fs.writeFileSync(file, JSON.stringify({ version: 1, machines: seeded }, null, 2));
   const worker = path.join(TMP, "store-worker.mjs");

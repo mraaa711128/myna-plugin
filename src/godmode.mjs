@@ -13,6 +13,7 @@ import os from "node:os";
 import path from "node:path";
 import crypto from "node:crypto";
 import { withFileLock } from "./remote.mjs";
+import { privateTempPath, sealTemp } from "./private-file.mjs";
 
 export const UNSENT_MAX = 200;
 export const godmodeFile = (env = process.env) => env.MYNA_GODMODE_FILE || path.join(os.homedir(), ".myna", "godmode");
@@ -70,25 +71,37 @@ const spoolFiles = (f) => {
 export function appendUnsent(record, env = process.env, { waitMs = 500 } = {}) {
   const f = unsentFile(env);
   const line = JSON.stringify(record) + "\n";
+  // the temp file is made this user's only (src/private-file.mjs: on Windows maybe an icacls run) before the
+  // lock is taken — other hooks wait for the lock; under it only its content is written (keeps its ACL)
+  let tmp;
   const write = () => {
     let extra = "";
     const spools = spoolFiles(f);
     for (const s of spools) { try { extra += fs.readFileSync(s, "utf8"); } catch {} }
     let cur = ""; try { cur = fs.readFileSync(f, "utf8"); } catch {}
     const all = lines(cur + (cur && !cur.endsWith("\n") ? "\n" : "") + extra + line);
-    const tmp = `${f}.${process.pid}.tmp`;
-    fs.writeFileSync(tmp, all.slice(-UNSENT_MAX).join("\n") + "\n", { mode: 0o600 });
+    fs.writeFileSync(tmp, all.slice(-UNSENT_MAX).join("\n") + "\n", { mode: 0o600 }); // sealed already: writing keeps its ACL
     fs.renameSync(tmp, f);
     for (const s of spools) { try { fs.rmSync(s, { force: true }); } catch {} } // only after the merge is written
   };
-  const spool = () => fs.writeFileSync(`${f}.${Date.now()}-${process.pid}-${crypto.randomBytes(4).toString("hex")}.spool`, line, { mode: 0o600, flag: "wx" });
+  // written whole as a temp file, then given its spool name (no reader sees it half-written)
+  const spool = () => {
+    const s = `${f}.${Date.now()}-${process.pid}-${crypto.randomBytes(4).toString("hex")}.spool`;
+    tmp = privateTempPath(s);
+    fs.writeFileSync(tmp, line, { mode: 0o600, flag: "wx" });
+    sealTemp(tmp);
+    fs.renameSync(tmp, s);
+  };
   try {
     fs.mkdirSync(path.dirname(f), { recursive: true });
     if (!(waitMs > 0)) { spool(); return true; }
+    tmp = privateTempPath(f);
+    fs.writeFileSync(tmp, "", { mode: 0o600 }); sealTemp(tmp); // outside the lock: Windows may run icacls here
     try { withFileLock(f, write, { waitMs }); }
     catch (e) { if (!/is held by another process/.test(e?.message || "")) throw e; spool(); }
     return true;
   } catch { return false; }
+  finally { if (tmp) { try { fs.rmSync(tmp, { force: true }); } catch {} } } // left over after a failure
 }
 
 // the unsent notices since a time (ms): {count, file}, spooled lines included. Unreadable lines are not counted.

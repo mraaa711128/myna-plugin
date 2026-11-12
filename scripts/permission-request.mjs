@@ -10,9 +10,10 @@
 //      with the human's words as the reason, ⏹ = deny and stop the turn;
 //   3. retract the phone's question the moment it is moot — the terminal answered (seen in the
 //      transcript: a result for this tool call), or the hook is being stopped (SIGTERM: a terminal
-//      "No" in the TUI, the hook timeout, the session ending). The relay also cancels any permission
-//      prompt of a session at its session end, and the main thread's at its round end, for a hook
-//      that could not.
+//      "No" in the TUI, the hook timeout, the session ending). On Windows the hook is killed without a
+//      signal and cannot; the relay then sees its held /answer poll hang up and retracts the question
+//      itself (v0.26.3, permissionAskerGone). The relay also cancels any permission prompt of a session
+//      at its session end, and the main thread's at its round end, for a hook that could not.
 // A background subagent's prompt (the hook input carries agent_id) is marked with that agent_id: its
 // dialog can outlive the main thread's turn, so the relay leaves it open at round end while this hook
 // still polls for the answer (a stopped subagent's hook is killed — on Windows without a signal, so

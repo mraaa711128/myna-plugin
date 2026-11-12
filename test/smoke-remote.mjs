@@ -25,6 +25,7 @@ import { fileURLToPath } from "node:url";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { privateProblem } from "./helpers/private-mode.mjs";
 
 const HERE = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const ROOT = process.env.MYNA_TEST_ROOT ? path.resolve(process.env.MYNA_TEST_ROOT) : HERE;
@@ -214,8 +215,8 @@ if (jm) tap(jm, 0, 0);
 const joinRc = await Promise.race([joinDone, sleep(10000).then(() => "timeout")]);
 const A_TOKEN_FILE = path.join(A_DIR, "machine-token");
 const aToken = fs.existsSync(A_TOKEN_FILE) ? fs.readFileSync(A_TOKEN_FILE, "utf8").trim() : "";
-ok(joinRc === 0 && /^myna_m_[a-f0-9]{12}_/.test(aToken), `✅ tapped → join.mjs exits 0 and saves the token (rc=${joinRc})`);
-ok(process.platform === "win32" || (fs.statSync(A_TOKEN_FILE).mode & 0o777) === 0o600, "machine-token is 0600");
+ok(joinRc === 0 && /^myna_m_[a-f0-9]{12}_/.test(aToken), `✅ tapped → join.mjs exits 0 and saves the token (rc=${joinRc})${joinRc !== 0 ? `: ${joinOut.slice(-400)}` : ""}`);
+{ const bad = privateProblem(A_TOKEN_FILE); ok(!bad, `machine-token is 0600 (Windows: this user's ACL only)${bad ? ` — ${bad}` : ""}`); }
 const aEnv = fs.readFileSync(A_ENV, "utf8");
 ok(/^MYNA_ROLE=edge$/m.test(aEnv) && new RegExp(`^MYNA_UPSTREAM=${tunnel.url}$`, "m").test(aEnv), ".env now has MYNA_ROLE=edge and MYNA_UPSTREAM=<hub URL>");
 const machinesText = fs.existsSync(MACHINES) ? fs.readFileSync(MACHINES, "utf8") : "";
@@ -438,9 +439,9 @@ ok(r.json?.ended === true, `mbp's round-end for "same-sid" is not held up by pc2
 {
   const PERM = ["✅ 允許", "❌ 拒絕"];
   const pw = await ask(EDGE_A, { kind: "permission", question: "mbp worker 權限", options: PERM, session_id: "perm-sid", agent_id: "a0123456789abcdef" });
-  const kw = await keyboardWith(/mbp worker 權限/);
-  let polling = true; // the worker's hook, polling through the edge
+  let polling = true; // the worker's hook, polling through the edge at once (as the real hook does)
   const poll = (async () => { for (;;) { const x = await req(`${EDGE_A}/answer/${pw.json?.request_id}`); if (!polling || (x.json && x.json.kind !== "pending")) return x; } })();
+  const kw = await keyboardWith(/mbp worker 權限/);
   await sleep(300);
   r = await req(`${EDGE_A}/session/round-end`, { method: "POST", body: { session_id: "perm-sid" } });
   const open = (await req(`${HUB}/requests`)).json?.requests?.find((x) => x.request_id === pw.json?.request_id);

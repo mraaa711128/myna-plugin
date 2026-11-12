@@ -42,6 +42,7 @@ if (r.other) {
   if (r.node) L.push(`  tree 模式：${r.node.tree ? `開（節點 ${r.node.name}，owner ${r.node.owner || "查不到"}${r.node.parent ? `，上層 ${r.node.parent.name}${r.node.parent.reachable ? "" : "（連不上）"}` : ""}，下層 ${r.node.children} 台，owner 的 IM 綁定 ${r.node.owner_bound ? "有" : "沒有（傳 !bind）"}）` : `關${r.node.off ? `（${r.node.off}）` : ""}`}；詳細：/myna:hub tree`);
   if (d.relay_differs?.role) L.push(`  ⚠ 角色：relay 用的是 ${r.role}，照設定檔／這個 session 會是 ${d.role_config}：/myna:relay restart 後才會照設定`);
   if (d.relay_differs?.provider) L.push(`  ⚠ provider：relay 用的是 ${r.provider}，照設定檔／這個 session 會是 ${d.expected_provider}：/myna:relay restart 後才會照設定`);
+  if (r.private_files) L.push(`  ⚠ 敏感檔沒辦法設成只有你讀得到：${p(r.private_files.file)}（${r.private_files.error}）`);
 }
 if (d.env_changed_since_start) L.push(`  ⚠ ${p(d.env_file.path)} 在 relay 啟動之後改過：/myna:relay restart 後才會生效`);
 

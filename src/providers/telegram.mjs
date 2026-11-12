@@ -49,6 +49,7 @@ import { questionLines, newToken, oneLine, toolLine, errText } from "./util.mjs"
 import { mdToPlain } from "./plain.mjs";
 import { isCommand, isSlashCommand } from "../chat.mjs";
 import * as inbox from "../inbox.mjs";
+import { sealTemp, privateTempPath, writePrivate } from "../private-file.mjs";
 
 export const name = "telegram";
 // the chat bound by /myna:pair, kept next to .env like the topics map (MYNA_TELEGRAM_CHAT_FILE: tests)
@@ -623,20 +624,22 @@ export function create(cfg, ctx) {
   })();
   // written whole to a temp file, then renamed over the journal (a crash mid-write leaves the old one)
   const savePending = () => {
+    let tmp;
     try {
       fs.mkdirSync(DIR, { recursive: true });
-      const tmp = `${PENDING_FILES}.${process.pid}.tmp`;
+      tmp = privateTempPath(PENDING_FILES); // this user's only from its first byte (Windows: see src/private-file.mjs)
       const buf = Buffer.from(JSON.stringify(pendingFiles));
       const fd = fs.openSync(tmp, "w", 0o600);
       try {
         for (let off = 0; off < buf.length;) { const w = fs.writeSync(fd, buf, off, buf.length - off); if (!(w > 0)) throw new Error("no progress writing"); off += w; }
         fs.fsyncSync(fd);
       } finally { fs.closeSync(fd); }
+      sealTemp(tmp); // Unix: the umask may have narrowed the mode; Windows: only if its folder could not be set up
       fs.renameSync(tmp, PENDING_FILES);
       // the rename itself survives a power cut once the folder is synced (POSIX; Windows cannot open a folder for it)
       if (process.platform !== "win32") { const dfd = fs.openSync(DIR, "r"); try { fs.fsyncSync(dfd); } finally { fs.closeSync(dfd); } }
       return true;
-    } catch (e) { log("inbox: could not persist", PENDING_FILES, e.message); return false; }
+    } catch (e) { if (tmp) { try { fs.rmSync(tmp, { force: true }); } catch {} } log("inbox: could not persist", PENDING_FILES, e.message); return false; }
   };
   const pendingKey = (msg) => `${msg.chat.id}:${msg.message_id}`;
   const inFlight = new Map(); // pendingKey -> the run handling it (a replay and a re-sent update share it)
@@ -1119,7 +1122,7 @@ export function create(cfg, ctx) {
     const old = CHAT_ID;
     CHAT_ID = String(msg.chat.id);
     bound = { chat_id: CHAT_ID, type: msg.chat.type, title: msg.chat.title || [msg.chat.first_name, msg.chat.last_name].filter(Boolean).join(" ") || msg.chat.username || "", paired_at: new Date().toISOString() };
-    try { fs.mkdirSync(path.dirname(CHAT_FILE), { recursive: true }); fs.writeFileSync(CHAT_FILE, JSON.stringify(bound, null, 2), { mode: 0o600 }); }
+    try { writePrivate(CHAT_FILE, JSON.stringify(bound, null, 2)); }
     catch (e) { log("pairing: could not persist", CHAT_FILE, e.message); }
     log(`paired with chat ${CHAT_ID} (${bound.type}${old && old !== CHAT_ID ? `, was ${old}` : ""})`);
     if (old && old !== CHAT_ID) {

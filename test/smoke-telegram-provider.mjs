@@ -14,6 +14,7 @@ import { fileURLToPath } from "node:url";
 import path from "node:path";
 import os from "node:os";
 import fs from "node:fs";
+import { eventualPrivateProblem } from "./helpers/private-mode.mjs";
 
 const relayPath = fileURLToPath(new URL("../src/relay.mjs", import.meta.url));
 let failed = 0;
@@ -922,8 +923,9 @@ for (const [mode, expectDeleted, expectClosed] of [["delete", 1, 2], ["keep", 1,
   say(me, `！pair ${code}`);
   ok(await waitSent(77, /已綁定這個聊天室/), "…the right code (full-width ！pair) binds the chat it was sent from (✅ reply there)");
   const saved = JSON.parse(fs.readFileSync(chatFile, "utf8"));
-  ok(saved.chat_id === "77" && saved.type === "private" && (fs.statSync(chatFile).mode & 0o777) === 0o600 && (await status()).chat?.id === "77",
-    `…and records it in the chat file (0600) → ${JSON.stringify(saved)}`);
+  const chatFileBad = await eventualPrivateProblem(chatFile); // Windows: set in the background
+  ok(saved.chat_id === "77" && saved.type === "private" && !chatFileBad && (await status()).chat?.id === "77",
+    `…and records it in the chat file (0600; Windows: this user's ACL only${chatFileBad ? ` — ${chatFileBad}` : ""}) → ${JSON.stringify(saved)}`);
   sent.length = 0;
   say(stranger, `!pair ${code}`);
   ok(await waitSent(666, /配對碼不正確/) && (await status()).chat?.id === "77", "…the code is one-use: replaying it from another chat is refused");

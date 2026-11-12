@@ -39,7 +39,7 @@ import path from "node:path";
 import crypto from "node:crypto";
 import { fileText, FID_RE } from "./inbox.mjs";
 import { projectOf } from "./project.mjs";
-import { writePrivate } from "./remote.mjs";
+import { restrictToOwnerInBackground, writePrivate } from "./private-file.mjs";
 
 // a session token file's name (src/node.mjs, src/mcp/ask-human.mjs use the same rule)
 const sessionTokenName = (sid) => String(sid).replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 128);
@@ -114,13 +114,12 @@ export function createChat({ cfg, log, dir, topicMachine = () => "", progressPer
   function loadSecret() {
     try {
       const s = fs.readFileSync(SECRET_FILE, "utf8").trim();
-      if (s.length >= 32) { try { fs.chmodSync(SECRET_FILE, 0o600); } catch {} return s; }
+      // made private when it was created; this fixes an older version's (Windows: icacls in the background)
+      if (s.length >= 32) { restrictToOwnerInBackground(SECRET_FILE); return s; } // an older version's too; the relay does not wait
     } catch {}
     const s = crypto.randomBytes(32).toString("hex");
     try {
-      fs.mkdirSync(path.dirname(SECRET_FILE), { recursive: true });
-      fs.writeFileSync(SECRET_FILE, `${s}\n`, { mode: 0o600 });
-      fs.chmodSync(SECRET_FILE, 0o600);
+      writePrivate(SECRET_FILE, `${s}\n`);
       log(`chat: relay secret created at ${SECRET_FILE}`);
     } catch (e) { log("chat: could not write the relay secret", SECRET_FILE, e.message); }
     return s;
@@ -138,10 +137,7 @@ export function createChat({ cfg, log, dir, topicMachine = () => "", progressPer
   }
   function save() {
     try {
-      fs.mkdirSync(path.dirname(FILE), { recursive: true });
-      const tmp = `${FILE}.${process.pid}.tmp`, text = JSON.stringify({ sessions: Object.fromEntries(sessions) }, null, 2);
-      fs.writeFileSync(tmp, text, { mode: 0o600 });
-      try { fs.renameSync(tmp, FILE); } catch { fs.writeFileSync(FILE, text, { mode: 0o600 }); try { fs.unlinkSync(tmp); } catch {} }
+      writePrivate(FILE, JSON.stringify({ sessions: Object.fromEntries(sessions) }, null, 2));
     } catch (e) { log("chat: could not persist", FILE, e.message); }
   }
 
