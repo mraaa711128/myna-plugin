@@ -857,7 +857,7 @@ AI 用的工具是 myna 的 `ask_human`、`await_human`、`detach_human`(Codex �
 - **權限確認轉手機、聊天**(含附檔、暱稱、murmur、`!指令`、tree 的 `message_session`)、`AskUserQuestion` 類的攔截、gate-brief、`/myna:review`:之後的階段再做。Codex 版的 MCP 不列出 `message_session`。
 - **God mode**:Codex 裡不能開關。在別處開了 God mode(Claude Code 的 `/myna:godmode`,或終端機跑 `node <myna>/scripts/godmode.mjs on|off`)之後,對 Codex session 有效的只有「帶 `approves` 的題目自動按 ✅」和它帶開的 autopilot;**Codex 自己的核准框不會自動同意**,照常出現在終端機。
 - **常駐**:只裝 Codex 的機器還不支援 `/myna:service`;Codex 開 session 時也不會改 Claude Code 設好的常駐(`~/.myna/service/service.json`)。只裝 Codex 的機器重開機後,要等第一個 Codex session 送出第一則訊息,relay 才會起來。
-- **改 relay 位址**:只支援預設的 `127.0.0.1:7800`。Codex 不把 shell 的環境變數傳給 MCP,`MYNA_RELAY_URL`、`RELAY_PORT` 在 Codex 版沒有作用。
+- **改 relay 位址、用環境變數改設定檔位置**:只支援預設的 `127.0.0.1:7800` 和 `~/.myna/`。Codex 不把 shell 的環境變數傳給 MCP,但 hook 和 `$myna:…` 跑的 scripts 會照讀;所以跑 Codex 的 shell **不要設** `RELAY_PORT`、`MYNA_RELAY_URL`、`MYNA_ENV`、`MYNA_AUTOPILOT_FILE` 這類覆寫,否則 MCP 和 scripts 會用到不同的 relay 或不同的設定檔(例如 hook 在別的 port 起 relay,`ask_human` 還是連 7800)。
 - **Codex 關掉時還在等的題目**:會留在手機上(按鈕不收回),答完之後 topic 才收;resume 同一個 session 後可以用 `await_human` 接回(看程式推的,沒實測)。
 - 只支援 **Codex CLI 互動模式**;IDE extension、桌面 app 不支援,`codex exec` 沒測。
 - **驗證範圍**:Windows 上用 `codex app-server`(跟 TUI 同一個引擎)驗過安裝、MCP、核准、hook、`$myna:config`、`$myna:manage` 的上手;TUI 才看得到的畫面、daemon 模式、macOS 都還沒驗證。
@@ -1856,7 +1856,7 @@ AI 用的工具是 myna 的 `ask_human`、`await_human`、`detach_human`(Codex �
 - **權限確認轉手機、聊天**(含附檔、暱稱、murmur、`!指令`、tree 的 `message_session`)、`AskUserQuestion` 類的攔截、gate-brief、`/myna:review`:之後的階段再做。Codex 版的 MCP 不列出 `message_session`。
 - **God mode**:Codex 裡不能開關。在別處開了 God mode(Claude Code 的 `/myna:godmode`,或終端機跑 `node <myna>/scripts/godmode.mjs on|off`)之後,對 Codex session 有效的只有「帶 `approves` 的題目自動按 ✅」和它帶開的 autopilot;**Codex 自己的核准框不會自動同意**,照常出現在終端機。
 - **常駐**:只裝 Codex 的機器還不支援 `/myna:service`;Codex 開 session 時也不會改 Claude Code 設好的常駐(`~/.myna/service/service.json`)。只裝 Codex 的機器重開機後,要等第一個 Codex session 送出第一則訊息,relay 才會起來。
-- **改 relay 位址**:只支援預設的 `127.0.0.1:7800`。Codex 不把 shell 的環境變數傳給 MCP,`MYNA_RELAY_URL`、`RELAY_PORT` 在 Codex 版沒有作用。
+- **改 relay 位址、用環境變數改設定檔位置**:只支援預設的 `127.0.0.1:7800` 和 `~/.myna/`。Codex 不把 shell 的環境變數傳給 MCP,但 hook 和 `$myna:…` 跑的 scripts 會照讀;所以跑 Codex 的 shell **不要設** `RELAY_PORT`、`MYNA_RELAY_URL`、`MYNA_ENV`、`MYNA_AUTOPILOT_FILE` 這類覆寫,否則 MCP 和 scripts 會用到不同的 relay 或不同的設定檔(例如 hook 在別的 port 起 relay,`ask_human` 還是連 7800)。
 - **Codex 關掉時還在等的題目**:會留在手機上(按鈕不收回),答完之後 topic 才收;resume 同一個 session 後可以用 `await_human` 接回(看程式推的,沒實測)。
 - 只支援 **Codex CLI 互動模式**;IDE extension、桌面 app 不支援,`codex exec` 沒測。
 - **驗證範圍**:Windows 上用 `codex app-server`(跟 TUI 同一個引擎)驗過安裝、MCP、核准、hook、`$myna:config`、`$myna:manage` 的上手;TUI 才看得到的畫面、daemon 模式、macOS 都還沒驗證。

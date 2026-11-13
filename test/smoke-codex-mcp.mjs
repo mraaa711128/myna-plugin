@@ -71,13 +71,22 @@ const newHome = (envText = "") => {
 };
 const homeEnv = (home) => ({ ...cleanEnv, HOME: home, USERPROFILE: home, MYNA_ENV: path.join(home, ".myna", ".env") });
 
-async function startServer({ host = "codex", home = newHome(), extra = {} } = {}) {
-  const env = { ...homeEnv(home), MYNA_RELAY_URL: RELAY, MYNA_AUTOPILOT_FILE: path.join(home, "no-autopilot"), MYNA_HEARTBEAT_MS: "60000", ...extra };
-  if (host) env.MYNA_HOST = host;
-  // the server's own cwd stands for Codex's plugin cache folder: a decision log must never land there
+// The server is started the way Codex starts it from codex/mcp.json (Codex review r1 X3): the plugin's folder as
+// cwd ("cwd": "." → a temp copy standing for ~/.codex/plugins/cache/…/<version>/, where a decision log must never
+// land), the relative args resolved there, the environment = only a few base variables (Codex passes MCP servers
+// a short allowlist, not the shell's MYNA_* / RELAY_PORT) plus codex/mcp.json's "env". MYNA_RELAY_URL is added the
+// only way a Codex install could add it — as if written into that "env" — to reach the stub relay. host "" = the
+// same server as Claude Code starts it (no MYNA_HOST).
+const CODEX_MCP = JSON.parse(fs.readFileSync(path.join(ROOT, "codex", "mcp.json"), "utf8")).mcpServers.myna;
+const BASE_VARS = ["PATH", "Path", "SystemRoot", "windir", "SYSTEMDRIVE", "TEMP", "TMP", "COMSPEC", "PATHEXT", "LANG"];
+async function startServer({ host = "codex", home = newHome() } = {}) {
+  const env = Object.fromEntries(BASE_VARS.filter((k) => process.env[k] !== undefined).map((k) => [k, process.env[k]]));
+  Object.assign(env, { HOME: home, USERPROFILE: home }, host ? CODEX_MCP.env : {}, { MYNA_RELAY_URL: RELAY });
   const cacheDir = path.join(TMP, `plugin-cache-${homes}`);
-  fs.mkdirSync(cacheDir, { recursive: true });
-  const transport = new StdioClientTransport({ command: process.execPath, args: [serverPath], env, cwd: cacheDir, stderr: "pipe" });
+  fs.mkdirSync(path.join(cacheDir, "dist"), { recursive: true });
+  fs.copyFileSync(serverPath, path.join(cacheDir, "dist", "ask-human.mjs"));
+  const args = host ? CODEX_MCP.args : ["./dist/ask-human.mjs"];
+  const transport = new StdioClientTransport({ command: process.execPath, args, env, cwd: path.resolve(cacheDir, host ? CODEX_MCP.cwd : "."), stderr: "pipe" });
   let stderr = "";
   transport.stderr?.on("data", (d) => (stderr += d));
   const c = new Client({ name: "smoke-codex", version: "0" }, { capabilities: {} });

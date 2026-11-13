@@ -728,6 +728,7 @@ Windows 為什麼是 `.vbs`:`wscript` 本身沒有主控台,`Run …, 0` 讓 nod
 - **`stop-catch-question --host codex`**:判斷、`stop_hook_active`、chat 豁免、round-end 都不變,只換 block 的文字(不提 `AskUserQuestion` 和 `mcp__…` 名稱)。讀 Claude transcript 格式的「背景工作還沒結束」判斷在 Codex 找不到東西,照常回報 round-end。
 - **`session-end.mjs`**(只有 Codex 用):Codex 結束時直接 kill MCP 程序、不關 stdin,`ask-human.mjs` 的 `endSession` 不會跑;這支用 hook 輸入的 `session_id` 打 `POST /session/close`,自己 2 秒內一定結束,relay 不在或不回都 exit 0。跟 `endSession` 不同,它不取消等待中的題目:relay 收到 close 時還有題目在等,就等最後一題答完才收 topic。
 - **`config.mjs --host codex`**:只列、只改 `autopilot`、`stopcatch`、`hold`、`topics`(每台機器一份的設定,兩個 host 共用);其他項目回「Codex 版還沒有這個功能」、exit 1、不寫入;輸出的指令提示換成 `$myna:config`、`$myna:manage …`。
+- **設定來源**:Codex 只把一小串環境變數(不含 `MYNA_*`、`RELAY_PORT`)傳給 MCP,MCP 的設定只能寫在 `codex/mcp.json` 的 `env`;hook 和 skill 跑的 scripts 照讀 shell 的環境。第一階段只支援預設的 relay 位址和 `~/.myna/`,shell 設了覆寫就會兩邊不一致(README 寫明不要設)。hook 照讀環境變數是刻意保留的:前提驗證和測試靠它把 hook 指到測試用的 relay;真的要支援改位址時,再設計三個入口(MCP、hook、skill)一致的設定來源。
 - **skills**:`codex/skills/config`(→ `config.mjs --host codex`)、`codex/skills/manage`(setup、configure、pair、relay、status、hub/hub tree、join/join tree、machines、bind,各自跑既有的 script;`ensure-relay` 一律帶 `--host codex`)。plugin 根目錄 = `SKILL.md` 往上三層。
 
 ### 後續修訂
