@@ -186,5 +186,30 @@ const n = roundEnds.length;
 out = await runHook({ transcript_path: transcript("r2", REPORT_END) }, { MYNA_RELAY_URL: RELAY_UP });
 ok(out === "" && roundEnds.length === n, "no session_id → allow, no round-end call");
 
+// 15) --host codex (codex/hooks.json, PR 2): the same decisions, the block worded for Codex (no
+//     AskUserQuestion, no mcp__ name); a Codex transcript (not Claude's format) → round-end still sent
+function runCodex(payload, env) {
+  return new Promise((resolve) => {
+    const child = spawn("node", [HOOK, "--host", "codex"], { env: { ...process.env, MYNA_STOPCATCH_FILE: FLAG, ...env } });
+    let out = ""; child.stdout.on("data", (d) => (out += d));
+    child.stdin.on("error", () => {});
+    child.on("close", () => resolve(out));
+    try { child.stdin.end(JSON.stringify(payload)); } catch {}
+  });
+}
+out = await runCodex({ session_id: "cx-1", last_assistant_message: "Both fixes are in. Should I open the PR now?", stop_hook_active: false }, { MYNA_RELAY_URL: RELAY_UP });
+let blk = null; try { blk = JSON.parse(out); } catch {}
+ok(blk?.decision === "block" && /ask_human/.test(blk.reason) && !/AskUserQuestion|mcp__myna__/.test(blk.reason) && !roundEnded("cx-1"), "--host codex question ending → block, the reason names ask_human but no AskUserQuestion / mcp__ name; no round-end");
+const codexTranscript = path.join(scratch, "codex-rollout.jsonl");
+fs.writeFileSync(codexTranscript, [
+  { timestamp: "2026-11-13T00:00:00Z", type: "session_meta", payload: { id: "cx-2" } },
+  { timestamp: "2026-11-13T00:00:01Z", type: "response_item", payload: { type: "function_call", name: "mcp__myna__ask_human", arguments: "{}" } },
+  { timestamp: "2026-11-13T00:00:02Z", type: "response_item", payload: { type: "message", role: "assistant", content: [{ type: "output_text", text: "全部完成。" }] } },
+].map((e) => JSON.stringify(e)).join("\n") + "\n");
+out = await runCodex({ session_id: "cx-2", transcript_path: codexTranscript, last_assistant_message: "全部完成。", stop_hook_active: false }, { MYNA_RELAY_URL: RELAY_UP });
+ok(out === "" && roundEnded("cx-2"), "--host codex, a Codex-format transcript, a report ending → allow, round-end sent");
+out = await runCodex({ session_id: "cx-3", transcript_path: codexTranscript, last_assistant_message: "Should I deploy Alpha or Beta?", stop_hook_active: true }, { MYNA_RELAY_URL: RELAY_UP });
+ok(out === "" && roundEnded("cx-3"), "--host codex, stop_hook_active → allow (no loop), round-end sent");
+
 stub.close();
 process.exit(failed ? 1 : 0);

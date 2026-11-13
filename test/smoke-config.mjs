@@ -407,6 +407,47 @@ function engine({ dir = path.join(TMP, "eng0"), root = "/w", sid = "s-1" } = {})
     `hub on, the .env turned into an edge's while it waited for the lock → refused, nothing written, the lock gone ("${hr.err.trim().slice(0, 60)}…")`);
 }
 
+// 9) --host codex (Codex CLI's $myna:config skill, PR 2): only autopilot / stopcatch / hold / topics — listed,
+// changed with the same files and texts as without --host; the other items refused, nothing written; the
+// command hints in Codex's words
+{
+  const cx = (args, home, extra) => cfg(["--host", "codex", ...args], home, extra);
+  const ORDER_ALL = ["autopilot", "godmode", "intercept", "stopcatch", "brief", "perm", "murmur", "hold", "chat", "topics", "perm-delay"];
+  const a = newHome();
+  let r = await cx([], a);
+  const listed = ORDER_ALL.filter((k) => new RegExp(`^  ${k} `, "m").test(r.out));
+  ok(r.rc === 0 && JSON.stringify(listed) === JSON.stringify(["autopilot", "stopcatch", "hold", "topics"]) && same(snap(a), {}), `--host codex, no argument → the 4 items only (${listed.join(", ")}), nothing written`);
+  ok(/^Myna 設定（改：\$myna:config <項目> <值>；單項的詳細：\$myna:config <項目>）/.test(r.out) && !r.out.includes("/myna:"), `…the hints are $myna:config, no /myna: left ("${r.out.split("\n")[0]}")`);
+  for (const [k, v] of [["autopilot", "on"], ["stopcatch", "off"], ["hold", "off"], ["topics", "off"]]) {
+    const h1 = newHome(), h2 = newHome();
+    const r1 = await cx([k, v], h1), r2 = await cfg([k, v], h2);
+    const envSame = fs.existsSync(path.join(h1, ".myna", ".env")) ? fs.readFileSync(path.join(h1, ".myna", ".env"), "utf8") === fs.readFileSync(path.join(h2, ".myna", ".env"), "utf8") : true;
+    ok(r1.rc === 0 && same(snap(h1), snap(h2)) && envSame, `--host codex ${k} ${v} → the same files as /myna:config ${k} ${v} (${JSON.stringify(snap(h1))})`);
+  }
+  {
+    const h = newHome();
+    const t = await cx(["topics", "off"], h);
+    ok(/\$myna:manage relay restart/.test(t.out) && !t.out.includes("/myna:"), `--host codex topics off → says to restart with $myna:manage relay restart ("${t.out.trim()}")`);
+    const one = await cx(["hold"], h);
+    ok(one.rc === 0 && /\$myna:manage join/.test(one.out) && !one.out.includes("/myna:"), "--host codex hold → its details, with $myna:manage join");
+    const st = await cx(["hold", "status"], h);
+    ok(st.rc === 0 && !st.all.includes("/myna:"), `--host codex hold status → hold.mjs's output, its /myna: hints in Codex's words ("${st.out.trim().split("\n")[0]}")`);
+  }
+  for (const k of ["godmode", "intercept", "brief", "perm", "perm-delay", "murmur", "chat"]) {
+    const h = newHome(), v = k === "perm-delay" ? "5" : "on";
+    const pre = JSON.stringify(snap(h));
+    const rr = await cx([k, v], h), alone = await cx([k], h);
+    ok(rr.rc === 1 && /Codex 版還沒有這個功能/.test(rr.err) && alone.rc === 1 && JSON.stringify(snap(h)) === pre && !fs.existsSync(path.join(h, ".myna", ".env")),
+      `--host codex ${k} ${v} (and ${k} alone) → "Codex 版還沒有這個功能", exit 1, nothing written`);
+  }
+  r = await cx(["nope"], newHome());
+  ok(r.rc === 1 && /不認得的項目「nope」.*autopilot、stopcatch、hold、topics$/m.test(r.err), `--host codex, an unknown item → the 4 items listed ("${r.err.trim()}")`);
+  r = await cfg(["--host", "claude-ish", "autopilot", "on"], a);
+  ok(r.rc === 1 && /--host 只接受 codex/.test(r.err) && same(snap(a), {}), "--host <anything else> → refused, nothing written");
+  r = await cfg(["autopilot", "on", "--host", "codex"], newHome());
+  ok(r.rc === 0, "--host codex may come after the item too");
+}
+
 srv.close();
 fs.rmSync(TMP, { recursive: true, force: true });
 console.log(failed ? `\n❌ ${failed} check(s) failed` : "\n✅ smoke-config: all checks passed");

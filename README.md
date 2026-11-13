@@ -32,6 +32,7 @@
 - [多台機器共用一支 bot(v0.20.0)](#多台機器共用一支-botv0200)
 - [不同機器的 session 互傳訊息:tree 模式(第 0 批)](#不同機器的-session-互傳訊息tree-模式第-0-批v0260)
 - [常駐:登入後自動啟動 relay(不用開 Claude Code)](#常駐登入後自動啟動-relay不用開-claude-codev0270)
+- [在 Codex CLI 使用(第一階段)](#在-codex-cli-使用第一階段v0280)
 - [指令速查](#指令速查)
 - [設定檔與路徑](#設定檔與路徑)
 - [純手動安裝(不裝 plugin)](#純手動安裝不裝-plugin)
@@ -820,6 +821,48 @@ node ~/myna-plugin/scripts/pair.mjs                    # 有 bot、還沒配對�
 - Windows 的啟動檔是 VBScript(由 `wscript` 跑,用隱藏視窗啟動 node;`.cmd` 一定會閃一下自己的主控台視窗)。微軟已經宣布要逐步淘汰 VBScript(Windows 11 24H2 改成預設啟用的選用功能,之後會改成預設停用);真的被停用時,登入啟動會失效,要再換做法。
 - `service.json` 指向哪份程式碼,登入時就跑哪份。能寫 `~/.myna` 的程式就能換掉它;這跟 `~/.myna/.env`、SessionStart hook 是同一個帳號下的信任範圍,不是新的弱點。
 - **沒在真機驗證**(v0.27.0):macOS、Linux 的登記指令只用假的 `launchctl`/`systemctl` 測過參數,Windows 的啟動檔只在暫存資料夾驗過內容;登出再登入後 relay 真的起來,三種 OS 都還沒實測。
+
+---
+
+## 在 Codex CLI 使用(第一階段,v0.28.0)
+
+同一個 plugin 也能裝進 **Codex CLI**:Codex 的 session 一樣能把題目送到手機、等你回答。relay、bot、多台機器的設定都跟 Claude Code 共用,同一台機器上兩邊用的是同一個 relay。Codex 讀的是 `.codex-plugin/plugin.json` 和 `codex/` 底下自己的設定(MCP、hooks、skills),不會載入 Claude Code 的 `.mcp.json`、`hooks/`、`commands/`。
+
+**安裝**
+
+1. **先裝 Node.js 18+**(各 OS 的官方安裝方式)。沒有 `node` 時 Codex 只會顯示「MCP startup failed: program not found」和「hook exited with code 1」,看不出是缺 Node.js。
+2. 加入 marketplace、安裝 plugin:
+   ```
+   codex plugin marketplace add mraaa711128/myna-plugin
+   codex plugin add myna@mraaa711128-myna
+   ```
+3. 在 Codex 裡打 `/hooks`,**信任** myna 的 3 個 hook(SessionStart、Stop、SessionEnd)。沒信任時 hook 不跑:relay 不會自動起來(`ask_human` 回 `unreachable`)、純文字問句不會轉手機、session 結束時不收 topic;問答本身不會壞。
+4. 第一次設定(還沒有 bot 的機器):在 Codex 裡打 `$myna:manage setup <bot token>`(Telegram;Discord / Slack 的參數同 `/myna:setup`)。腳本要寫 `~/.myna`、起 relay,Codex 的 sandbox 每一步都會跳一次核准,照著核准即可。
+
+**每次升版都要重新信任 hook,也要重新核准指令**:Codex 的信任綁在整個 plugin 的內容上,只要 plugin 有任何改動(升版一定有)就變回不信任;終端機核准框的「always allow this command」綁的是含版本號的路徑,升版後也要重新核准(看路徑推的,沒實測)。重新信任之前 relay 不會被 Codex 叫起來;同一台有 Claude Code 的話,用 `/myna:service on` 開常駐就不受影響。
+
+**在 Codex 裡怎麼用**
+
+| 在 Codex 打 | 作用 |
+|---|---|
+| `$myna:config [項目] [值]`(或 `$config`) | 看和改這台的 `autopilot`、`stopcatch`、`hold`、`topics`(跟 Claude Code 共用同一份設定:在 Codex 改,同一台的 Claude Code session 也跟著變)。其他項目回「Codex 版還沒有這個功能」,什麼都不改 |
+| `$myna:manage <動作>` | `setup`、`configure`、`pair`、`relay start\|stop\|restart\|status`、`status`、`hub`(含 `hub tree`)、`join`(含 `join tree`)、`machines`、`bind`,做的事跟對應的 `/myna:*` 指令一樣 |
+
+AI 用的工具是 myna 的 `ask_human`、`await_human`、`detach_human`(Codex 裡的名稱是 `mcp__myna__ask_human` 這類),參數和回傳都跟 Claude Code 版一樣;這 3 個 tool 呼叫時**不跳終端機核准**(人不在電腦前也送得到手機)。決策紀錄寫在這次 Codex session 的專案目錄(`MYNA-DECISIONS.jsonl/.md`),跟 Claude Code 版一樣(Codex 沒告訴 myna 專案目錄時,改寫到 `~/.myna/decisions/`);`logDir` 參數照常可用。
+
+**第一階段有的**:手機問答(`ask_human`、`await_human`、`detach_human`)、`approves` 核准作證、autopilot、多台機器(hub/edge 和 tree 節點,只裝 Codex 的機器也能用 `$myna:manage join` 加入)、SessionStart 自動起 relay、stop-catch(純文字問句轉手機)和回合結束收 topic、session 結束時通知 relay。
+
+**第一階段還沒有的**:
+
+- **權限確認轉手機、聊天**(含附檔、暱稱、murmur、`!指令`、tree 的 `message_session`)、`AskUserQuestion` 類的攔截、gate-brief、`/myna:review`:之後的階段再做。Codex 版的 MCP 不列出 `message_session`。
+- **God mode**:Codex 裡不能開關。在別處開了 God mode(Claude Code 的 `/myna:godmode`,或終端機跑 `node <myna>/scripts/godmode.mjs on|off`)之後,對 Codex session 有效的只有「帶 `approves` 的題目自動按 ✅」和它帶開的 autopilot;**Codex 自己的核准框不會自動同意**,照常出現在終端機。
+- **常駐**:只裝 Codex 的機器還不支援 `/myna:service`;Codex 開 session 時也不會改 Claude Code 設好的常駐(`~/.myna/service/service.json`)。只裝 Codex 的機器重開機後,要等第一個 Codex session 送出第一則訊息,relay 才會起來。
+- **改 relay 位址**:只支援預設的 `127.0.0.1:7800`。Codex 不把 shell 的環境變數傳給 MCP,`MYNA_RELAY_URL`、`RELAY_PORT` 在 Codex 版沒有作用。
+- **Codex 關掉時還在等的題目**:會留在手機上(按鈕不收回),答完之後 topic 才收;resume 同一個 session 後可以用 `await_human` 接回(看程式推的,沒實測)。
+- 只支援 **Codex CLI 互動模式**;IDE extension、桌面 app 不支援,`codex exec` 沒測。
+- **驗證範圍**:Windows 上用 `codex app-server`(跟 TUI 同一個引擎)驗過安裝、MCP、核准、hook、`$myna:config`、`$myna:manage` 的上手;TUI 才看得到的畫面、daemon 模式、macOS 都還沒驗證。
+
+**兩個版本的檔案怎麼分**(SPEC §5.6):Codex 的檔案只在 `.codex-plugin/`、`codex/`;共用程式裡的 Codex 差異只放在 `MYNA_HOST=codex`(MCP)和 `--host codex`(scripts)後面,沒帶就是 Claude Code 原本的路徑。`node test/smoke-codex-mcp.mjs` 驗 Codex 版的 MCP、SessionEnd hook、`ensure-relay --host codex`(暫存 HOME、假 relay、隨機 port);`node test/smoke-host-layout.mjs` 驗兩邊的檔案沒有混在一起、4 個版本號一致;`smoke-config`、`smoke-stopcatch` 各多了 `--host codex` 的案例。
 
 ---
 
@@ -988,6 +1031,7 @@ node scripts/service.mjs on                    # 選配:登入後自動啟動 re
 - [多台機器共用一支 bot(v0.20.0)](#多台機器共用一支-botv0200)
 - [不同機器的 session 互傳訊息:tree 模式(第 0 批)](#不同機器的-session-互傳訊息tree-模式第-0-批v0260)
 - [常駐:登入後自動啟動 relay(不用開 Claude Code)](#常駐登入後自動啟動-relay不用開-claude-codev0270)
+- [在 Codex CLI 使用(第一階段)](#在-codex-cli-使用第一階段v0280)
 - [指令速查](#指令速查)
 - [設定檔與路徑](#設定檔與路徑)
 - [純手動安裝(不裝 plugin)](#純手動安裝不裝-plugin)
@@ -1776,6 +1820,48 @@ node ~/myna-plugin/scripts/pair.mjs                    # 有 bot、還沒配對�
 - Windows 的啟動檔是 VBScript(由 `wscript` 跑,用隱藏視窗啟動 node;`.cmd` 一定會閃一下自己的主控台視窗)。微軟已經宣布要逐步淘汰 VBScript(Windows 11 24H2 改成預設啟用的選用功能,之後會改成預設停用);真的被停用時,登入啟動會失效,要再換做法。
 - `service.json` 指向哪份程式碼,登入時就跑哪份。能寫 `~/.myna` 的程式就能換掉它;這跟 `~/.myna/.env`、SessionStart hook 是同一個帳號下的信任範圍,不是新的弱點。
 - **沒在真機驗證**(v0.27.0):macOS、Linux 的登記指令只用假的 `launchctl`/`systemctl` 測過參數,Windows 的啟動檔只在暫存資料夾驗過內容;登出再登入後 relay 真的起來,三種 OS 都還沒實測。
+
+---
+
+## 在 Codex CLI 使用(第一階段,v0.28.0)
+
+同一個 plugin 也能裝進 **Codex CLI**:Codex 的 session 一樣能把題目送到手機、等你回答。relay、bot、多台機器的設定都跟 Claude Code 共用,同一台機器上兩邊用的是同一個 relay。Codex 讀的是 `.codex-plugin/plugin.json` 和 `codex/` 底下自己的設定(MCP、hooks、skills),不會載入 Claude Code 的 `.mcp.json`、`hooks/`、`commands/`。
+
+**安裝**
+
+1. **先裝 Node.js 18+**(各 OS 的官方安裝方式)。沒有 `node` 時 Codex 只會顯示「MCP startup failed: program not found」和「hook exited with code 1」,看不出是缺 Node.js。
+2. 加入 marketplace、安裝 plugin:
+   ```
+   codex plugin marketplace add mraaa711128/myna-plugin
+   codex plugin add myna@mraaa711128-myna
+   ```
+3. 在 Codex 裡打 `/hooks`,**信任** myna 的 3 個 hook(SessionStart、Stop、SessionEnd)。沒信任時 hook 不跑:relay 不會自動起來(`ask_human` 回 `unreachable`)、純文字問句不會轉手機、session 結束時不收 topic;問答本身不會壞。
+4. 第一次設定(還沒有 bot 的機器):在 Codex 裡打 `$myna:manage setup <bot token>`(Telegram;Discord / Slack 的參數同 `/myna:setup`)。腳本要寫 `~/.myna`、起 relay,Codex 的 sandbox 每一步都會跳一次核准,照著核准即可。
+
+**每次升版都要重新信任 hook,也要重新核准指令**:Codex 的信任綁在整個 plugin 的內容上,只要 plugin 有任何改動(升版一定有)就變回不信任;終端機核准框的「always allow this command」綁的是含版本號的路徑,升版後也要重新核准(看路徑推的,沒實測)。重新信任之前 relay 不會被 Codex 叫起來;同一台有 Claude Code 的話,用 `/myna:service on` 開常駐就不受影響。
+
+**在 Codex 裡怎麼用**
+
+| 在 Codex 打 | 作用 |
+|---|---|
+| `$myna:config [項目] [值]`(或 `$config`) | 看和改這台的 `autopilot`、`stopcatch`、`hold`、`topics`(跟 Claude Code 共用同一份設定:在 Codex 改,同一台的 Claude Code session 也跟著變)。其他項目回「Codex 版還沒有這個功能」,什麼都不改 |
+| `$myna:manage <動作>` | `setup`、`configure`、`pair`、`relay start\|stop\|restart\|status`、`status`、`hub`(含 `hub tree`)、`join`(含 `join tree`)、`machines`、`bind`,做的事跟對應的 `/myna:*` 指令一樣 |
+
+AI 用的工具是 myna 的 `ask_human`、`await_human`、`detach_human`(Codex 裡的名稱是 `mcp__myna__ask_human` 這類),參數和回傳都跟 Claude Code 版一樣;這 3 個 tool 呼叫時**不跳終端機核准**(人不在電腦前也送得到手機)。決策紀錄寫在這次 Codex session 的專案目錄(`MYNA-DECISIONS.jsonl/.md`),跟 Claude Code 版一樣(Codex 沒告訴 myna 專案目錄時,改寫到 `~/.myna/decisions/`);`logDir` 參數照常可用。
+
+**第一階段有的**:手機問答(`ask_human`、`await_human`、`detach_human`)、`approves` 核准作證、autopilot、多台機器(hub/edge 和 tree 節點,只裝 Codex 的機器也能用 `$myna:manage join` 加入)、SessionStart 自動起 relay、stop-catch(純文字問句轉手機)和回合結束收 topic、session 結束時通知 relay。
+
+**第一階段還沒有的**:
+
+- **權限確認轉手機、聊天**(含附檔、暱稱、murmur、`!指令`、tree 的 `message_session`)、`AskUserQuestion` 類的攔截、gate-brief、`/myna:review`:之後的階段再做。Codex 版的 MCP 不列出 `message_session`。
+- **God mode**:Codex 裡不能開關。在別處開了 God mode(Claude Code 的 `/myna:godmode`,或終端機跑 `node <myna>/scripts/godmode.mjs on|off`)之後,對 Codex session 有效的只有「帶 `approves` 的題目自動按 ✅」和它帶開的 autopilot;**Codex 自己的核准框不會自動同意**,照常出現在終端機。
+- **常駐**:只裝 Codex 的機器還不支援 `/myna:service`;Codex 開 session 時也不會改 Claude Code 設好的常駐(`~/.myna/service/service.json`)。只裝 Codex 的機器重開機後,要等第一個 Codex session 送出第一則訊息,relay 才會起來。
+- **改 relay 位址**:只支援預設的 `127.0.0.1:7800`。Codex 不把 shell 的環境變數傳給 MCP,`MYNA_RELAY_URL`、`RELAY_PORT` 在 Codex 版沒有作用。
+- **Codex 關掉時還在等的題目**:會留在手機上(按鈕不收回),答完之後 topic 才收;resume 同一個 session 後可以用 `await_human` 接回(看程式推的,沒實測)。
+- 只支援 **Codex CLI 互動模式**;IDE extension、桌面 app 不支援,`codex exec` 沒測。
+- **驗證範圍**:Windows 上用 `codex app-server`(跟 TUI 同一個引擎)驗過安裝、MCP、核准、hook、`$myna:config`、`$myna:manage` 的上手;TUI 才看得到的畫面、daemon 模式、macOS 都還沒驗證。
+
+**兩個版本的檔案怎麼分**(SPEC §5.6):Codex 的檔案只在 `.codex-plugin/`、`codex/`;共用程式裡的 Codex 差異只放在 `MYNA_HOST=codex`(MCP)和 `--host codex`(scripts)後面,沒帶就是 Claude Code 原本的路徑。`node test/smoke-codex-mcp.mjs` 驗 Codex 版的 MCP、SessionEnd hook、`ensure-relay --host codex`(暫存 HOME、假 relay、隨機 port);`node test/smoke-host-layout.mjs` 驗兩邊的檔案沒有混在一起、4 個版本號一致;`smoke-config`、`smoke-stopcatch` 各多了 `--host codex` 的案例。
 
 ---
 

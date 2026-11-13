@@ -699,6 +699,41 @@ Windows 為什麼是 `.vbs`:`wscript` 本身沒有主控台,`Run …, 0` 讓 nod
 
 - **v0.27.0**:上面全部。Windows 從工作排程器換成「啟動」資料夾(人 2026-11-12;實測用 `runas /trustlevel:0x20000` 降權後 `schtasks /Create /SC ONLOGON` 回「存取被拒」——這種降權比一般沒用系統管理員開的視窗更嚴,不算定論,但考量確定性和簡單改用「啟動」資料夾)。**沒有真機驗證**:macOS、Linux 的登記只用假指令驗過參數,Windows 的 `.vbs` 只在暫存資料夾驗過內容。還沒實測的:Windows 登入時 `.vbs` 真的不開視窗、relay 起來;macOS launchd 結束 job 時會不會清掉 detached 的 relay(不行就加 `AbandonProcessGroup`);Linux `RemainAfterExit` 的 unit 下 relay 會不會留著。三種 OS 都要跑完手動 E2E(`on` → 登出再登入 → relay 在跑 → `off` → relay 還在 → 停掉 → 登出再登入 → 沒有自己起來)才算完成。
 
+## 5.6 兩個 host:Claude Code 和 Codex CLI(v0.28.0,Codex 第一階段)
+
+同一個 repo 同時是 Claude Code plugin 和 Codex CLI plugin。relay、provider、多機、核准作證完全不動;Codex 版只是另一組 host 轉接檔,共用同一支 `dist/ask-human.mjs` 和同一批 scripts,差異只在兩個開關後面。設計和決定:friday-ai `docs/designs/myna-codex/design.md`(2026-11-13 照 0.27.0 改版、同日設計確認)。
+
+### 三層
+
+| 層 | 檔案 | 規則 |
+|---|---|---|
+| 共用核心 | `src/relay.mjs`、`src/providers/*` 和其他 `src/*.mjs`(`src/mcp/` 以外)、`scripts/*.mjs` 的開關和管理 script | 不知道 host 是誰;只透過 HTTP 和 `~/.myna/` 的檔案溝通 |
+| 共用、有 host 差異 | `src/mcp/ask-human.mjs`(差異集中在 `src/mcp/codex.mjs`)、`scripts/stop-catch-question.mjs`(只換文字)、`scripts/config.mjs`(只開放 4 項、提示文字)、`scripts/ensure-relay.mjs`(不更新 `service.json`) | 差異只放在 `MYNA_HOST=codex`(MCP)／`--host codex`(scripts)後面;**沒帶開關 = Claude Code 原本的路徑** |
+| host 轉接層 | Claude Code:`.claude-plugin/`、`.mcp.json`、`hooks/`、`commands/`;Codex:`.codex-plugin/`、`codex/` | 互不引用 |
+
+### 守法(`test/smoke-host-layout.mjs` 檢查 1–4)
+
+1. Codex 的檔案只在 `codex/` 和 `.codex-plugin/`;根目錄不能有 `skills/`(Claude Code 會自動載入)和 `plugin.json`(Codex 會先讀它)。
+2. `.codex-plugin/plugin.json` 明寫 `mcpServers`、`hooks`、`skills`(都在 `codex/` 裡),`commands` 指向不存在的 `./codex/commands`(不寫的話 Codex 安裝時會把 `commands/*.md` 轉成 skill,實測);`codex/commands` 不能存在;`codex/hooks.json` 只有 `SessionStart`、`Stop`、`SessionEnd`;`codex/mcp.json` 不能有 `${`(Codex 不代換),核准只對 `ask_human`、`await_human`、`detach_human` 各自設 `approval_mode: "approve"`,不設整個 server 的 `default_tools_approval_mode`(之後新增的 tool 要個別決定)。
+3. 共用程式的 host 差異只能透過那兩個開關;Claude Code 的 `.mcp.json`、`hooks/hooks.json`、`commands/*.md` 不能帶 `MYNA_HOST` 或 `--host`。
+4. 一個版本號:`package.json`、`.claude-plugin/plugin.json`、`.claude-plugin/marketplace.json`、`.codex-plugin/plugin.json` 一樣。兩個 host 裝同一版就是同一個 relay(`ensure-relay` 照版本換 relay)。
+5. 既有的 smoke 是 Claude Code 版的回歸測試,不改;Codex 的測試是新檔(`smoke-codex-mcp`、`smoke-host-layout`)或既有檔的新案例(`smoke-config`、`smoke-stopcatch`)。CI 兩組都跑。
+6. 指令說明各寫各的(`commands/*.md` 給 Claude Code,`codex/skills/*/SKILL.md` 給 Codex),內容都只是「跑哪支 script」;邏輯只在 script 裡。
+
+### Codex 的差異(只在開關後面)
+
+- **MCP**(`MYNA_HOST=codex`,只有 `codex/mcp.json` 帶):`initialize` 多宣告 experimental capability `codex/sandbox-state`,Codex 每次 `tools/call` 的 `_meta` 就會帶 `sandboxCwd`。session id = 那次呼叫的 `_meta.sessionId`(= hook 輸入的 `session_id`),不讀 `~/.claude/sessions/<ppid>.json`,也**不做 session 切換**(不呼叫 `retireSession`;同一個程序看到不同的 id 只記一行診斷)。專案目錄 = `sandboxCwd`(`file://` URI 用 `fileURLToPath` 轉):topic 名稱用它的資料夾名(第一次拿到時定下)、決策紀錄寫到它(`logDir`、`MYNA_LOG_DIR` 還是優先;都沒有時寫 `~/.myna/decisions/`,不寫進 plugin 快取資料夾)。tree 模式也不列 `message_session`(要 chat,Codex 還沒有),被叫到回錯誤、不打 relay。relay 收到的 `/ask` 格式不變。
+- **hooks**(`codex/hooks.json`):SessionStart → `ensure-relay.mjs --host codex`;Stop → `stop-catch-question.mjs --host codex`;SessionEnd → `session-end.mjs`(timeout 3 秒,Codex 的上限)。
+- **`ensure-relay --host codex`**:啟動、換版的規則不變,只是不更新 `~/.myna/service/service.json`(Codex 跑的是 plugin 快取裡那份,升版或移除後那個資料夾不一定還在,登入啟動不能指過去)。
+- **`stop-catch-question --host codex`**:判斷、`stop_hook_active`、chat 豁免、round-end 都不變,只換 block 的文字(不提 `AskUserQuestion` 和 `mcp__…` 名稱)。讀 Claude transcript 格式的「背景工作還沒結束」判斷在 Codex 找不到東西,照常回報 round-end。
+- **`session-end.mjs`**(只有 Codex 用):Codex 結束時直接 kill MCP 程序、不關 stdin,`ask-human.mjs` 的 `endSession` 不會跑;這支用 hook 輸入的 `session_id` 打 `POST /session/close`,自己 2 秒內一定結束,relay 不在或不回都 exit 0。跟 `endSession` 不同,它不取消等待中的題目:relay 收到 close 時還有題目在等,就等最後一題答完才收 topic。
+- **`config.mjs --host codex`**:只列、只改 `autopilot`、`stopcatch`、`hold`、`topics`(每台機器一份的設定,兩個 host 共用);其他項目回「Codex 版還沒有這個功能」、exit 1、不寫入;輸出的指令提示換成 `$myna:config`、`$myna:manage …`。
+- **skills**:`codex/skills/config`(→ `config.mjs --host codex`)、`codex/skills/manage`(setup、configure、pair、relay、status、hub/hub tree、join/join tree、machines、bind,各自跑既有的 script;`ensure-relay` 一律帶 `--host codex`)。plugin 根目錄 = `SKILL.md` 往上三層。
+
+### 後續修訂
+
+- **v0.28.0**:上面全部。前提驗證(Windows,Codex CLI 0.166.0,用 `codex app-server` 驅動、隔離的 Codex home 和 HOME、測試用的 relay port)在 0.28.0 上重跑過 V1、V2、V3、V8、V10、V13。**沒驗證**:macOS、TUI 才看得到的畫面、daemon 模式、`codex exec`。第二階段(`request_user_input` 攔截、gate-brief／review 純文字版)和第三階段(權限轉手機、聊天,依 app-server spike)另外設計。
+
 ## 6. Telegram UX
 
 - **訊息格式:** `[機器A · PROJ-123 · gate② space-time]` +(有 `preamble` 時先顯示 preamble)+ question +**完整選項以編號列於內文**(`1. …` `2. …`)。

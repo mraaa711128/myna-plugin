@@ -20,6 +20,21 @@ import { loadEnv, holdSettings, readHoldFile, updateEnvFile, mynaDir } from "../
 import { SWITCHES, readEnvFile, tildePath } from "../src/status.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
+// --host codex: Codex CLI's $myna:config skill (codex/skills/config). Only the 4 items its first stage has —
+// each machine's own files, shared with Claude Code on the same machine — are listed or changed; the others
+// are refused before anything is written, and the command hints in the output are Codex's ($myna:…).
+// Without --host this script is Claude Code's /myna:config, unchanged.
+const argv = process.argv.slice(2);
+const hostAt = argv.indexOf("--host");
+const HOST = hostAt >= 0 ? String(argv[hostAt + 1] ?? "").toLowerCase() : "";
+if (hostAt >= 0) argv.splice(hostAt, 2);
+if (hostAt >= 0 && HOST !== "codex") { console.error(`--host 只接受 codex（你給的是「${HOST}」），沒有改。`); process.exit(1); }
+const CODEX = HOST === "codex";
+const CODEX_ITEMS = ["autopilot", "stopcatch", "hold", "topics"];
+// every line printed (this script's and the switch script's), its Claude Code command hints in Codex's words
+const codexText = (s) => String(s).replaceAll("/myna:config", "$myna:config").replaceAll("/myna:hold", "$myna:config hold")
+  .replaceAll("/myna:relay restart", "$myna:manage relay restart").replaceAll("/myna:join", "$myna:manage join");
+if (CODEX) for (const k of ["log", "error"]) { const f = console[k]; console[k] = (...a) => f(...a.map((x) => (typeof x === "string" ? codexText(x) : x))); }
 // an unreadable .env (as scripts/status.mjs): go on with the environment alone, and say so
 let cfg, envError;
 try { cfg = loadEnv(); }
@@ -199,18 +214,20 @@ function itemEntry(item) {
   return out.join("\n");
 }
 
-const ITEMS_TEXT = ORDER.join("、");
+const SHOWN = CODEX ? ORDER.filter((k) => CODEX_ITEMS.includes(k)) : ORDER;
+const ITEMS_TEXT = SHOWN.join("、");
 const usageError = (msg) => { console.error(msg); process.exit(1); };
-const [item0, ...rest] = process.argv.slice(2);
+const [item0, ...rest] = argv;
 // shown with every reading (the whole list or one item): an unreadable .env makes "預設" a guess
 const warn = envError ? [`注意：${tildePath(ENV_PATH)} 讀不到（${envError}），下面只看環境變數和各開關的檔案`] : [];
 
 if (!item0) {
-  console.log(["Myna 設定（改：/myna:config <項目> <值>；單項的詳細：/myna:config <項目>）", ...warn, ...ORDER.map(listEntry)].join("\n"));
+  console.log(["Myna 設定（改：/myna:config <項目> <值>；單項的詳細：/myna:config <項目>）", ...warn, ...SHOWN.map(listEntry)].join("\n"));
   process.exit(0);
 }
 const item = item0.toLowerCase();
-if (!ORDER.includes(item)) usageError(`不認得的項目「${item0}」。可以設定的項目：${ITEMS_TEXT}`);
+if (CODEX && ORDER.includes(item) && !SHOWN.includes(item)) usageError(`Codex 版還沒有這個功能（${item}），沒有改。Codex 可以設定的項目：${ITEMS_TEXT}`);
+if (!SHOWN.includes(item)) usageError(`不認得的項目「${item0}」。可以設定的項目：${ITEMS_TEXT}`);
 
 if (item === "chat") {
   // the chat mod answers "/myna:config chat …"; reaching here means it is not loaded in this session
@@ -232,8 +249,9 @@ if (!ENV_ITEMS[item]) {
     else usageError(`hold 只接受 on、off、status 或 max <30m|6h|1d|秒數|default>（你給的是「${rest.join(" ")}」），沒有改。`);
   } else if ((v === "on" || v === "off") && rest.length === 1) args = [v];
   else usageError(`${item} 只接受 on 或 off（你給的是「${rest.join(" ")}」），沒有改。`);
-  const r = spawnSync(process.execPath, [path.join(HERE, sw(item).script), ...args], { stdio: "inherit" });
+  const r = spawnSync(process.execPath, [path.join(HERE, sw(item).script), ...args], CODEX ? { encoding: "utf8" } : { stdio: "inherit" });
   if (r.error) usageError(`${sw(item).script} 沒有執行：${r.error.message}`);
+  if (CODEX) { process.stdout.write(codexText(r.stdout || "")); process.stderr.write(codexText(r.stderr || "")); }
   process.exit(r.status ?? 1);
 }
 
