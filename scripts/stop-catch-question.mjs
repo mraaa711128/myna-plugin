@@ -161,6 +161,21 @@ const probe = () => fetch(`${RELAY}/chat/session?session_id=${encodeURIComponent
 const link = (await probe()) || (await probe());
 if (!link || link === "chat") await allow();
 
+// --host codex (codex/hooks.json): the same decision, worded for Codex — it has no AskUserQuestion, and its
+// tool is shown as myna's ask_human rather than by Claude Code's mcp__… name
+const codexHost = process.argv.slice(2).some((a, i, all) => a === "--host" && String(all[i + 1]).toLowerCase() === "codex");
+if (codexHost) {
+  process.stdout.write(JSON.stringify({
+    decision: "block",
+    reason: [
+      "Myna stop-catch:這回合以『問使用者的問題』收尾,但沒有經過提問工具——這個問題不會送到手機,使用者可能幾小時後才看到。二選一:",
+      "1. 這確實需要使用者回答才能繼續 → 立刻把同一個問題改用 myna 的 ask_human 工具(名稱結尾是 ask_human)送出(question 放問題文字、options 放結構化 JSON 字串陣列、可附 recommendedIndex),等答案回來再繼續。",
+      "2. 它只是禮貌性/修辭性的收尾、不需要答案 → 直接再結束一次回合即可(這個 gate 不會攔第二次)。",
+      "絕不要為了通過這個 gate 而刪掉真正需要人回答的問題。",
+    ].join("\n"),
+  }));
+  process.exit(0);
+}
 process.stdout.write(JSON.stringify({
   decision: "block",
   reason: [

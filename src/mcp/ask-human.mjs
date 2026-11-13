@@ -18,6 +18,7 @@ import os from "node:os";
 import path from "node:path";
 import crypto from "node:crypto";
 import { validateAskArgs } from "../providers/util.mjs";
+import { CODEX, CODEX_CAPABILITIES, sessionFromMeta, cwdFromMeta, folderName, fallbackLogDir } from "./codex.mjs";
 
 const RELAY = process.env.MYNA_RELAY_URL || "http://127.0.0.1:7800";
 const AUTOPILOT_FILE = process.env.MYNA_AUTOPILOT_FILE || path.join(os.homedir(), ".myna", "autopilot");
@@ -57,10 +58,34 @@ function sessionId() {
   lastSessionId = id;
   return id;
 }
-const SESSION_BASE = process.env.MYNA_SESSION_NAME || (() => {
+// Codex (MYNA_HOST=codex, src/mcp/codex.mjs): each call carries its thread's id in _meta.sessionId — used as
+// it comes, never treated as a session switch (no retireSession: one Codex thread has its own MCP process,
+// and a resumed thread keeps its id). A different id in the same process is only logged.
+let codexLastId = "";
+function codexSessionId(meta) {
+  const id = process.env.MYNA_SESSION_ID || sessionFromMeta(meta) || FALLBACK_SESSION_ID;
+  if (codexLastId && id !== codexLastId) log(`Codex: this process now sees session ${id} (was ${codexLastId}) — not a switch, nothing closed`);
+  codexLastId = id;
+  return id;
+}
+const sidFor = (meta) => (CODEX ? codexSessionId(meta) : sessionId());
+const clock = () => {
   const d = new Date(), two = (n) => String(n).padStart(2, "0");
-  return `${path.basename(process.cwd()) || "session"} ${two(d.getMonth() + 1)}/${two(d.getDate())} ${two(d.getHours())}:${two(d.getMinutes())}`;
-})();
+  return `${two(d.getMonth() + 1)}/${two(d.getDate())} ${two(d.getHours())}:${two(d.getMinutes())}`;
+};
+const SESSION_BASE = process.env.MYNA_SESSION_NAME || (CODEX ? "" : `${path.basename(process.cwd()) || "session"} ${clock()}`);
+// Codex: the process runs in the plugin's folder; the project's name comes with the first call that has one
+// (then fixed, as SESSION_BASE is for Claude)
+let codexBase = SESSION_BASE, codexProvisional = "";
+function baseFor(meta) {
+  if (!CODEX) return SESSION_BASE;
+  if (codexBase) return codexBase;
+  const dir = folderName(cwdFromMeta(meta));
+  // no project folder yet: one fixed stand-in for this process (Codex review r2 X5), replaced by the folder's
+  // name once a call brings one
+  if (!dir) return (codexProvisional ||= `session ${clock()}`);
+  return (codexBase = `${dir} ${clock()}`);
+}
 // Ticket key (an issue key such as PROJ-1234, supplied by the caller) labels the topic — "PROJ-1234 · <dir> <time>".
 // The caller owns the ticket: the call's `ticket` arg (per ask) or MYNA_TICKET (session default).
 // Myna deliberately does NOT sniff it out of the git branch or the `header` text — that bakes one
@@ -71,7 +96,7 @@ const SESSION_BASE = process.env.MYNA_SESSION_NAME || (() => {
 const TICKET_RE = /\b[A-Z][A-Z0-9]+-\d+\b/;
 const ticketIn = (s) => (typeof s === "string" && s.match(TICKET_RE)?.[0]) || "";
 let sessionTicket = ticketIn(String(process.env.MYNA_TICKET || "").toUpperCase());
-const sessionName = () => (sessionTicket ? `${sessionTicket} · ${SESSION_BASE}` : SESSION_BASE);
+const sessionName = (meta) => (sessionTicket ? `${sessionTicket} · ${baseFor(meta)}` : baseFor(meta));
 // pick this call's ticket: explicit arg > whatever the session already has
 const currentTicket = (args) => ticketIn(String(args.ticket || "").toUpperCase()) || sessionTicket;
 // sessions this process asked under — only tell the relay about a session that actually reached the
@@ -123,9 +148,18 @@ function recommendedIdx(args) {
 
 // Decision audit trail — jsonl (source of truth) + md (human view). Written into logDir
 // (the run's worktree, passed per-call) or cwd, so decisions travel with the branch into the PR.
-function logDecision(rec, logDir) {
+// Codex: the call's project folder instead of cwd (the plugin's cache folder); none → <home>/.myna/decisions
+function codexLogDir(meta) {
+  const cwd = cwdFromMeta(meta);
+  if (cwd) return cwd;
+  const dir = fallbackLogDir();
+  log(`Codex: this call has no project folder (codex/sandbox-state) — decision log goes to ${dir}`);
+  fs.mkdirSync(dir, { recursive: true });
+  return dir;
+}
+function logDecision(rec, logDir, meta) {
   try {
-    const base = logDir || process.env.MYNA_LOG_DIR || process.cwd();
+    const base = logDir || process.env.MYNA_LOG_DIR || (CODEX ? codexLogDir(meta) : process.cwd());
     fs.appendFileSync(path.join(base, "MYNA-DECISIONS.jsonl"), JSON.stringify(rec) + "\n");
     const md = path.join(base, "MYNA-DECISIONS.md");
     if (!fs.existsSync(md)) fs.writeFileSync(md, "# Myna decisions\n\n| time | mode | header | question | chosen |\n|---|---|---|---|---|\n");
@@ -235,7 +269,7 @@ async function messageSession(args) {
   }
 }
 
-const mcp = new Server({ name: "myna", version: "0.1.0" }, { capabilities: { tools: {} } });
+const mcp = new Server({ name: "myna", version: "0.1.0" }, { capabilities: CODEX ? CODEX_CAPABILITIES : { tools: {} } });
 
 mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [{
@@ -294,15 +328,17 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
         logDir: { type: "string", description: "absolute dir to write the decision log (MYNA-DECISIONS.jsonl/.md). Defaults to cwd." },
       },
     },
-  }, ...(treeOn() ? [MESSAGE_SESSION_TOOL] : [])],
+  }, ...(!CODEX && treeOn() ? [MESSAGE_SESSION_TOOL] : [])], // Codex: no chat yet, so no message_session (a later stage)
 }));
 
 mcp.setRequestHandler(CallToolRequestSchema, async (req, extra) => {
+  if (CODEX && req.params.name === "message_session") return toolError("message_session: Codex 版還沒有 session 互傳（要聊天，第三階段）；什麼都沒送出");
   if (req.params.name === "message_session" && treeOn()) return messageSession(req.params.arguments || {});
-  if (req.params.name === "detach_human") return detachHuman(req.params.arguments || {});
+  if (req.params.name === "detach_human") return detachHuman(req.params.arguments || {}, req);
   if (req.params.name === "await_human") return awaitHuman(req.params.arguments || {}, req, extra);
   if (req.params.name !== "ask_human") throw new Error(`unknown tool: ${req.params.name}`);
   const args = req.params.arguments || {};
+  const meta = req.params?._meta;
   const ts = new Date().toISOString();
   const machine = os.hostname();
 
@@ -336,7 +372,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req, extra) => {
     const ri = recommendedIdx(args);
     if (ri >= 0 && (args.options || [])[ri] !== undefined) {
       const value = args.options[ri];
-      logDecision({ ts, answered_at: new Date().toISOString(), machine, mode: "auto", ...(args.gate ? { gate: args.gate } : {}), ...partOf(args), header: args.header, question: args.question, options: args.options, recommendedIndex: ri, chosen: value }, args.logDir);
+      logDecision({ ts, answered_at: new Date().toISOString(), machine, mode: "auto", ...(args.gate ? { gate: args.gate } : {}), ...partOf(args), header: args.header, question: args.question, options: args.options, recommendedIndex: ri, chosen: value }, args.logDir, meta);
       log(`autopilot auto-accepted [${ri}] ${JSON.stringify(value)}`);
       return { content: [{ type: "text", text: JSON.stringify({ kind: "selection", value, auto: true }) }] };
     }
@@ -347,10 +383,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req, extra) => {
   try {
     const t = currentTicket(args);
     if (t && t !== sessionTicket) { log(`session ticket ${sessionTicket || "(none)"} → ${t} — topic will be re-labelled`); sessionTicket = t; }
-    const sid = sessionId();
+    const sid = sidFor(meta);
     const asked = await fetchRelayJson(`${RELAY}/ask`, {
       method: "POST", headers: { "content-type": "application/json" },
-      body: JSON.stringify({ ...args, session_id: sid, session_name: sessionName() }),
+      body: JSON.stringify({ ...args, session_id: sid, session_name: sessionName(meta) }),
     }, 2);
     askedSessions.add(sid);
     // relay-side validation rejected the args (second line of defense) — surface it as a
@@ -365,7 +401,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req, extra) => {
     const result = await waitForAnswer(request_id, extra, req.params?._meta?.progressToken);
     const answered_at = new Date().toISOString(); // when this server got the answer (ts = when it was asked)
     if (result.kind === "selection") {
-      logDecision({ ts, answered_at, machine, mode: modeOf(result), ...(args.gate ? { gate: args.gate } : {}), ...partOf(args), header: args.header, question: args.question, options: args.options, chosen: result.value, ...(args.approves !== undefined ? { approves: args.approves } : {}) }, args.logDir);
+      logDecision({ ts, answered_at, machine, mode: modeOf(result), ...(args.gate ? { gate: args.gate } : {}), ...partOf(args), header: args.header, question: args.question, options: args.options, chosen: result.value, ...(args.approves !== undefined ? { approves: args.approves } : {}) }, args.logDir, meta);
     }
     return textResult(result);
   } catch (e) {
@@ -378,12 +414,12 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req, extra) => {
 // A request leaves `inflight` only once the relay confirmed the detach — until then an exit still
 // cancels it (better than an orphan nobody can find). The relay wakes the pending ask_human poll,
 // which returns {kind:"detached"}.
-async function detachHuman(args) {
+async function detachHuman(args, req) {
   const ids = args.request_id ? [String(args.request_id)] : [...inflight];
   const detached = [], failed = [];
   for (const id of ids) {
     try {
-      const { status, json } = await relayPost(`/detach/${id}`, { session_id: requestSession.get(id) || sessionId() });
+      const { status, json } = await relayPost(`/detach/${id}`, { session_id: requestSession.get(id) || sidFor(req?.params?._meta) });
       if (status === 200 && json?.detached) {
         inflight.delete(id);
         const { detached: _, answered, ...info } = json;
@@ -398,9 +434,10 @@ async function detachHuman(args) {
 // await_human: reattach a handed-off request (or this session's own orphan) and block on its answer.
 async function awaitHuman(args, req, extra) {
   const ts = new Date().toISOString();
+  const meta = req.params?._meta;
   try {
     let id = args.request_id ? String(args.request_id) : "";
-    const sid = sessionId();
+    const sid = sidFor(meta);
     if (!id) {
       const { json } = await fetchRelayJson(`${RELAY}/requests?session_id=${encodeURIComponent(sid)}`, { signal: AbortSignal.timeout(5000) }, 2);
       const orphans = (json?.requests || []).filter((r) => r.detached || !r.attended);
@@ -408,7 +445,7 @@ async function awaitHuman(args, req, extra) {
       if (orphans.length > 1) return textResult({ kind: "choose", requests: orphans.map(({ request_id, gate, thread_id, header, question, created, detached }) => ({ request_id, gate, thread_id, header, question, created, detached })) });
       id = orphans[0].request_id;
     }
-    const { status, json: info } = await relayPost(`/reattach/${id}`, { session_id: sid, session_name: sessionName() });
+    const { status, json: info } = await relayPost(`/reattach/${id}`, { session_id: sid, session_name: sessionName(meta) });
     if (status !== 200) return toolError(`await_human: could not reattach ${id} — ${info?.error || `relay answered ${status}`}`);
     askedSessions.add(sid); // this session now owns a question at the relay → close it on exit
     requestSession.set(id, sid);
@@ -416,7 +453,7 @@ async function awaitHuman(args, req, extra) {
     const result = await waitForAnswer(id, extra, req.params?._meta?.progressToken);
     const answered_at = new Date().toISOString();
     if (result.kind === "selection") {
-      logDecision({ ts, answered_at, machine: os.hostname(), mode: modeOf(result), ...(info.gate ? { gate: info.gate } : {}), header: info.header, question: info.question, options: info.options, chosen: result.value, ...(info.approves !== undefined ? { approves: info.approves } : {}), reattached: id }, args.logDir);
+      logDecision({ ts, answered_at, machine: os.hostname(), mode: modeOf(result), ...(info.gate ? { gate: info.gate } : {}), header: info.header, question: info.question, options: info.options, chosen: result.value, ...(info.approves !== undefined ? { approves: info.approves } : {}), reattached: id }, args.logDir, meta);
     }
     return textResult({ ...result, request_id: id });
   } catch (e) {
@@ -442,4 +479,5 @@ process.stdin.on("close", endSession);
 for (const sig of ["SIGTERM", "SIGINT", "SIGHUP"]) process.on(sig, endSession);
 
 await mcp.connect(new StdioServerTransport());
-log(`myna ask_human connected (relay=${RELAY}, autopilot=${autopilotOn()}, session=${sessionId()} "${sessionName()}")`);
+if (CODEX) log(`myna ask_human connected (host=codex, relay=${RELAY}, autopilot=${autopilotOn()}, session and project folder from each call)`);
+else log(`myna ask_human connected (relay=${RELAY}, autopilot=${autopilotOn()}, session=${sessionId()} "${sessionName()}")`);
