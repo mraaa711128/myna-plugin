@@ -251,7 +251,8 @@ if (!ENV_ITEMS[item]) {
   else usageError(`${item} 只接受 on 或 off（你給的是「${rest.join(" ")}」），沒有改。`);
   const r = spawnSync(process.execPath, [path.join(HERE, sw(item).script), ...args], CODEX ? { encoding: "utf8" } : { stdio: "inherit" });
   if (r.error) usageError(`${sw(item).script} 沒有執行：${r.error.message}`);
-  if (CODEX) { process.stdout.write(codexText(r.stdout || "")); process.stderr.write(codexText(r.stderr || "")); }
+  // written synchronously: process.exit right after an async pipe write could cut it off (Codex review r2 X6)
+  if (CODEX) for (const [fd, text] of [[1, r.stdout], [2, r.stderr]]) if (text) fs.writeSync(fd, codexText(text));
   process.exit(r.status ?? 1);
 }
 

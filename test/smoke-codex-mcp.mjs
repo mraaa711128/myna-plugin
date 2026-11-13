@@ -177,7 +177,13 @@ try {
     const fb = path.join(t.home, ".myna", "decisions");
     ok(readLog(fb).some((x) => x.question === "no cwd?") && readLog(t.cacheDir).length === 0, "no codex/sandbox-state → the decision log goes to <home>/.myna/decisions, not the plugin folder");
     ok(/no project folder/.test(t.err()), "…and says so on stderr");
-    ok(/^session \d\d\/\d\d/.test(hitsTo("/ask").at(-1)?.body?.session_name || ""), `…the topic is named "session <time>" (${hitsTo("/ask").at(-1)?.body?.session_name})`);
+    const first = hitsTo("/ask").at(-1)?.body?.session_name || "";
+    ok(/^session \d\d\/\d\d/.test(first), `…the topic is named "session <time>" (${first})`);
+    // the stand-in name is fixed for the process (Codex review r2 X5); a later call with a folder upgrades it
+    await call(t.c, "ask_human", { question: "no cwd again?", options: ["A"], gate: "g" }, meta("thread-n"));
+    ok(hitsTo("/ask").at(-1)?.body?.session_name === first, "a second call without a project folder → the same stand-in name");
+    await call(t.c, "ask_human", { question: "now with a folder", options: ["A"], gate: "g" }, meta("thread-n", projDir("late-folder")));
+    ok(/^late-folder \d\d\/\d\d/.test(hitsTo("/ask").at(-1)?.body?.session_name || ""), `the first call with a project folder → its name from then on (${hitsTo("/ask").at(-1)?.body?.session_name})`);
     await t.c.close();
   }
 

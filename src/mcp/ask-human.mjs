@@ -76,12 +76,14 @@ const clock = () => {
 const SESSION_BASE = process.env.MYNA_SESSION_NAME || (CODEX ? "" : `${path.basename(process.cwd()) || "session"} ${clock()}`);
 // Codex: the process runs in the plugin's folder; the project's name comes with the first call that has one
 // (then fixed, as SESSION_BASE is for Claude)
-let codexBase = SESSION_BASE;
+let codexBase = SESSION_BASE, codexProvisional = "";
 function baseFor(meta) {
   if (!CODEX) return SESSION_BASE;
   if (codexBase) return codexBase;
   const dir = folderName(cwdFromMeta(meta));
-  if (!dir) return `session ${clock()}`;
+  // no project folder yet: one fixed stand-in for this process (Codex review r2 X5), replaced by the folder's
+  // name once a call brings one
+  if (!dir) return (codexProvisional ||= `session ${clock()}`);
   return (codexBase = `${dir} ${clock()}`);
 }
 // Ticket key (an issue key such as PROJ-1234, supplied by the caller) labels the topic — "PROJ-1234 · <dir> <time>".

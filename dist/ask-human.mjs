@@ -15594,11 +15594,12 @@ var clock = () => {
 };
 var SESSION_BASE = process.env.MYNA_SESSION_NAME || (CODEX ? "" : `${path2.basename(process.cwd()) || "session"} ${clock()}`);
 var codexBase = SESSION_BASE;
+var codexProvisional = "";
 function baseFor(meta2) {
   if (!CODEX) return SESSION_BASE;
   if (codexBase) return codexBase;
   const dir = folderName(cwdFromMeta(meta2));
-  if (!dir) return `session ${clock()}`;
+  if (!dir) return codexProvisional ||= `session ${clock()}`;
   return codexBase = `${dir} ${clock()}`;
 }
 var TICKET_RE = /\b[A-Z][A-Z0-9]+-\d+\b/;

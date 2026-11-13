@@ -430,8 +430,10 @@ function engine({ dir = path.join(TMP, "eng0"), root = "/w", sid = "s-1" } = {})
     ok(/\$myna:manage relay restart/.test(t.out) && !t.out.includes("/myna:"), `--host codex topics off → says to restart with $myna:manage relay restart ("${t.out.trim()}")`);
     const one = await cx(["hold"], h);
     ok(one.rc === 0 && /\$myna:manage join/.test(one.out) && !one.out.includes("/myna:"), "--host codex hold → its details, with $myna:manage join");
-    const st = await cx(["hold", "status"], h);
+    const st = await cx(["hold", "status"], h), direct = await run("hold.mjs", ["status"], h);
     ok(st.rc === 0 && !st.all.includes("/myna:"), `--host codex hold status → hold.mjs's output, its /myna: hints in Codex's words ("${st.out.trim().split("\n")[0]}")`);
+    // passed on whole, not cut off by the exit (Codex review r2 X6): every line of hold.mjs's own output is there
+    ok(direct.out.trim().split("\n").length > 1 && st.out.trim().split("\n").length === direct.out.trim().split("\n").length, `…every line of it (${st.out.trim().split("\n").length} lines, hold.mjs alone ${direct.out.trim().split("\n").length})`);
   }
   for (const k of ["godmode", "intercept", "brief", "perm", "perm-delay", "murmur", "chat"]) {
     const h = newHome(), v = k === "perm-delay" ? "5" : "on";

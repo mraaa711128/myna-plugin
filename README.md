@@ -837,7 +837,7 @@ node ~/myna-plugin/scripts/pair.mjs                    # 有 bot、還沒配對�
    codex plugin add myna@mraaa711128-myna
    ```
 3. 在 Codex 裡打 `/hooks`,**信任** myna 的 3 個 hook(SessionStart、Stop、SessionEnd)。沒信任時 hook 不跑:relay 不會自動起來(`ask_human` 回 `unreachable`)、純文字問句不會轉手機、session 結束時不收 topic;問答本身不會壞。
-4. 第一次設定(還沒有 bot 的機器):在 Codex 裡打 `$myna:manage setup <bot token>`(Telegram;Discord / Slack 的參數同 `/myna:setup`)。腳本要寫 `~/.myna`、起 relay,Codex 的 sandbox 每一步都會跳一次核准,照著核准即可。
+4. 第一次設定(還沒有 bot 的機器):在 Codex 裡打 `$myna:manage setup <bot token>`(Telegram;Discord / Slack 的參數同 `/myna:setup`)。腳本要寫 `~/.myna`、起 relay,Codex 的 sandbox 每一步都會跳一次核准,照著核准即可。不想讓 token 出現在 Codex 的對話裡(跟 Claude Code 的 `/myna:setup <token>` 一樣,打在指令裡的 token 模型看得到),就先在自己的終端機跑 `node <myna>/scripts/configure.mjs <bot token>`(`<myna>` 是 Codex 的 plugin 資料夾,例如 `~/.codex/plugins/cache/mraaa711128-myna/myna/<版本>`),再在 Codex 打 `$myna:manage setup`(不帶 token),它會接著起 relay、配對。
 
 **每次升版都要重新信任 hook,也要重新核准指令**:Codex 的信任綁在整個 plugin 的內容上,只要 plugin 有任何改動(升版一定有)就變回不信任;終端機核准框的「always allow this command」綁的是含版本號的路徑,升版後也要重新核准(看路徑推的,沒實測)。重新信任之前 relay 不會被 Codex 叫起來;同一台有 Claude Code 的話,用 `/myna:service on` 開常駐就不受影響。
 
@@ -1836,7 +1836,7 @@ node ~/myna-plugin/scripts/pair.mjs                    # 有 bot、還沒配對�
    codex plugin add myna@mraaa711128-myna
    ```
 3. 在 Codex 裡打 `/hooks`,**信任** myna 的 3 個 hook(SessionStart、Stop、SessionEnd)。沒信任時 hook 不跑:relay 不會自動起來(`ask_human` 回 `unreachable`)、純文字問句不會轉手機、session 結束時不收 topic;問答本身不會壞。
-4. 第一次設定(還沒有 bot 的機器):在 Codex 裡打 `$myna:manage setup <bot token>`(Telegram;Discord / Slack 的參數同 `/myna:setup`)。腳本要寫 `~/.myna`、起 relay,Codex 的 sandbox 每一步都會跳一次核准,照著核准即可。
+4. 第一次設定(還沒有 bot 的機器):在 Codex 裡打 `$myna:manage setup <bot token>`(Telegram;Discord / Slack 的參數同 `/myna:setup`)。腳本要寫 `~/.myna`、起 relay,Codex 的 sandbox 每一步都會跳一次核准,照著核准即可。不想讓 token 出現在 Codex 的對話裡(跟 Claude Code 的 `/myna:setup <token>` 一樣,打在指令裡的 token 模型看得到),就先在自己的終端機跑 `node <myna>/scripts/configure.mjs <bot token>`(`<myna>` 是 Codex 的 plugin 資料夾,例如 `~/.codex/plugins/cache/mraaa711128-myna/myna/<版本>`),再在 Codex 打 `$myna:manage setup`(不帶 token),它會接著起 relay、配對。
 
 **每次升版都要重新信任 hook,也要重新核准指令**:Codex 的信任綁在整個 plugin 的內容上,只要 plugin 有任何改動(升版一定有)就變回不信任;終端機核准框的「always allow this command」綁的是含版本號的路徑,升版後也要重新核准(看路徑推的,沒實測)。重新信任之前 relay 不會被 Codex 叫起來;同一台有 Claude Code 的話,用 `/myna:service on` 開常駐就不受影響。
 
