@@ -34,7 +34,10 @@ let failed = 0;
 const ok = (c, m) => { console.log(`${c ? "✅" : "❌"} ${m}`); if (!c) failed++; return c; };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-const TMP = fs.mkdtempSync(path.join(os.tmpdir(), "myna-service-"));
+// realpath: on macOS os.tmpdir() is /var/folders/… (a symlink to /private/var/…), and node resolves a script's
+// own path through symlinks — a copied ensure-relay there reports its root as /private/var/…, so the roots
+// this test expects must be the resolved ones too
+const TMP = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "myna-service-")));
 const freePort = (() => { const used = new Set([7800, 7801, 7802]); return () => { for (;;) { const p = 20000 + Math.floor(Math.random() * 20000); if (!used.has(p)) { used.add(p); return p; } } }; })();
 const RP = freePort();
 const BOT = "TELEGRAM_BOT_TOKEN=123456:FAKE\nTELEGRAM_CHAT_ID=1\nTELEGRAM_API_BASE=http://127.0.0.1:9\n";
