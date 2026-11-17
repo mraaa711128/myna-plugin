@@ -726,14 +726,14 @@ Windows 為什麼是 `.vbs`:`wscript` 本身沒有主控台,`Run …, 0` 讓 nod
 - **hooks**(`codex/hooks.json`):SessionStart → `ensure-relay.mjs --host codex`;Stop → `stop-catch-question.mjs --host codex`;SessionEnd → `session-end.mjs`(timeout 3 秒,Codex 的上限)。
 - **`ensure-relay --host codex`**:啟動、換版的規則不變,只是不更新 `~/.myna/service/service.json`(Codex 跑的是 plugin 快取裡那份,升版或移除後那個資料夾不一定還在,登入啟動不能指過去)。
 - **`stop-catch-question --host codex`**:判斷、`stop_hook_active`、chat 豁免、round-end 都不變,只換 block 的文字(不提 `AskUserQuestion` 和 `mcp__…` 名稱)。讀 Claude transcript 格式的「背景工作還沒結束」判斷在 Codex 找不到東西,照常回報 round-end。
-- **`session-end.mjs`**(只有 Codex 用):Codex 結束時直接 kill MCP 程序、不關 stdin,`ask-human.mjs` 的 `endSession` 不會跑;這支用 hook 輸入的 `session_id` 打 `POST /session/close`,自己 2 秒內一定結束,relay 不在或不回都 exit 0。跟 `endSession` 不同,它不取消等待中的題目:relay 收到 close 時還有題目在等,就等最後一題答完才收 topic。
+- **`session-end.mjs`**(只有 Codex 用):Windows 上 Codex 結束時直接 kill MCP 程序、不關 stdin,`ask-human.mjs` 的 `endSession` 不會跑(macOS 不同,見下面 v0.28.0 的修訂);這支用 hook 輸入的 `session_id` 打 `POST /session/close`,自己 2 秒內一定結束,relay 不在或不回都 exit 0。跟 `endSession` 不同,它不取消等待中的題目:relay 收到 close 時還有題目在等,就等最後一題答完才收 topic。
 - **`config.mjs --host codex`**:只列、只改 `autopilot`、`stopcatch`、`hold`、`topics`(每台機器一份的設定,兩個 host 共用);其他項目回「Codex 版還沒有這個功能」、exit 1、不寫入;輸出的指令提示換成 `$myna:config`、`$myna:manage …`。
 - **設定來源**:Codex 只把一小串環境變數(不含 `MYNA_*`、`RELAY_PORT`)傳給 MCP,MCP 的設定只能寫在 `codex/mcp.json` 的 `env`;hook 和 skill 跑的 scripts 照讀 shell 的環境。第一階段只支援預設的 relay 位址和 `~/.myna/`,shell 設了覆寫就會兩邊不一致(README 寫明不要設)。hook 照讀環境變數是刻意保留的:前提驗證和測試靠它把 hook 指到測試用的 relay;真的要支援改位址時,再設計三個入口(MCP、hook、skill)一致的設定來源。
 - **skills**:`codex/skills/config`(→ `config.mjs --host codex`)、`codex/skills/manage`(setup、configure、pair、relay、status、hub/hub tree、join/join tree、machines、bind,各自跑既有的 script;`ensure-relay` 一律帶 `--host codex`)。plugin 根目錄 = `SKILL.md` 往上三層。
 
 ### 後續修訂
 
-- **v0.28.0**:上面全部。前提驗證(Windows,Codex CLI 0.166.0,用 `codex app-server` 驅動、隔離的 Codex home 和 HOME、測試用的 relay port)在 0.28.0 上重跑過 V1、V2、V3、V8、V10、V13。**沒驗證**:macOS、TUI 才看得到的畫面、daemon 模式、`codex exec`。第二階段(`request_user_input` 攔截、gate-brief／review 純文字版)和第三階段(權限轉手機、聊天,依 app-server spike)另外設計。
+- **v0.28.0**:上面全部。前提驗證(Windows,Codex CLI 0.166.0,用 `codex app-server` 驅動、隔離的 Codex home 和 HOME、測試用的 relay port)在 0.28.0 上重跑過 V1、V2、V3、V8、V10、V13。**macOS**(2026-11-17,macOS 26.6.2 arm64,Codex CLI 0.166.0,同樣用 `codex app-server`、隔離環境、Telegram stub)V1–V13 跑過一次:通過 11、部分 2,跟 Windows 不同的有三點。(1) Codex 結束時對 MCP 程序送 SIGTERM 並關 stdin,`endSession` **會**跑:等待中的題目被取消、按鈕收回(手機顯示「這題已在終端機處理」),`/session/close` 送兩次(MCP 一次、`session-end.mjs` 一次,relay 兩次都照常處理);取消是 SIGTERM 還是 Codex 先送取消通知觸發的,沒有分開驗。(2) 沒有 `node` 時的字樣是「No such file or directory (os error 2)」和「hook exited with code 127」。(3) Codex 直接 spawn MCP、hook 用非 login 非 interactive 的 shell(zsh 只讀 `~/.zshenv`),兩者只看得到 Codex 自己的 `PATH`;AI 跑的指令用 `zsh -lc`。`sandboxCwd` 是 `file:///` 加 POSIX 路徑(空白編成 `%20`,不解開 `/tmp` 這類 symlink),`fileURLToPath` 轉得對。**沒驗證**:TUI 才看得到的畫面、daemon 模式、`codex exec`、從 GitHub 名稱安裝(macOS)。第二階段(`request_user_input` 攔截、gate-brief／review 純文字版)和第三階段(權限轉手機、聊天,依 app-server spike)另外設計。
 
 ## 6. Telegram UX
 

@@ -830,7 +830,8 @@ node ~/myna-plugin/scripts/pair.mjs                    # 有 bot、還沒配對�
 
 **安裝**
 
-1. **先裝 Node.js 18+**(各 OS 的官方安裝方式)。沒有 `node` 時 Codex 只會顯示「MCP startup failed: program not found」和「hook exited with code 1」,看不出是缺 Node.js。
+1. **先裝 Node.js 18+**(各 OS 的官方安裝方式)。沒有 `node` 時 Codex 只會顯示「MCP startup failed: program not found」和「hook exited with code 1」(Windows),或「MCP startup failed: No such file or directory (os error 2)」和「hook exited with code 127」(macOS),看不出是缺 Node.js。
+   - **`node` 要在「啟動 Codex 的那個環境」的 `PATH` 裡**(macOS 實測):Codex 直接啟動 MCP(不經 shell),hook 用非 login、非 interactive 的 shell 跑(zsh 只讀 `~/.zshenv`),兩者都只看得到 Codex 自己的 `PATH`;只有 AI 跑的指令(`$myna:…`)用 login shell。所以 `node` 只在 `~/.zshrc` 裡載入(例如 nvm)的人,要從互動終端機啟動 Codex;從沒有 `node` 的環境啟動時,`$myna:manage` 的設定照樣成功,但 `ask_human` 和 hooks 都不會有。
 2. 加入 marketplace、安裝 plugin:
    ```
    codex plugin marketplace add mraaa711128/myna-plugin
@@ -858,7 +859,9 @@ AI 用的工具是 myna 的 `ask_human`、`await_human`、`detach_human`(Codex �
 - **God mode**:Codex 裡不能開關。在別處開了 God mode(Claude Code 的 `/myna:godmode`,或終端機跑 `node <myna>/scripts/godmode.mjs on|off`)之後,對 Codex session 有效的只有「帶 `approves` 的題目自動按 ✅」和它帶開的 autopilot;**Codex 自己的核准框不會自動同意**,照常出現在終端機。
 - **常駐**:只裝 Codex 的機器還不支援 `/myna:service`;Codex 開 session 時也不會改 Claude Code 設好的常駐(`~/.myna/service/service.json`)。只裝 Codex 的機器重開機後,要等第一個 Codex session 送出第一則訊息,relay 才會起來。
 - **改 relay 位址、用環境變數改設定檔位置**:只支援預設的 `127.0.0.1:7800` 和 `~/.myna/`。Codex 不把 shell 的環境變數傳給 MCP,但 hook 和 `$myna:…` 跑的 scripts 會照讀;所以跑 Codex 的 shell **不要設** `RELAY_PORT`、`MYNA_RELAY_URL`、`MYNA_ENV`、`MYNA_AUTOPILOT_FILE` 這類覆寫,否則 MCP 和 scripts 會用到不同的 relay 或不同的設定檔(例如 hook 在別的 port 起 relay,`ask_human` 還是連 7800)。
-- **Codex 關掉時還在等的題目**:會留在手機上(按鈕不收回),答完之後 topic 才收;resume 同一個 session 後可以用 `await_human` 接回(看程式推的,沒實測)。
+- **Codex 關掉時還在等的題目**:兩個 OS 實測不一樣(Codex CLI 0.166.0,`codex app-server`)。
+  - **Windows**:會留在手機上(按鈕不收回),答完之後 topic 才收;resume 同一個 session 後可以用 `await_human` 接回(看程式推的,沒實測)。
+  - **macOS**:題目會被收回(按鈕失效,手機顯示「這題已在終端機處理」,雖然其實是 Codex 關掉了),resume 後要重問。
 - 只支援 **Codex CLI 互動模式**;IDE extension、桌面 app 不支援,`codex exec` 沒測。
 - **驗證範圍**:Windows 上用 `codex app-server`(跟 TUI 同一個引擎)驗過安裝、MCP、核准、hook、`$myna:config`、`$myna:manage` 的上手;TUI 才看得到的畫面、daemon 模式、macOS 都還沒驗證。
 
