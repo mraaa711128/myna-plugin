@@ -12,3 +12,4 @@
 
 - 新增使用者可見的功能時,順手把 `README.md` 對應段落(繁中)一起更新。
 - 改了 `src/mcp/ask-human.mjs`(或它 import 的檔案)後跑 `npm run build`,把重新產生的 `dist/ask-human.mjs` 一起 commit;CI 會檢查 dist 是否與 src 同步。
+- 這個 repo 同時是 Claude Code 和 Codex CLI 的 plugin(SPEC §5.6)。改共用程式(`src/mcp/`、`scripts/`)時,Claude Code 和 Codex 兩邊的 smoke 都要跑(既有的 smoke,加上 `smoke-codex-mcp`、`smoke-host-layout`,和 `smoke-config`、`smoke-stopcatch` 的 `--host codex` 案例);Codex 的差異只能放在 `MYNA_HOST=codex`／`--host codex` 後面。升版時 `.codex-plugin/plugin.json` 的版本號一起改。

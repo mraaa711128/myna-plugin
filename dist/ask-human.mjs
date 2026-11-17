@@ -3229,8 +3229,8 @@ var require_utils = __commonJS({
       }
       return ind;
     }
-    function removeDotSegments(path2) {
-      let input = path2;
+    function removeDotSegments(path3) {
+      let input = path3;
       const output = [];
       let nextSlash = -1;
       let len = 0;
@@ -3482,8 +3482,8 @@ var require_schemes = __commonJS({
         wsComponent.secure = void 0;
       }
       if (wsComponent.resourceName) {
-        const [path2, query] = wsComponent.resourceName.split("?");
-        wsComponent.path = path2 && path2 !== "/" ? path2 : void 0;
+        const [path3, query] = wsComponent.resourceName.split("?");
+        wsComponent.path = path3 && path3 !== "/" ? path3 : void 0;
         wsComponent.query = query;
         wsComponent.resourceName = void 0;
       }
@@ -7129,10 +7129,10 @@ function mergeDefs(...defs) {
 function cloneDef(schema) {
   return mergeDefs(schema._zod.def);
 }
-function getElementAtPath(obj, path2) {
-  if (!path2)
+function getElementAtPath(obj, path3) {
+  if (!path3)
     return obj;
-  return path2.reduce((acc, key) => acc?.[key], obj);
+  return path3.reduce((acc, key) => acc?.[key], obj);
 }
 function promiseAllObject(promisesObj) {
   const keys = Object.keys(promisesObj);
@@ -7541,11 +7541,11 @@ function explicitlyAborted(x, startIndex = 0) {
   }
   return false;
 }
-function prefixIssues(path2, issues) {
+function prefixIssues(path3, issues) {
   return issues.map((iss) => {
     var _a3;
     (_a3 = iss).path ?? (_a3.path = []);
-    iss.path.unshift(path2);
+    iss.path.unshift(path3);
     return iss;
   });
 }
@@ -7692,16 +7692,16 @@ function flattenError(error2, mapper = (issue2) => issue2.message) {
 }
 function formatError(error2, mapper = (issue2) => issue2.message) {
   const fieldErrors = { _errors: [] };
-  const processError = (error3, path2 = []) => {
+  const processError = (error3, path3 = []) => {
     for (const issue2 of error3.issues) {
       if (issue2.code === "invalid_union" && issue2.errors.length) {
-        issue2.errors.map((issues) => processError({ issues }, [...path2, ...issue2.path]));
+        issue2.errors.map((issues) => processError({ issues }, [...path3, ...issue2.path]));
       } else if (issue2.code === "invalid_key") {
-        processError({ issues: issue2.issues }, [...path2, ...issue2.path]);
+        processError({ issues: issue2.issues }, [...path3, ...issue2.path]);
       } else if (issue2.code === "invalid_element") {
-        processError({ issues: issue2.issues }, [...path2, ...issue2.path]);
+        processError({ issues: issue2.issues }, [...path3, ...issue2.path]);
       } else {
-        const fullpath = [...path2, ...issue2.path];
+        const fullpath = [...path3, ...issue2.path];
         if (fullpath.length === 0) {
           fieldErrors._errors.push(mapper(issue2));
         } else {
@@ -15451,8 +15451,8 @@ var StdioServerTransport = class {
 
 // src/mcp/ask-human.mjs
 import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
+import os2 from "node:os";
+import path2 from "node:path";
 import crypto from "node:crypto";
 
 // src/providers/util.mjs
@@ -15528,14 +15528,40 @@ function validateAskArgs(a = {}) {
   return problems;
 }
 
+// src/mcp/codex.mjs
+import os from "node:os";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+var CODEX = String(process.env.MYNA_HOST || "").trim().toLowerCase() === "codex";
+var CODEX_CAPABILITIES = { tools: {}, experimental: { "codex/sandbox-state": {} } };
+function sessionFromMeta(meta2) {
+  const id = meta2?.sessionId;
+  return typeof id === "string" && id.trim() ? id.trim() : "";
+}
+function cwdFromMeta(meta2) {
+  const s = meta2?.["codex/sandbox-state"]?.sandboxCwd;
+  if (typeof s !== "string" || !s.trim()) return "";
+  let p = s.trim();
+  if (/^file:\/\//i.test(p)) {
+    try {
+      p = fileURLToPath(p);
+    } catch {
+      return "";
+    }
+  }
+  return path.win32.isAbsolute(p) || path.posix.isAbsolute(p) ? p : "";
+}
+var folderName = (p) => String(p || "").replace(/[\\/]+$/, "").split(/[\\/]/).pop() || "";
+var fallbackLogDir = () => path.join(os.homedir(), ".myna", "decisions");
+
 // src/mcp/ask-human.mjs
 var RELAY = process.env.MYNA_RELAY_URL || "http://127.0.0.1:7800";
-var AUTOPILOT_FILE = process.env.MYNA_AUTOPILOT_FILE || path.join(os.homedir(), ".myna", "autopilot");
+var AUTOPILOT_FILE = process.env.MYNA_AUTOPILOT_FILE || path2.join(os2.homedir(), ".myna", "autopilot");
 var HEARTBEAT_MS = Number(process.env.MYNA_HEARTBEAT_MS || 15e3);
 var ANSWER_POLL_MS = Number(process.env.MYNA_ANSWER_POLL_MS || 35e3);
 var log = (...a) => console.error(`[myna ${(/* @__PURE__ */ new Date()).toISOString()}]`, ...a);
 var FALLBACK_SESSION_ID = process.env.CLAUDE_CODE_SESSION_ID || crypto.randomBytes(4).toString("hex");
-var SESSIONS_FILE = path.join(process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), ".claude"), "sessions", `${process.ppid}.json`);
+var SESSIONS_FILE = path2.join(process.env.CLAUDE_CONFIG_DIR || path2.join(os2.homedir(), ".claude"), "sessions", `${process.ppid}.json`);
 function liveSessionId() {
   try {
     const s = JSON.parse(fs.readFileSync(SESSIONS_FILE, "utf8"));
@@ -15554,14 +15580,32 @@ function sessionId() {
   lastSessionId = id;
   return id;
 }
-var SESSION_BASE = process.env.MYNA_SESSION_NAME || (() => {
+var codexLastId = "";
+function codexSessionId(meta2) {
+  const id = process.env.MYNA_SESSION_ID || sessionFromMeta(meta2) || FALLBACK_SESSION_ID;
+  if (codexLastId && id !== codexLastId) log(`Codex: this process now sees session ${id} (was ${codexLastId}) \u2014 not a switch, nothing closed`);
+  codexLastId = id;
+  return id;
+}
+var sidFor = (meta2) => CODEX ? codexSessionId(meta2) : sessionId();
+var clock = () => {
   const d = /* @__PURE__ */ new Date(), two = (n) => String(n).padStart(2, "0");
-  return `${path.basename(process.cwd()) || "session"} ${two(d.getMonth() + 1)}/${two(d.getDate())} ${two(d.getHours())}:${two(d.getMinutes())}`;
-})();
+  return `${two(d.getMonth() + 1)}/${two(d.getDate())} ${two(d.getHours())}:${two(d.getMinutes())}`;
+};
+var SESSION_BASE = process.env.MYNA_SESSION_NAME || (CODEX ? "" : `${path2.basename(process.cwd()) || "session"} ${clock()}`);
+var codexBase = SESSION_BASE;
+var codexProvisional = "";
+function baseFor(meta2) {
+  if (!CODEX) return SESSION_BASE;
+  if (codexBase) return codexBase;
+  const dir = folderName(cwdFromMeta(meta2));
+  if (!dir) return codexProvisional ||= `session ${clock()}`;
+  return codexBase = `${dir} ${clock()}`;
+}
 var TICKET_RE = /\b[A-Z][A-Z0-9]+-\d+\b/;
 var ticketIn = (s) => typeof s === "string" && s.match(TICKET_RE)?.[0] || "";
 var sessionTicket = ticketIn(String(process.env.MYNA_TICKET || "").toUpperCase());
-var sessionName = () => sessionTicket ? `${sessionTicket} \xB7 ${SESSION_BASE}` : SESSION_BASE;
+var sessionName = (meta2) => sessionTicket ? `${sessionTicket} \xB7 ${baseFor(meta2)}` : baseFor(meta2);
 var currentTicket = (args) => ticketIn(String(args.ticket || "").toUpperCase()) || sessionTicket;
 var askedSessions = /* @__PURE__ */ new Set();
 var inflight = /* @__PURE__ */ new Set();
@@ -15606,11 +15650,19 @@ function recommendedIdx(args) {
   const i = (args.options || []).findIndex((o) => /\(recommended\)/i.test(o));
   return i >= 0 ? i : -1;
 }
-function logDecision(rec, logDir) {
+function codexLogDir(meta2) {
+  const cwd = cwdFromMeta(meta2);
+  if (cwd) return cwd;
+  const dir = fallbackLogDir();
+  log(`Codex: this call has no project folder (codex/sandbox-state) \u2014 decision log goes to ${dir}`);
+  fs.mkdirSync(dir, { recursive: true });
+  return dir;
+}
+function logDecision(rec, logDir, meta2) {
   try {
-    const base = logDir || process.env.MYNA_LOG_DIR || process.cwd();
-    fs.appendFileSync(path.join(base, "MYNA-DECISIONS.jsonl"), JSON.stringify(rec) + "\n");
-    const md = path.join(base, "MYNA-DECISIONS.md");
+    const base = logDir || process.env.MYNA_LOG_DIR || (CODEX ? codexLogDir(meta2) : process.cwd());
+    fs.appendFileSync(path2.join(base, "MYNA-DECISIONS.jsonl"), JSON.stringify(rec) + "\n");
+    const md = path2.join(base, "MYNA-DECISIONS.md");
     if (!fs.existsSync(md)) fs.writeFileSync(md, "# Myna decisions\n\n| time | mode | header | question | chosen |\n|---|---|---|---|---|\n");
     const cell = (s) => String(s ?? "").replace(/\|/g, "\\|").replace(/\r?\n/g, " ");
     fs.appendFileSync(md, `| ${rec.ts} | ${rec.mode} | ${cell(rec.header)} | ${cell(rec.question)} | ${cell(JSON.stringify(rec.chosen))} |
@@ -15670,10 +15722,10 @@ async function waitForAnswer(request_id, extra, progressToken) {
     clearInterval(heartbeat);
   }
 }
-var MYNA_DIR = path.dirname(process.env.MYNA_ENV || path.join(os.homedir(), ".myna", ".env"));
+var MYNA_DIR = path2.dirname(process.env.MYNA_ENV || path2.join(os2.homedir(), ".myna", ".env"));
 function envFileValue(key) {
   try {
-    const m = new RegExp(`^${key}=(.*)$`, "m").exec(fs.readFileSync(process.env.MYNA_ENV || path.join(MYNA_DIR, ".env"), "utf8"));
+    const m = new RegExp(`^${key}=(.*)$`, "m").exec(fs.readFileSync(process.env.MYNA_ENV || path2.join(MYNA_DIR, ".env"), "utf8"));
     return m ? m[1].trim() : "";
   } catch {
     return "";
@@ -15698,7 +15750,7 @@ async function messageSession(args) {
   const sid = sessionId();
   let token = "";
   try {
-    token = fs.readFileSync(path.join(MYNA_DIR, "session-tokens", String(sid).replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 128)), "utf8").trim();
+    token = fs.readFileSync(path2.join(MYNA_DIR, "session-tokens", String(sid).replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 128)), "utf8").trim();
   } catch {
   }
   if (!token) return out({ delivered: false, reason: "not_registered", error: "this session's chat is not registered with the relay (needs Claude Code 2.1.287+ and /myna:config chat on) \u2014 nothing was sent" }, true);
@@ -15711,7 +15763,7 @@ async function messageSession(args) {
     return out(e.name === "TimeoutError" ? { delivered: "unknown", error: "no answer from the relay in time \u2014 it may or may not have arrived; do not resend the same text" } : { delivered: false, reason: "relay_down", error: `the local relay does not answer (${e.cause?.code || e.message})` }, true);
   }
 }
-var mcp = new Server({ name: "myna", version: "0.1.0" }, { capabilities: { tools: {} } });
+var mcp = new Server({ name: "myna", version: "0.1.0" }, { capabilities: CODEX ? CODEX_CAPABILITIES : { tools: {} } });
 mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [{
     name: "ask_human",
@@ -15754,16 +15806,19 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
         logDir: { type: "string", description: "absolute dir to write the decision log (MYNA-DECISIONS.jsonl/.md). Defaults to cwd." }
       }
     }
-  }, ...treeOn() ? [MESSAGE_SESSION_TOOL] : []]
+  }, ...!CODEX && treeOn() ? [MESSAGE_SESSION_TOOL] : []]
+  // Codex: no chat yet, so no message_session (a later stage)
 }));
 mcp.setRequestHandler(CallToolRequestSchema, async (req, extra) => {
+  if (CODEX && req.params.name === "message_session") return toolError("message_session: Codex \u7248\u9084\u6C92\u6709 session \u4E92\u50B3\uFF08\u8981\u804A\u5929\uFF0C\u7B2C\u4E09\u968E\u6BB5\uFF09\uFF1B\u4EC0\u9EBC\u90FD\u6C92\u9001\u51FA");
   if (req.params.name === "message_session" && treeOn()) return messageSession(req.params.arguments || {});
-  if (req.params.name === "detach_human") return detachHuman(req.params.arguments || {});
+  if (req.params.name === "detach_human") return detachHuman(req.params.arguments || {}, req);
   if (req.params.name === "await_human") return awaitHuman(req.params.arguments || {}, req, extra);
   if (req.params.name !== "ask_human") throw new Error(`unknown tool: ${req.params.name}`);
   const args = req.params.arguments || {};
+  const meta2 = req.params?._meta;
   const ts = (/* @__PURE__ */ new Date()).toISOString();
-  const machine = os.hostname();
+  const machine = os2.hostname();
   const problems = validateAskArgs(args);
   if (problems.length) {
     log(`rejecting ask_human call: ${problems.join("; ")}`);
@@ -15786,7 +15841,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req, extra) => {
     const ri = recommendedIdx(args);
     if (ri >= 0 && (args.options || [])[ri] !== void 0) {
       const value = args.options[ri];
-      logDecision({ ts, answered_at: (/* @__PURE__ */ new Date()).toISOString(), machine, mode: "auto", ...args.gate ? { gate: args.gate } : {}, ...partOf(args), header: args.header, question: args.question, options: args.options, recommendedIndex: ri, chosen: value }, args.logDir);
+      logDecision({ ts, answered_at: (/* @__PURE__ */ new Date()).toISOString(), machine, mode: "auto", ...args.gate ? { gate: args.gate } : {}, ...partOf(args), header: args.header, question: args.question, options: args.options, recommendedIndex: ri, chosen: value }, args.logDir, meta2);
       log(`autopilot auto-accepted [${ri}] ${JSON.stringify(value)}`);
       return { content: [{ type: "text", text: JSON.stringify({ kind: "selection", value, auto: true }) }] };
     }
@@ -15798,11 +15853,11 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req, extra) => {
       log(`session ticket ${sessionTicket || "(none)"} \u2192 ${t} \u2014 topic will be re-labelled`);
       sessionTicket = t;
     }
-    const sid = sessionId();
+    const sid = sidFor(meta2);
     const asked = await fetchRelayJson(`${RELAY}/ask`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ ...args, session_id: sid, session_name: sessionName() })
+      body: JSON.stringify({ ...args, session_id: sid, session_name: sessionName(meta2) })
     }, 2);
     askedSessions.add(sid);
     if (asked.status === 400) {
@@ -15815,7 +15870,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req, extra) => {
     const result = await waitForAnswer(request_id, extra, req.params?._meta?.progressToken);
     const answered_at = (/* @__PURE__ */ new Date()).toISOString();
     if (result.kind === "selection") {
-      logDecision({ ts, answered_at, machine, mode: modeOf(result), ...args.gate ? { gate: args.gate } : {}, ...partOf(args), header: args.header, question: args.question, options: args.options, chosen: result.value, ...args.approves !== void 0 ? { approves: args.approves } : {} }, args.logDir);
+      logDecision({ ts, answered_at, machine, mode: modeOf(result), ...args.gate ? { gate: args.gate } : {}, ...partOf(args), header: args.header, question: args.question, options: args.options, chosen: result.value, ...args.approves !== void 0 ? { approves: args.approves } : {} }, args.logDir, meta2);
     }
     return textResult(result);
   } catch (e) {
@@ -15823,12 +15878,12 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req, extra) => {
     return textResult({ kind: "unreachable", error: e.message });
   }
 });
-async function detachHuman(args) {
+async function detachHuman(args, req) {
   const ids = args.request_id ? [String(args.request_id)] : [...inflight];
   const detached = [], failed = [];
   for (const id of ids) {
     try {
-      const { status, json } = await relayPost(`/detach/${id}`, { session_id: requestSession.get(id) || sessionId() });
+      const { status, json } = await relayPost(`/detach/${id}`, { session_id: requestSession.get(id) || sidFor(req?.params?._meta) });
       if (status === 200 && json?.detached) {
         inflight.delete(id);
         const { detached: _, answered, ...info } = json;
@@ -15843,9 +15898,10 @@ async function detachHuman(args) {
 }
 async function awaitHuman(args, req, extra) {
   const ts = (/* @__PURE__ */ new Date()).toISOString();
+  const meta2 = req.params?._meta;
   try {
     let id = args.request_id ? String(args.request_id) : "";
-    const sid = sessionId();
+    const sid = sidFor(meta2);
     if (!id) {
       const { json } = await fetchRelayJson(`${RELAY}/requests?session_id=${encodeURIComponent(sid)}`, { signal: AbortSignal.timeout(5e3) }, 2);
       const orphans = (json?.requests || []).filter((r) => r.detached || !r.attended);
@@ -15853,7 +15909,7 @@ async function awaitHuman(args, req, extra) {
       if (orphans.length > 1) return textResult({ kind: "choose", requests: orphans.map(({ request_id, gate, thread_id, header, question, created, detached }) => ({ request_id, gate, thread_id, header, question, created, detached })) });
       id = orphans[0].request_id;
     }
-    const { status, json: info } = await relayPost(`/reattach/${id}`, { session_id: sid, session_name: sessionName() });
+    const { status, json: info } = await relayPost(`/reattach/${id}`, { session_id: sid, session_name: sessionName(meta2) });
     if (status !== 200) return toolError(`await_human: could not reattach ${id} \u2014 ${info?.error || `relay answered ${status}`}`);
     askedSessions.add(sid);
     requestSession.set(id, sid);
@@ -15861,7 +15917,7 @@ async function awaitHuman(args, req, extra) {
     const result = await waitForAnswer(id, extra, req.params?._meta?.progressToken);
     const answered_at = (/* @__PURE__ */ new Date()).toISOString();
     if (result.kind === "selection") {
-      logDecision({ ts, answered_at, machine: os.hostname(), mode: modeOf(result), ...info.gate ? { gate: info.gate } : {}, header: info.header, question: info.question, options: info.options, chosen: result.value, ...info.approves !== void 0 ? { approves: info.approves } : {}, reattached: id }, args.logDir);
+      logDecision({ ts, answered_at, machine: os2.hostname(), mode: modeOf(result), ...info.gate ? { gate: info.gate } : {}, header: info.header, question: info.question, options: info.options, chosen: result.value, ...info.approves !== void 0 ? { approves: info.approves } : {}, reattached: id }, args.logDir, meta2);
     }
     return textResult({ ...result, request_id: id });
   } catch (e) {
@@ -15881,4 +15937,5 @@ process.stdin.on("end", endSession);
 process.stdin.on("close", endSession);
 for (const sig of ["SIGTERM", "SIGINT", "SIGHUP"]) process.on(sig, endSession);
 await mcp.connect(new StdioServerTransport());
-log(`myna ask_human connected (relay=${RELAY}, autopilot=${autopilotOn()}, session=${sessionId()} "${sessionName()}")`);
+if (CODEX) log(`myna ask_human connected (host=codex, relay=${RELAY}, autopilot=${autopilotOn()}, session and project folder from each call)`);
+else log(`myna ask_human connected (relay=${RELAY}, autopilot=${autopilotOn()}, session=${sessionId()} "${sessionName()}")`);

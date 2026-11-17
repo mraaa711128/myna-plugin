@@ -41,7 +41,12 @@ const ourVersion = (() => { try { return JSON.parse(fs.readFileSync(path.join(ro
 // start at this myna if it is newer (or the same version while the recorded root is gone). A separate,
 // best-effort step after the start flow on every way out: any error is one warning line, never a change
 // to what happens to the relay.
+// --host codex (codex/hooks.json's SessionStart): leave service.json alone. Codex runs this from its plugin
+// cache (~/.codex/plugins/cache/…/<version>/), which may be gone after an upgrade or an uninstall — a login
+// start pointed there would start no relay.
+const codexHost = process.argv.slice(2).some((a, i, all) => a === "--host" && String(all[i + 1]).toLowerCase() === "codex");
 function servicePointer() {
+  if (codexHost) return;
   try {
     if (updatePointer({ root, version: ourVersion }) === "updated") console.log(`myna: login start (myna service) now uses v${ourVersion} at ${root}`);
   } catch (e) { console.log(`myna: warning — could not update ~/.myna/service/service.json (${e.message}); the relay start is not affected`); }

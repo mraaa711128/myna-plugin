@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "myna": {
+      "command": "node",
+      "args": ["./dist/ask-human.mjs"],
+      "cwd": ".",
+      "env": { "MYNA_HOST": "codex" },
+      "tool_timeout_sec": 86400,
+      "tools": {
+        "ask_human": { "approval_mode": "approve" },
+        "await_human": { "approval_mode": "approve" },
+        "detach_human": { "approval_mode": "approve" }
+      }
+    }
+  }
+}
