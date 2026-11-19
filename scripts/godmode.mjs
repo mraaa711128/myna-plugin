@@ -6,11 +6,12 @@
 // The relay presses the ✅ of this machine's `approves` questions (v0.26.2). on/off also bring autopilot
 // along and back (src/godmode.mjs, "God mode brings autopilot along"); a flag file written any other way
 // (another tool creating it) turns on God mode only.
+// `session <session id> [on|off|status]` (v0.29.0, /myna:godmode-session): God mode for that one session — see sessionMode.
 import fs from "node:fs";
 import path from "node:path";
 import { loadEnv, mynaDir, roleOf } from "../src/remote.mjs";
 import { expectedProvider, tildePath } from "../src/status.mjs";
-import { godmodeFile, godmodeOn, godmodeSince, unsentSince, autopilotFile, autopilotState, autopilotMark, autopilotBefore } from "../src/godmode.mjs";
+import { godmodeFile, godmodeOn, godmodeSince, unsentSince, appendUnsent,autopilotFile, autopilotState, autopilotMark, autopilotBefore, sessionGodmodeOn, sessionGodmodeFile, sessionGodmodeSince } from "../src/godmode.mjs";
 
 const FLAG = godmodeFile();
 const AP = autopilotFile();
@@ -68,7 +69,64 @@ function writeFlag(first, before, ok) {
   }
 }
 
-if (arg === "on") {
+// /myna:godmode-session [on|off|status] (v0.29.0) — God mode for ONE session: `session <session id> [on|off|status]`.
+// commands/godmode-session.md passes ${CLAUDE_SESSION_ID} (Claude Code fills it in); the chat mod passes its own
+// session id for the phone's !myna:godmode-session. The flag is a file per session (src/godmode-session.mjs):
+// existing = on. The machine-wide flag and the machine-wide autopilot flag are never touched here — the MCP
+// server takes the session's flag as "autopilot on" for that session's own questions. A session id that is
+// missing, or still the literal placeholder, is refused: nothing is written.
+function sessionMode() {
+  const sid = String(process.argv[3] ?? "").trim();
+  const sub = (process.argv[4] || "status").toLowerCase();
+  const usage = "用法：/myna:godmode-session [on|off|status]（只管目前這個 session，不收其他參數）";
+  if (!sid || sid.includes("$") || ["on", "off", "status"].includes(sid.toLowerCase())) {
+    console.error(`拿不到這個 session 的 id（拿到的是「${sid}」），沒有改。這個 Claude Code 版本可能不會把指令裡的 \${CLAUDE_SESSION_ID} 換成 session id。`);
+    process.exit(1);
+  }
+  // two forms for the chat mod only (the phone's !myna:godmode-session, hooks/chat-mod.mjs — a mod has no file
+  // system calls of its own for these): `check` prints on / off; `unsent` keeps a notice the mod could not send
+  // (stdin: {text, reason}) in the unsent file, as the hook and the relay keep theirs
+  if (sub === "check" && process.argv.length === 5) { console.log(sessionGodmodeOn(sid) ? "on" : "off"); return; }
+  if (sub === "unsent" && process.argv.length === 5) {
+    let rec = {};
+    try { rec = JSON.parse(fs.readFileSync(0, "utf8") || "{}"); } catch {}
+    if (typeof rec?.text !== "string" || !rec.text.trim()) { console.error("unsent: stdin 要是 {text, reason}"); process.exit(1); }
+    const kept = appendUnsent({ at: new Date().toISOString(), session_id: sid, tool: "godmode-session", reason: String(rec.reason || "not sent").slice(0, 300), text: rec.text.slice(0, 2000) });
+    if (!kept) process.exit(1);
+    return;
+  }
+  if (!["on", "off", "status"].includes(sub) || process.argv.length > 5) {
+    console.error(`godmode-session 只接受 on、off 或 status（你給的是「${process.argv.slice(4).join(" ")}」），沒有改。${usage}`);
+    process.exit(1);
+  }
+  const f = sessionGodmodeFile(sid), short = sid.slice(0, 8);
+  const whole = () => (godmodeOn() ? `整台的 God mode 也開著（${when(godmodeSince())} 開的，/myna:godmode）：這台所有 session 本來就全部自動同意，關掉這個 session 的不會改變這點。` : "");
+  const out = [];
+  if (sub === "on") {
+    if (sessionGodmodeOn(sid)) out.push(`God mode 本來就開給這個 session（${short}）了（${when(sessionGodmodeSince(sid))} 開的），沒有改。關掉：/myna:godmode-session off。`);
+    else {
+      try { fs.mkdirSync(path.dirname(f), { recursive: true }); fs.writeFileSync(f, `${new Date().toISOString()}\n`); }
+      catch (e) { console.log(`God mode 沒開：${tildePath(f)} 寫不進去（${e.message}）。`); process.exit(1); }
+      out.push(`God mode 只開給這個 session（${short}）了 —— 這個 session 和它的背景 subagent 的權限確認立刻自動允許（含護欄 hook 攔下來要問的動作），帶 ✅ 核准的 ask_human 題目由 relay 直接按 ✅，有建議選項的題目自動選（只有這個 session，整台的 autopilot 沒有動），每一筆都送一則通知到 IM 的「🔓 God mode」topic。這台其他 session 照舊問你。`,
+        `session 結束（離開、/clear、/resume 換到別的 session）就自動關；手動關：/myna:godmode-session off。旗標檔：${tildePath(f)}`);
+    }
+    const w = whole(); if (w) out.push(w);
+    const note = imNote(); if (note) out.push(note);
+  } else if (sub === "off") {
+    const was = sessionGodmodeOn(sid);
+    try { fs.rmSync(f, { force: true }); } catch {}
+    if (sessionGodmodeOn(sid)) { console.log(`God mode 沒關掉：${tildePath(f)} 刪不掉，請手動刪除。`); process.exit(1); }
+    out.push(was ? `這個 session（${short}）的 God mode 關了 —— 它的權限確認和 ✅ 核准題照原本的方式處理。` : `這個 session（${short}）的 God mode 本來就沒開，沒有改。`);
+    const w = whole(); if (w) out.push(w);
+  } else {
+    out.push(sessionGodmodeOn(sid) ? `這個 session（${short}）的 God mode 開著，${when(sessionGodmodeSince(sid))} 開的（${tildePath(f)}）；session 結束就自動關` : `這個 session（${short}）的 God mode 關著`);
+    out.push(godmodeOn() ? `整台的 God mode 開著（${when(godmodeSince())} 開的）：這台所有 session 都自動同意` : "整台的 God mode 關著");
+  }
+  console.log(out.join("\n"));
+}
+
+if (arg === "session") sessionMode();
+else if (arg === "on") {
   // already on: the file (its time) is kept, so the unsent count since it was turned on stays whole
   const already = godmodeOn();
   let out;

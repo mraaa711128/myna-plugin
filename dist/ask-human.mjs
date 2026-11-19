@@ -3229,8 +3229,8 @@ var require_utils = __commonJS({
       }
       return ind;
     }
-    function removeDotSegments(path3) {
-      let input = path3;
+    function removeDotSegments(path4) {
+      let input = path4;
       const output = [];
       let nextSlash = -1;
       let len = 0;
@@ -3482,8 +3482,8 @@ var require_schemes = __commonJS({
         wsComponent.secure = void 0;
       }
       if (wsComponent.resourceName) {
-        const [path3, query] = wsComponent.resourceName.split("?");
-        wsComponent.path = path3 && path3 !== "/" ? path3 : void 0;
+        const [path4, query] = wsComponent.resourceName.split("?");
+        wsComponent.path = path4 && path4 !== "/" ? path4 : void 0;
         wsComponent.query = query;
         wsComponent.resourceName = void 0;
       }
@@ -6876,12 +6876,12 @@ var require_dist = __commonJS({
         throw new Error(`Unknown format "${name}"`);
       return f;
     };
-    function addFormats(ajv, list, fs2, exportName) {
+    function addFormats(ajv, list, fs3, exportName) {
       var _a3;
       var _b;
       (_a3 = (_b = ajv.opts.code).formats) !== null && _a3 !== void 0 ? _a3 : _b.formats = (0, codegen_1._)`require("ajv-formats/dist/formats").${exportName}`;
       for (const f of list)
-        ajv.addFormat(f, fs2[f]);
+        ajv.addFormat(f, fs3[f]);
     }
     module.exports = exports = formatsPlugin;
     Object.defineProperty(exports, "__esModule", { value: true });
@@ -7129,10 +7129,10 @@ function mergeDefs(...defs) {
 function cloneDef(schema) {
   return mergeDefs(schema._zod.def);
 }
-function getElementAtPath(obj, path3) {
-  if (!path3)
+function getElementAtPath(obj, path4) {
+  if (!path4)
     return obj;
-  return path3.reduce((acc, key) => acc?.[key], obj);
+  return path4.reduce((acc, key) => acc?.[key], obj);
 }
 function promiseAllObject(promisesObj) {
   const keys = Object.keys(promisesObj);
@@ -7541,11 +7541,11 @@ function explicitlyAborted(x, startIndex = 0) {
   }
   return false;
 }
-function prefixIssues(path3, issues) {
+function prefixIssues(path4, issues) {
   return issues.map((iss) => {
     var _a3;
     (_a3 = iss).path ?? (_a3.path = []);
-    iss.path.unshift(path3);
+    iss.path.unshift(path4);
     return iss;
   });
 }
@@ -7692,16 +7692,16 @@ function flattenError(error2, mapper = (issue2) => issue2.message) {
 }
 function formatError(error2, mapper = (issue2) => issue2.message) {
   const fieldErrors = { _errors: [] };
-  const processError = (error3, path3 = []) => {
+  const processError = (error3, path4 = []) => {
     for (const issue2 of error3.issues) {
       if (issue2.code === "invalid_union" && issue2.errors.length) {
-        issue2.errors.map((issues) => processError({ issues }, [...path3, ...issue2.path]));
+        issue2.errors.map((issues) => processError({ issues }, [...path4, ...issue2.path]));
       } else if (issue2.code === "invalid_key") {
-        processError({ issues: issue2.issues }, [...path3, ...issue2.path]);
+        processError({ issues: issue2.issues }, [...path4, ...issue2.path]);
       } else if (issue2.code === "invalid_element") {
-        processError({ issues: issue2.issues }, [...path3, ...issue2.path]);
+        processError({ issues: issue2.issues }, [...path4, ...issue2.path]);
       } else {
-        const fullpath = [...path3, ...issue2.path];
+        const fullpath = [...path4, ...issue2.path];
         if (fullpath.length === 0) {
           fieldErrors._errors.push(mapper(issue2));
         } else {
@@ -15450,9 +15450,9 @@ var StdioServerTransport = class {
 };
 
 // src/mcp/ask-human.mjs
-import fs from "node:fs";
-import os2 from "node:os";
-import path2 from "node:path";
+import fs2 from "node:fs";
+import os3 from "node:os";
+import path3 from "node:path";
 import crypto from "node:crypto";
 
 // src/providers/util.mjs
@@ -15554,17 +15554,34 @@ function cwdFromMeta(meta2) {
 var folderName = (p) => String(p || "").replace(/[\\/]+$/, "").split(/[\\/]/).pop() || "";
 var fallbackLogDir = () => path.join(os.homedir(), ".myna", "decisions");
 
+// src/godmode-session.mjs
+import fs from "node:fs";
+import os2 from "node:os";
+import path2 from "node:path";
+var godmodeSessionsDir = (env = process.env) => env.MYNA_GODMODE_SESSIONS_DIR || path2.join(os2.homedir(), ".myna", "godmode-sessions");
+var sessionFlagName = (sid) => String(sid).replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 128);
+var usable = (sid) => typeof sid === "string" && !!sid.trim();
+var sessionGodmodeFile = (sid, env = process.env) => path2.join(godmodeSessionsDir(env), sessionFlagName(String(sid).trim()));
+var sessionGodmodeOn = (sid, env = process.env) => {
+  if (!usable(sid)) return false;
+  try {
+    return fs.existsSync(sessionGodmodeFile(sid, env));
+  } catch {
+    return false;
+  }
+};
+
 // src/mcp/ask-human.mjs
 var RELAY = process.env.MYNA_RELAY_URL || "http://127.0.0.1:7800";
-var AUTOPILOT_FILE = process.env.MYNA_AUTOPILOT_FILE || path2.join(os2.homedir(), ".myna", "autopilot");
+var AUTOPILOT_FILE = process.env.MYNA_AUTOPILOT_FILE || path3.join(os3.homedir(), ".myna", "autopilot");
 var HEARTBEAT_MS = Number(process.env.MYNA_HEARTBEAT_MS || 15e3);
 var ANSWER_POLL_MS = Number(process.env.MYNA_ANSWER_POLL_MS || 35e3);
 var log = (...a) => console.error(`[myna ${(/* @__PURE__ */ new Date()).toISOString()}]`, ...a);
 var FALLBACK_SESSION_ID = process.env.CLAUDE_CODE_SESSION_ID || crypto.randomBytes(4).toString("hex");
-var SESSIONS_FILE = path2.join(process.env.CLAUDE_CONFIG_DIR || path2.join(os2.homedir(), ".claude"), "sessions", `${process.ppid}.json`);
+var SESSIONS_FILE = path3.join(process.env.CLAUDE_CONFIG_DIR || path3.join(os3.homedir(), ".claude"), "sessions", `${process.ppid}.json`);
 function liveSessionId() {
   try {
-    const s = JSON.parse(fs.readFileSync(SESSIONS_FILE, "utf8"));
+    const s = JSON.parse(fs2.readFileSync(SESSIONS_FILE, "utf8"));
     if (s?.pid === process.ppid && typeof s.sessionId === "string" && s.sessionId) return s.sessionId;
   } catch {
   }
@@ -15592,7 +15609,7 @@ var clock = () => {
   const d = /* @__PURE__ */ new Date(), two = (n) => String(n).padStart(2, "0");
   return `${two(d.getMonth() + 1)}/${two(d.getDate())} ${two(d.getHours())}:${two(d.getMinutes())}`;
 };
-var SESSION_BASE = process.env.MYNA_SESSION_NAME || (CODEX ? "" : `${path2.basename(process.cwd()) || "session"} ${clock()}`);
+var SESSION_BASE = process.env.MYNA_SESSION_NAME || (CODEX ? "" : `${path3.basename(process.cwd()) || "session"} ${clock()}`);
 var codexBase = SESSION_BASE;
 var codexProvisional = "";
 function baseFor(meta2) {
@@ -15638,13 +15655,14 @@ async function fetchRelayJson(url, opts, tries = 2, delayMs = 0) {
   throw lastErr;
 }
 var ANSWER_POLL_TRIES = Number(process.env.MYNA_ANSWER_POLL_TRIES || 8);
-var autopilotOn = () => {
+var autopilotFlag = () => {
   try {
-    return fs.existsSync(AUTOPILOT_FILE);
+    return fs2.existsSync(AUTOPILOT_FILE);
   } catch {
     return false;
   }
 };
+var autopilotOn = (meta2) => autopilotFlag() || sessionGodmodeOn(sidFor(meta2));
 function recommendedIdx(args) {
   if (Number.isInteger(args.recommendedIndex)) return args.recommendedIndex;
   const i = (args.options || []).findIndex((o) => /\(recommended\)/i.test(o));
@@ -15655,17 +15673,17 @@ function codexLogDir(meta2) {
   if (cwd) return cwd;
   const dir = fallbackLogDir();
   log(`Codex: this call has no project folder (codex/sandbox-state) \u2014 decision log goes to ${dir}`);
-  fs.mkdirSync(dir, { recursive: true });
+  fs2.mkdirSync(dir, { recursive: true });
   return dir;
 }
 function logDecision(rec, logDir, meta2) {
   try {
     const base = logDir || process.env.MYNA_LOG_DIR || (CODEX ? codexLogDir(meta2) : process.cwd());
-    fs.appendFileSync(path2.join(base, "MYNA-DECISIONS.jsonl"), JSON.stringify(rec) + "\n");
-    const md = path2.join(base, "MYNA-DECISIONS.md");
-    if (!fs.existsSync(md)) fs.writeFileSync(md, "# Myna decisions\n\n| time | mode | header | question | chosen |\n|---|---|---|---|---|\n");
+    fs2.appendFileSync(path3.join(base, "MYNA-DECISIONS.jsonl"), JSON.stringify(rec) + "\n");
+    const md = path3.join(base, "MYNA-DECISIONS.md");
+    if (!fs2.existsSync(md)) fs2.writeFileSync(md, "# Myna decisions\n\n| time | mode | header | question | chosen |\n|---|---|---|---|---|\n");
     const cell = (s) => String(s ?? "").replace(/\|/g, "\\|").replace(/\r?\n/g, " ");
-    fs.appendFileSync(md, `| ${rec.ts} | ${rec.mode} | ${cell(rec.header)} | ${cell(rec.question)} | ${cell(JSON.stringify(rec.chosen))} |
+    fs2.appendFileSync(md, `| ${rec.ts} | ${rec.mode} | ${cell(rec.header)} | ${cell(rec.question)} | ${cell(JSON.stringify(rec.chosen))} |
 `);
   } catch (e) {
     log("logDecision failed:", e.message);
@@ -15722,10 +15740,10 @@ async function waitForAnswer(request_id, extra, progressToken) {
     clearInterval(heartbeat);
   }
 }
-var MYNA_DIR = path2.dirname(process.env.MYNA_ENV || path2.join(os2.homedir(), ".myna", ".env"));
+var MYNA_DIR = path3.dirname(process.env.MYNA_ENV || path3.join(os3.homedir(), ".myna", ".env"));
 function envFileValue(key) {
   try {
-    const m = new RegExp(`^${key}=(.*)$`, "m").exec(fs.readFileSync(process.env.MYNA_ENV || path2.join(MYNA_DIR, ".env"), "utf8"));
+    const m = new RegExp(`^${key}=(.*)$`, "m").exec(fs2.readFileSync(process.env.MYNA_ENV || path3.join(MYNA_DIR, ".env"), "utf8"));
     return m ? m[1].trim() : "";
   } catch {
     return "";
@@ -15750,7 +15768,7 @@ async function messageSession(args) {
   const sid = sessionId();
   let token = "";
   try {
-    token = fs.readFileSync(path2.join(MYNA_DIR, "session-tokens", String(sid).replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 128)), "utf8").trim();
+    token = fs2.readFileSync(path3.join(MYNA_DIR, "session-tokens", String(sid).replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 128)), "utf8").trim();
   } catch {
   }
   if (!token) return out({ delivered: false, reason: "not_registered", error: "this session's chat is not registered with the relay (needs Claude Code 2.1.287+ and /myna:config chat on) \u2014 nothing was sent" }, true);
@@ -15818,7 +15836,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req, extra) => {
   const args = req.params.arguments || {};
   const meta2 = req.params?._meta;
   const ts = (/* @__PURE__ */ new Date()).toISOString();
-  const machine = os2.hostname();
+  const machine = os3.hostname();
   const problems = validateAskArgs(args);
   if (problems.length) {
     log(`rejecting ask_human call: ${problems.join("; ")}`);
@@ -15836,8 +15854,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req, extra) => {
       ].join("\n") }]
     };
   }
-  if (autopilotOn() && args.approves !== void 0) log("autopilot ON but the question carries `approves` \u2192 asking the human (only a human tap approves)");
-  else if (autopilotOn()) {
+  const auto = autopilotOn(meta2);
+  if (auto && args.approves !== void 0) log("autopilot ON but the question carries `approves` \u2192 asking the human (only a human tap approves)");
+  else if (auto) {
     const ri = recommendedIdx(args);
     if (ri >= 0 && (args.options || [])[ri] !== void 0) {
       const value = args.options[ri];
@@ -15917,7 +15936,7 @@ async function awaitHuman(args, req, extra) {
     const result = await waitForAnswer(id, extra, req.params?._meta?.progressToken);
     const answered_at = (/* @__PURE__ */ new Date()).toISOString();
     if (result.kind === "selection") {
-      logDecision({ ts, answered_at, machine: os2.hostname(), mode: modeOf(result), ...info.gate ? { gate: info.gate } : {}, header: info.header, question: info.question, options: info.options, chosen: result.value, ...info.approves !== void 0 ? { approves: info.approves } : {}, reattached: id }, args.logDir, meta2);
+      logDecision({ ts, answered_at, machine: os3.hostname(), mode: modeOf(result), ...info.gate ? { gate: info.gate } : {}, header: info.header, question: info.question, options: info.options, chosen: result.value, ...info.approves !== void 0 ? { approves: info.approves } : {}, reattached: id }, args.logDir, meta2);
     }
     return textResult({ ...result, request_id: id });
   } catch (e) {
@@ -15937,5 +15956,5 @@ process.stdin.on("end", endSession);
 process.stdin.on("close", endSession);
 for (const sig of ["SIGTERM", "SIGINT", "SIGHUP"]) process.on(sig, endSession);
 await mcp.connect(new StdioServerTransport());
-if (CODEX) log(`myna ask_human connected (host=codex, relay=${RELAY}, autopilot=${autopilotOn()}, session and project folder from each call)`);
-else log(`myna ask_human connected (relay=${RELAY}, autopilot=${autopilotOn()}, session=${sessionId()} "${sessionName()}")`);
+if (CODEX) log(`myna ask_human connected (host=codex, relay=${RELAY}, autopilot=${autopilotFlag()}, session and project folder from each call)`);
+else log(`myna ask_human connected (relay=${RELAY}, autopilot=${autopilotFlag()}, session=${sessionId()} "${sessionName()}")`);

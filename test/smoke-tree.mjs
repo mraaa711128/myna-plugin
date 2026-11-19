@@ -24,7 +24,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { projectOfRemote } from "../src/project.mjs";
 import { parseAddress, parseProxyLine } from "../src/node.mjs";
-import { peerText } from "../hooks/chat-mod.mjs";
+import { peerText, GODMODE_SESSION_KIND, GODMODE_SESSION_YES, GODMODE_SESSION_NO } from "../hooks/chat-mod.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const S = (f) => path.join(ROOT, "scripts", f);
@@ -443,6 +443,39 @@ try {
   const noBot = await (await fetch(`${C.url}/ask`, { method: "POST", body: JSON.stringify({ question: "push?", options: ["✅ 核准", "❌ 不要"], approves: "git push origin main", session_id: "s-egret" }) })).json();
   const noBotAns = await (await fetch(`${C.url}/answer/${noBot.request_id}`)).json();
   ok(noBotAns.kind === "unreachable", "a node without a bot: a question with `approves` → unreachable at once (the terminal decides)");
+
+  // "turn God mode on for this session?" (v0.29.0, kind "godmode-session" — the chat mod asks it for the phone's
+  // !myna:godmode-session on): sent to the phone in tree mode, never pressed by God mode (the machine's or the
+  // session's own), and only the bound account's ✅ answers it. The relays here share one temp HOME: its
+  // .myna/godmode and .myna/godmode-sessions/ are the flags they read.
+  {
+    const MYNA_HOME = path.join(TMP, "home", ".myna"), GS = "s-kite";
+    const godFlag = path.join(MYNA_HOME, "godmode"), sessFlag = path.join(MYNA_HOME, "godmode-sessions", GS);
+    fs.mkdirSync(path.dirname(sessFlag), { recursive: true });
+    fs.writeFileSync(godFlag, new Date().toISOString()); fs.writeFileSync(sessFlag, new Date().toISOString());
+    const askJson = async (n, body) => (await fetch(`${n.url}/ask`, { method: "POST", body: JSON.stringify(body) })).json();
+    const peek = async (n, id) => (await fetch(`${n.url}/answer/${id}`)).json();
+    // both God modes on: an ordinary ✅ question of that session is pressed here (as on a single machine)…
+    const plain = await askJson(P, { question: "tree push?", options: ["✅ 核准", "❌ 不要"], approves: "git push origin tree", session_id: GS });
+    const plainAns = await until(async () => { const j = await peek(P, plain.request_id); return j.kind !== "pending" && j; });
+    ok(plainAns?.by === "godmode", "tree mode, God mode on: an ordinary ✅ question is pressed by the relay (by godmode), as on a single machine");
+    // …the "godmode-session" question is not
+    const gq = { kind: GODMODE_SESSION_KIND, header: "🔓 God mode", question: "手機要替 session kite（s-kite）開 God mode。打字的人：Mallory。", options: [GODMODE_SESSION_YES, GODMODE_SESSION_NO], approves: `myna:godmode-session on ${GS}`, session_id: GS, session_name: "kite" };
+    const g = await askJson(P, gq);
+    const gKb = await msgWith(/手機要替 session kite/);
+    ok(!!gKb?.reply_markup && (await peek(P, g.request_id)).kind === "pending", "kind godmode-session with the machine's and the session's God mode both on → not pressed: it goes to the phone and waits");
+    const refusals = () => sent().filter((s) => /這次沒有算/.test(s.text || "")).length;
+    const r0 = refusals();
+    tap(gKb, 0, 0, 99);
+    await until(() => refusals() > r0);
+    ok(refusals() > r0 && (await peek(P, g.request_id)).kind === "pending", "…an unbound account's ✅ → not counted, the question stays");
+    tap(gKb, 0, 0, 7);
+    const gAns = await until(async () => { const j = await peek(P, g.request_id); return j.kind !== "pending" && j; });
+    ok(gAns?.kind === "selection" && gAns.value === GODMODE_SESSION_YES && !gAns.by, `…the bound account's ✅ → answered, by a human (${JSON.stringify(gAns)})`);
+    const gNoBot = await askJson(C, { ...gq, session_id: "s-egret", approves: "myna:godmode-session on s-egret" });
+    ok((await peek(C, gNoBot.request_id)).kind === "unreachable", "…on a tree node without a bot → unreachable at once");
+    fs.rmSync(godFlag, { force: true }); fs.rmSync(sessFlag, { force: true });
+  }
 
   // message_session: listed only in tree mode; sends as the session it runs in
   {

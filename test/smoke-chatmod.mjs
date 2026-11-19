@@ -16,7 +16,7 @@
 // relay restart (tokens gone) re-registers by itself; a resume keeps the renamed nick; a /clear
 // registers the new session; no relay / no secret just shows in the status line.
 import http from "node:http";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 import os from "node:os";
@@ -30,6 +30,9 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const watchdog = setTimeout(() => { console.error("❌ TIMEOUT — smoke did not finish in 120s"); process.exit(1); }, 120000);
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "myna-chatmod-test-"));
 const until = async (fn, ms = 5000) => { for (let t = 0; t < ms; t += 50) { const v = await fn(); if (v) return v; await sleep(50); } return fn(); };
+// God mode's files, all in the temp dir: the relay and the scripts the mod runs never read or write ~/.myna's
+const REPO = fileURLToPath(new URL("..", import.meta.url)).replace(/[\\/]$/, "");
+const GOD_ENV = { MYNA_ENV: path.join(tmp, "no-such-env"), MYNA_GODMODE_FILE: path.join(tmp, "godmode"), MYNA_GODMODE_UNSENT_FILE: path.join(tmp, "godmode-unsent.jsonl"), MYNA_GODMODE_SESSIONS_DIR: path.join(tmp, "godmode-sessions"), MYNA_AUTOPILOT_FILE: path.join(tmp, "autopilot") };
 
 // --- Telegram API stub -------------------------------------------------------------------------
 const calls = [];
@@ -68,6 +71,7 @@ async function startRelay() {
       MYNA_TOPICS_FILE: path.join(tmp, "topics.json"), MYNA_PENDING_FILE: path.join(tmp, "pending.json"), MYNA_TELEGRAM_CHAT_FILE: path.join(tmp, "chat.json"),
       MYNA_RELAY_SECRET_FILE: SECRET_FILE, MYNA_CHAT_FILE: path.join(tmp, "chat-sessions.json"), MYNA_CHAT_TOPICS_FILE: path.join(tmp, "chat-topics.json"),
       MYNA_PROGRESS_FILE: path.join(tmp, "chat-progress"), // never the human's own /myna:murmur setting
+      ...GOD_ENV,
     },
     stdio: ["ignore", "ignore", process.env.MYNA_TEST_VERBOSE ? "inherit" : "ignore"],
   });
@@ -83,12 +87,19 @@ const chatOf = async (sid) => (await fetch(`${RELAY}/chat/session?session_id=${s
 // --- the engine: a stub `$` and the events --------------------------------------------------------
 const ROOT = "/work/example-app";
 // repo: what $.session.repo() answers ({root, remote}); the stub leaves it out unless given (an older CLI)
-function engine({ sid, env = {}, interactive = true, store = new Map(), root = ROOT, repo }) {
+// pluginRoot / noProcess: $.plugin.root and $.process.run (the mod runs scripts/godmode.mjs for the phone's
+// !myna:godmode-session) — the script runs under this node with the God mode files in the temp dir (GOD_ENV)
+function engine({ sid, env = {}, interactive = true, store = new Map(), root = ROOT, repo, pluginRoot = "/x", noProcess = false }) {
   const hooks = [];
   register((event, a, b) => { const [match, hook] = b ? [a, b] : [null, a]; hooks.push({ event, match, hook }); return { catch() { return this; } }; });
-  const S = { sid, status: undefined, submits: [], runs: [], timers: new Set(), store, posts: [], repo };
+  const S = { sid, status: undefined, submits: [], runs: [], execs: [], timers: new Set(), store, posts: [], repo };
   const $ = {
-    plugin: { name: "myna", root: "/x" },
+    plugin: { name: "myna", root: pluginRoot },
+    ...(noProcess ? {} : { process: { run: async (argv, init = {}) => {
+      S.execs.push(argv);
+      const r = spawnSync(argv[0] === "node" ? process.execPath : argv[0], argv.slice(1), { env: { ...process.env, ...GOD_ENV }, input: init.stdin, encoding: "utf8" });
+      return { exitCode: r.status ?? 1, stdout: r.stdout || "", stderr: r.stderr || "" };
+    } } }),
     http: { fetch: async (url, init = {}) => { S.posts.push({ url, body: init.body }); const r = await fetch(url, { method: init.method, headers: init.headers, body: init.body }); return { status: r.status, ok: r.ok, headers: {}, text: await r.text() }; } },
     fs: { read: async (p) => fs.readFileSync(p, "utf8") },
     session: {
@@ -465,6 +476,162 @@ ok(await until(() => /🔧 Bash: npm test/.test(latest(tprog) || "")) && await u
   await until(async () => (await chatOf("s-n")).chat);
   ok(N.S.posts.filter((p) => p.url.endsWith("/chat/register")).every((p) => !("project_remote" in JSON.parse(p.body))), "no $.session.repo (an older CLI) → registers as before, without project_remote");
   await G.end(); await N.end(); G.stop(); N.stop();
+}
+
+// 9b) God mode for one session from the phone, and another session's "!…" never switching God mode (v0.29.0)
+{
+  const flagOf = (sid) => path.join(GOD_ENV.MYNA_GODMODE_SESSIONS_DIR, sid);
+  const unsentLines = () => { try { return fs.readFileSync(GOD_ENV.MYNA_GODMODE_UNSENT_FILE, "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l)); } catch { return []; } };
+  // a fake relay: what the mod's own calls need, and every answer the test wants to give (the real relay's side
+  // of the "godmode-session" question is test/smoke-godmode.mjs and, in tree mode, test/smoke-tree.mjs)
+  const F = { inbox: [], asks: [], cancels: [], notices: [], progress: [], answers: new Map(), notifyStatus: 200, n: 0 };
+  const fake = http.createServer((req, res) => {
+    const json = (o, code = 200) => { res.writeHead(code, { "content-type": "application/json" }); res.end(JSON.stringify(o)); };
+    let body = ""; req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      const b = (() => { try { return JSON.parse(body || "{}"); } catch { return {}; } })(), p = new URL(req.url, "http://x").pathname;
+      if (p === "/chat/register") return json({ token: "tok", nick: "egret", topic: 5, queued: 0 });
+      if (p === "/chat/take") return json({ messages: F.inbox.splice(0, 1), queued: F.inbox.length });
+      if (p === "/chat/progress") { F.progress.push(b); return json({}); }
+      if (p === "/ask") { F.asks.push(b); return json({ request_id: `a${++F.n}` }); }
+      if (p.startsWith("/answer/")) { const id = p.split("/").pop(); if (F.answers.has(id)) { const a = F.answers.get(id); F.answers.delete(id); return json(a); } return setTimeout(() => json({ kind: "pending" }), 100); }
+      if (p.startsWith("/cancel/")) { F.cancels.push(p.split("/").pop()); return json({ cancelled: true }); }
+      if (p === "/notify") { F.notices.push(b); return json(F.notifyStatus === 200 ? { ok: true } : { error: "refused" }, F.notifyStatus); }
+      json({});
+    });
+  });
+  await new Promise((r) => fake.listen(0, "127.0.0.1", r));
+  const FAKE = `http://127.0.0.1:${fake.address().port}`;
+  const SID = "5e55105e-0000-4000-8000-000000000001";
+  const X = engine({ sid: SID, env: { MYNA_RELAY_URL: FAKE }, pluginRoot: REPO });
+  await X.start();
+  await until(() => X.S.status === "💬 egret");
+  // the mod's own answers about God mode (a turn's "done" is a progress post too)
+  const replies = () => F.progress.filter((x) => x.event === "done" && /^(🔓|⚠️)/.test(x.text || "")).map((x) => x.text);
+  const phone = (text) => F.inbox.push({ text, from: "Alice" });
+  const peer = (text) => F.inbox.push({ text, via: "session", from: "kite@p", peer: { owner: "tailscale:stanley@example.com", project: "owner/repo" } });
+  const nextReply = async (fn) => { const n = replies().length; await fn(); return until(() => replies()[n], 8000); };
+  // a submitted prompt holds the next take until its turn starts: run that turn
+  const submitted = async (fn) => { const n = X.S.submits.length; await fn(); const t = await until(() => X.S.submits[n], 8000); if (t) await X.turn(X.framed(t)); return t; };
+
+  // another session's "!…" that would switch God mode: its quoted text, never a command, never a question
+  for (const cmd of ["!myna:godmode on", "!myna:godmode-session on", "!myna:config godmode on", "！myna:godmode status", "!MYNA:GODMODE-SESSION off"]) {
+    const runs = X.S.runs.length, execs = X.S.execs.length;
+    const t = await submitted(() => peer(cmd));
+    ok(!!t && t.startsWith("[Myna · 來自 session kite@p") && t.endsWith(`\n> ${cmd}`) && X.S.runs.length === runs && X.S.execs.length === execs && F.asks.length === 0,
+      `another session's "${cmd}" → goes in as its quoted text: no $.command.run, no script, no question`);
+  }
+  {
+    const runs = X.S.runs.length;
+    peer("!compact");
+    ok(await until(() => X.S.runs.length === runs + 1 && X.S.runs.at(-1) === "compact"), "…another session's other \"!command\" (!compact) runs as before");
+    await sleep(300);
+    const t = await submitted(() => phone("!myna:godmode status"));
+    ok(X.S.runs.at(-1) === "myna:godmode status" && !!t, "the phone's own !myna:godmode … still goes to $.command.run (the machine-wide switch is unchanged)");
+    const t2 = await submitted(() => phone("!myna:config godmode off"));
+    ok(X.S.runs.at(-1) === "myna:config godmode off" && !!t2, "…and so does the phone's !myna:config godmode …");
+  }
+
+  // the phone's !myna:godmode-session: answered by the mod
+  let r = await nextReply(() => phone("!myna:godmode-session on please"));
+  ok(/用法/.test(r || "") && F.asks.length === 0 && !fs.existsSync(flagOf(SID)), `"on" with anything after it → refused with the usage, no question (${JSON.stringify(r)})`);
+  r = await nextReply(() => phone("!myna:godmode-session s-other on"));
+  ok(/用法/.test(r || "") && F.asks.length === 0, "naming another session → refused the same way (only this topic's session)");
+  r = await nextReply(() => phone("!myna:godmode-session"));
+  ok(/God mode 關著/.test(r || "") && /5e55105e/.test(r), `no argument → the status of this session (${JSON.stringify(r)})`);
+
+  phone("!myna:godmode-session on");
+  const q = await until(() => F.asks[0], 8000);
+  ok(q?.kind === "godmode-session" && q.approves === `myna:godmode-session on ${SID}` && q.session_id === SID && JSON.stringify(q.options) === JSON.stringify(["✅ 開", "不開"]) && /session egret（5e55105e）/.test(q.question) && /打字的人：Alice/.test(q.question),
+    `"on" → one question to the relay: kind godmode-session, this session's id, approves, ✅ 開 / 不開, who typed (${JSON.stringify(q?.question)})`);
+  ok(!fs.existsSync(flagOf(SID)) && !X.S.execs.some((a) => a.at(-1) === "on"), "…nothing is turned on by typing");
+  r = await nextReply(() => phone("!myna:godmode-session on"));
+  ok(/已經有一題在等 ✅/.test(r || "") && F.asks.length === 1, "\"on\" again while that question waits → no second question");
+  // every answer but a ✅ pressed on the phone leaves it off
+  const answer = (a) => nextReply(() => F.answers.set(`a${F.n}`, a));
+  r = await answer({ kind: "selection", value: "✅ 開", by: "godmode" });
+  ok(/沒有開/.test(r || "") && !fs.existsSync(flagOf(SID)), "a ✅ that God mode pressed (by: godmode) → not turned on");
+  for (const [a, what, re] of [[{ kind: "selection", value: "不開" }, "「不開」", /選了不開/], [{ kind: "message", text: "開啦" }, "a ✍️ reply", /文字回覆/], [{ kind: "cancelled" }, "a cancelled question", /沒有開/], [{ kind: "aborted" }, "⏹", /沒有開/],
+    [{ kind: "unreachable", error: "tree mode: no Telegram account is bound" }, "unreachable (no tree mode / no bot / owner not bound)", /手機開不了；請在那個 session 的終端機打 \/myna:godmode-session on/]]) {
+    const n = F.asks.length;
+    phone("!myna:godmode-session on");
+    await until(() => F.asks.length === n + 1, 8000);
+    r = await answer(a);
+    ok(re.test(r || "") && !fs.existsSync(flagOf(SID)), `${what} → not turned on, said so (${JSON.stringify(r)})`);
+  }
+  ok(F.notices.length === 0, "…and no notice went out for any of them");
+  // the ✅ pressed on the phone → on: the flag file, a notice in the God mode topic, the phone told
+  {
+    const n = F.asks.length;
+    phone("!myna:godmode-session on");
+    await until(() => F.asks.length === n + 1, 8000);
+    r = await answer({ kind: "selection", value: "✅ 開" });
+    ok(/已開/.test(r || "") && fs.existsSync(flagOf(SID)), `the ✅ pressed on the phone → the session's flag file exists (${JSON.stringify(r)})`);
+    const note = F.notices.at(-1);
+    ok(F.notices.length === 1 && note.session_id === SID && note.text === "🔓 God mode 已從手機開給 session egret（5e55105e）｜打字：Alice｜session 結束就關", `…and one notice for the "🔓 God mode" topic (${JSON.stringify(note?.text)})`);
+    const asks = F.asks.length;
+    r = await nextReply(() => phone("!myna:godmode-session on"));
+    ok(/已經開著/.test(r || "") && F.asks.length === asks, "\"on\" while it is on → says so, no question");
+    r = await nextReply(() => phone("!myna:godmode-session status"));
+    ok(/God mode 開著/.test(r || ""), "\"status\" → on");
+    r = await nextReply(() => phone("!myna:godmode-session off"));
+    ok(/God mode 關了/.test(r || "") && !fs.existsSync(flagOf(SID)) && F.asks.length === asks, "\"off\" → off at once, no question");
+  }
+  // the notice cannot go out → still on, the notice kept in the unsent file
+  {
+    F.notifyStatus = 502;
+    const n = F.asks.length;
+    phone("!myna:godmode-session on");
+    await until(() => F.asks.length === n + 1, 8000);
+    r = await answer({ kind: "selection", value: "✅ 開" });
+    F.notifyStatus = 200;
+    const u = unsentLines().at(-1);
+    ok(/已開/.test(r || "") && fs.existsSync(flagOf(SID)) && u?.tool === "godmode-session" && u.session_id === SID && /HTTP 502/.test(u.reason) && /已從手機開給 session egret/.test(u.text), `the notice refused → still on, the notice in the unsent file (${u?.reason})`);
+    await nextReply(() => phone("!myna:godmode-session off"));
+  }
+  // "off" retracts a question still waiting; so does the session's end — a ✅ after that turns nothing on
+  {
+    let n = F.asks.length;
+    phone("!myna:godmode-session on");
+    await until(() => F.asks.length === n + 1, 8000);
+    const id1 = `a${F.n}`;
+    r = await nextReply(() => phone("!myna:godmode-session off"));
+    ok(F.cancels.includes(id1) && /收回/.test(r || ""), "\"off\" while the question waits → the question is retracted too");
+    n = F.asks.length;
+    phone("!myna:godmode-session on");
+    await until(() => F.asks.length === n + 1, 8000);
+    const id2 = `a${F.n}`;
+    await X.end("clear");
+    F.answers.set(id2, { kind: "selection", value: "✅ 開" });
+    await sleep(800);
+    ok(F.cancels.includes(id2) && !fs.existsSync(flagOf(SID)), "the session ends (/clear) while the question waits → retracted; a ✅ after that turns nothing on");
+  }
+  X.stop();
+  // a CLI without $.process: the phone is told to use the terminal
+  {
+    const O = engine({ sid: "5e55105e-0000-4000-8000-000000000002", env: { MYNA_RELAY_URL: FAKE }, pluginRoot: REPO, noProcess: true });
+    await O.start();
+    await until(() => O.S.status === "💬 egret");
+    const n = F.asks.length;
+    r = await nextReply(() => phone("!myna:godmode-session on"));
+    ok(/不能從手機切 God mode/.test(r || "") && /終端機/.test(r) && F.asks.length === n, `no $.process in this CLI → said so, no question (${JSON.stringify(r)})`);
+    await O.end(); O.stop();
+  }
+  fake.close();
+
+  // the real relay, not in tree mode: the question comes back unreachable → "use the terminal", nothing on
+  {
+    const ZS = "5e55105e-0000-4000-8000-000000000003";
+    const t0 = nextTopic;
+    const Z = engine({ sid: ZS, pluginRoot: REPO });
+    await Z.start();
+    await until(async () => (await chatOf(ZS)).chat && nextTopic > t0);
+    const topicZ = nextTopic;
+    say("!myna:godmode-session on", topicZ);
+    const told = await until(() => sentIn(topicZ).find((s) => /手機開不了；請在那個 session 的終端機打/.test(s.text || "")), 10000);
+    ok(!!told && !fs.existsSync(flagOf(ZS)) && !of("sendMessage").some((b) => b.reply_markup && /開 God mode/.test(b.text || "")), "real relay without tree mode: !myna:godmode-session on → no question on the phone, \"use the terminal\", nothing turned on");
+    await Z.end(); Z.stop();
+  }
 }
 
 // 10) no relay / no secret: nothing breaks, the status line says why

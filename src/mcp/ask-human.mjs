@@ -19,6 +19,7 @@ import path from "node:path";
 import crypto from "node:crypto";
 import { validateAskArgs } from "../providers/util.mjs";
 import { CODEX, CODEX_CAPABILITIES, sessionFromMeta, cwdFromMeta, folderName, fallbackLogDir } from "./codex.mjs";
+import { sessionGodmodeOn } from "../godmode-session.mjs";
 
 const RELAY = process.env.MYNA_RELAY_URL || "http://127.0.0.1:7800";
 const AUTOPILOT_FILE = process.env.MYNA_AUTOPILOT_FILE || path.join(os.homedir(), ".myna", "autopilot");
@@ -138,7 +139,11 @@ async function fetchRelayJson(url, opts, tries = 2, delayMs = 0) {
 }
 const ANSWER_POLL_TRIES = Number(process.env.MYNA_ANSWER_POLL_TRIES || 8);   // × 1s gap ≈ how long a relay may be down mid-gate
 
-const autopilotOn = () => { try { return fs.existsSync(AUTOPILOT_FILE); } catch { return false; } };
+// autopilot is on when its flag file exists — or, for this call's session only, when God mode is on for that
+// session (v0.29.0, /myna:godmode-session: God mode brings autopilot along, and the session's must not turn it
+// on for the whole machine, so the machine-wide autopilot flag is never touched for it).
+const autopilotFlag = () => { try { return fs.existsSync(AUTOPILOT_FILE); } catch { return false; } };
+const autopilotOn = (meta) => autopilotFlag() || sessionGodmodeOn(sidFor(meta));
 
 function recommendedIdx(args) {
   if (Number.isInteger(args.recommendedIndex)) return args.recommendedIndex;
@@ -367,8 +372,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req, extra) => {
   // An approval (approval attestation) only exists when ✅ is pressed at the relay — by a human on the phone, or by the
   // relay itself in God mode (v0.26.2) — an auto-accept here could never let the guarded command through, so a
   // question with `approves` always goes to the relay.
-  if (autopilotOn() && args.approves !== undefined) log("autopilot ON but the question carries `approves` → asking the human (only a human tap approves)");
-  else if (autopilotOn()) {
+  const auto = autopilotOn(meta);
+  if (auto && args.approves !== undefined) log("autopilot ON but the question carries `approves` → asking the human (only a human tap approves)");
+  else if (auto) {
     const ri = recommendedIdx(args);
     if (ri >= 0 && (args.options || [])[ri] !== undefined) {
       const value = args.options[ri];
@@ -479,5 +485,5 @@ process.stdin.on("close", endSession);
 for (const sig of ["SIGTERM", "SIGINT", "SIGHUP"]) process.on(sig, endSession);
 
 await mcp.connect(new StdioServerTransport());
-if (CODEX) log(`myna ask_human connected (host=codex, relay=${RELAY}, autopilot=${autopilotOn()}, session and project folder from each call)`);
-else log(`myna ask_human connected (relay=${RELAY}, autopilot=${autopilotOn()}, session=${sessionId()} "${sessionName()}")`);
+if (CODEX) log(`myna ask_human connected (host=codex, relay=${RELAY}, autopilot=${autopilotFlag()}, session and project folder from each call)`);
+else log(`myna ask_human connected (relay=${RELAY}, autopilot=${autopilotFlag()}, session=${sessionId()} "${sessionName()}")`);

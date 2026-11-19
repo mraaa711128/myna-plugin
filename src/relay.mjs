@@ -38,7 +38,12 @@
 //   option and no invisible/control characters in `approves`) — never for a cancel, a terminal
 //   answer, a ✍️ reply or another option. The one exception is God mode (v0.26.2): with it on, the relay
 //   presses that ✅ itself for this machine's own question (godmodeApprove) and the approval carries
-//   by:"godmode", which /attest returns too. A guard (e.g. a PreToolUse hook) then asks
+//   by:"godmode", which /attest returns too. God mode may be on for one session only (v0.29.0,
+//   /myna:godmode-session): then only that session's questions are pressed — on an edge too, where such a
+//   question stays on the edge instead of going to the hub. A question of kind "godmode-session" (the
+//   phone asking to turn it on for a session, hooks/chat-mod.mjs) is never pressed by God mode, never
+//   leaves this machine, and is asked in tree mode only (its ✅ counts from an account bound to the owner).
+//   A guard (e.g. a PreToolUse hook) then asks
 // POST /attest {command, session_id} → {approved:true, request_id, answered_at, chosen, by?} for a matching
 //   unused approval of that session no older than MYNA_APPROVAL_TTL_MS (default 15 min) — marked used in
 //   the same synchronous step, so each approval lets exactly one command through — else
@@ -76,7 +81,7 @@ import { createChat } from "./chat.mjs";
 import { createEdgeChat } from "./edge-chat.mjs";
 import { applyNetAttemptTimeout } from "./net.mjs";
 import { createNode, treeSettings, nodeFiles, JOIN_ALLOW as NODE_JOIN_ALLOW } from "./node.mjs";
-import { godmodeOn, appendUnsent } from "./godmode.mjs";
+import { godmodeOn, sessionGodmodeOn, appendUnsent } from "./godmode.mjs";
 import { lastPrivateFileProblem } from "./private-file.mjs";
 import {
   PROTOCOL, PROTOCOL_HEADER, ENROLL_SECRET_HEADER, REQUEST_ID_HEADER, VERSION_HEADER, FEATURES, LOCAL_ID, NAME_RE, CODE_RE, ASK_MAX_BYTES_DEFAULT,
@@ -238,6 +243,9 @@ const approvals = new Map();
 // approves: the command a ✅ option of this ask approves — informational only (journal, /requests,
 // detach info); an approval is recorded from the runtime-only entry.approves, never from meta
 // agent_id: set by the PermissionRequest hook when the prompt is a background subagent's (see cancelPermissions)
+// kind: "godmode-session" (v0.29.0): the phone asked to turn God mode on for one session — the chat mod's own
+// question (hooks/chat-mod.mjs), see handleAsk
+const GODMODE_SESSION_KIND = "godmode-session";
 const META_KEYS = ["gate", "thread_id", "header", "question", "options", "kind", "questionNumber", "questionTotal", "approves", "agent_id"];
 const metaOf = (args) => Object.fromEntries(META_KEYS.filter((k) => args[k] !== undefined).map((k) => [k, args[k]]));
 
@@ -381,14 +389,16 @@ const approvalExpired = (a, now = Date.now()) => { const t = Date.parse(a.answer
 // adopted from the journal (asked before a restart) records nothing even when its ✅ is tapped —
 // otherwise an edited journal could pair a button the human sees with a different command.
 // who: the IM user who pressed (Telegram passes callback_query.from). Tree mode only (M4): an important
-// button — the ✅ of an ask with `approves`, a permission prompt's allow, a join's allow — counts only when
+// button — the ✅ of an ask with `approves`, a permission prompt's allow, a join's allow, the ✅ of a
+// "godmode-session" question (by its journaled kind too: after a restart entry.approves is gone, and an
+// unbound account's ✅ must still not turn God mode on) — counts only when
 // that user is bound to this relay's owner; otherwise nothing is resolved and {refused, link?} goes back
 // to the provider (the buttons stay; it tells the human how to bind).
 function resolveFromIM(request_id, result, who) {
   if (node.active && result?.kind === "selection") {
     const q = pending.get(request_id);
     const important = node.isJoinQuestion(request_id) ? result.value === NODE_JOIN_ALLOW
-      : !!q && q.result === undefined && ((typeof q.approves === "string" && result.value === q.approveOption) || (q.meta?.kind === "permission" && isApproveOption(result.value)));
+      : !!q && q.result === undefined && ((typeof q.approves === "string" && result.value === q.approveOption) || ((q.meta?.kind === "permission" || q.meta?.kind === GODMODE_SESSION_KIND) && isApproveOption(result.value)));
     if (important) {
       const g = node.mayPress(who);
       if (!g.ok) { log(`request ${request_id}: important button pressed by ${who?.id ? `telegram:${who.id}` : "an unknown user"} — not bound to the owner, not counted`); return { refused: g.why, ...(g.link ? { link: g.link } : {}) }; }
@@ -759,6 +769,9 @@ async function handleAsk(req, res, scope, pre) {
     log("rejecting /ask (400):", problems.join("; "));
     return send(res, 400, { error: problems.join("; ") });
   }
+  // "turn God mode on for this session?" (v0.29.0): only ever a ✅ question about one session
+  const godSession = args.kind === GODMODE_SESSION_KIND;
+  if (godSession && (typeof args.approves !== "string" || typeof args.session_id !== "string" || !args.session_id)) return send(res, 400, { error: `kind "${GODMODE_SESSION_KIND}" needs \`approves\` and \`session_id\`` });
   // an edge may pick the request id (X-Myna-Request-Id, 10 hex) so it can cancel the question even when
   // this reply never reaches it; the same id again from the same machine returns that request (idempotent)
   let request_id;
@@ -794,7 +807,10 @@ async function handleAsk(req, res, scope, pre) {
   pending.set(request_id, entry);
   if (scope.remote) log(`remote ask from machine=${scope.name} (${scope.id}) → request ${request_id}${args.session_id ? ` session ${args.session_id}` : ""}`);
   // God mode (v0.26.2): this machine's question carrying `approves` gets its ✅ pressed here instead of on the phone
-  if (!scope.remote && entry.approves && entry.approveOption && args.session_id && godmodeOn(process.env)) return godmodeApprove(res, request_id, entry, args, scope);
+  // — machine-wide, or on for this session only (v0.29.0: its own flag file; a local session id has no prefix,
+  // the same id the PermissionRequest hook sees). Never the "godmode-session" question: that one asks the
+  // human whether to turn God mode on, so neither the machine's nor the session's God mode may answer it.
+  if (!godSession && !scope.remote && entry.approves && entry.approveOption && args.session_id && godmodeOn(process.env, String(args.session_id))) return godmodeApprove(res, request_id, entry, args, scope);
   // sendQuestion throws when the question/keyboard could not be delivered to the phone (after the
   // provider's own transient retries). Resolve the request as {kind:"unreachable"} so the client's
   // /answer poll returns immediately and the orchestrator falls back to the local picker — instead
@@ -804,6 +820,16 @@ async function handleAsk(req, res, scope, pre) {
   // a remote machine's /cancel waits for this send to finish (entry.sending): an edge that gave the
   // question up may cancel it while Telegram is still sending it, and only a sent message can be retracted
   entry.inFlight = true; // runtime only: see cancelPermissions
+  // the "godmode-session" question is asked on this machine's own bot in tree mode only: without tree mode
+  // there is no account bound to the owner, and anyone in the chat could press its ✅ (the tree check below
+  // then wants Telegram and a bound account). Another machine's is never asked here: the flag is a file there.
+  if (godSession && (scope.remote || !node.active)) {
+    const why = scope.remote ? "a God mode question of another machine is not asked here" : "not in tree mode: no Telegram account bound to this relay's owner can confirm it";
+    log(`request ${request_id}: God mode question for session ${args.session_id} not sent to the phone — ${why}`);
+    resolveRequest(request_id, { kind: "unreachable", error: why });
+    delete entry.inFlight; entry.lastPoll = Date.now();
+    return send(res, 200, { request_id });
+  }
   // tree mode (M4): an important question (✅ that approves a command, a permission prompt) goes to the
   // phone only when someone there can press it — the provider tells who pressed (Telegram) and an IM
   // account is bound to this relay's owner. Otherwise the asker gets unreachable at once and falls back
@@ -854,14 +880,31 @@ function godmodeApprove(res, request_id, entry, args, scope) {
   const sid = String(entry.session_id);
   const cmd = entry.approves.length > GODMODE_CMD_MAX ? `${entry.approves.slice(0, GODMODE_CMD_MAX)}…` : entry.approves;
   const label = topicMachine(scope);
-  const text = [
+  const bare = [
     `🔓 God mode 已自動按 ✅${args.gate ? `｜${oneLine(args.gate, 80)}` : ""}`,
     `題目：${oneLine(args.question, 200)}`,
     `核准的指令：${cmd}`,
     `session：${[oneLine(args.session_name, 80), sid.slice(0, 8)].filter(Boolean).join("・")}`,
-    ...(label ? [`機器：${label}`] : []),
   ].join("\n");
+  const text = label ? `${bare}\n機器：${label}` : bare;
   const unsent = (reason) => appendUnsent({ at: new Date().toISOString(), session_id: sid, tool: "ask_human", request_id, reason, text }, process.env);
+  // an edge (v0.29.0): the notice goes the way a POST /notify of this machine goes (edgeNoticeWay) — the hub's
+  // bot when it is reachable (it adds the machine name itself), this machine's own bot only when the hub
+  // surely did not send it, else the unsent file
+  if (EDGE) {
+    edgeNoticeWay(JSON.stringify({ text: bare, session_id: sid })).then((w) => {
+      if (w.sent) return log(`godmode notice for request ${request_id}: sent through the hub`);
+      if (w.maybe) { log(`godmode notice for request ${request_id}: no answer from the hub (it may have sent it) — kept in the unsent file`); return unsent("no answer from the hub (may still have been sent)"); }
+      if (w.own && typeof provider.sendNotice === "function") return Promise.resolve(provider.sendNotice(text)).then(
+        (where) => log(`godmode notice for request ${request_id}: sent on this machine's own bot${where ? ` → ${where}` : ""}`),
+        (e) => { log(`godmode notice for request ${request_id}: not sent — ${e.message}`); unsent(`${e.message}${e.maybeSent ? " (may still have been sent)" : ""}`); },
+      );
+      const why = w.r ? `the hub answered HTTP ${w.r.status}` : hub.reachable ? "the hub takes no notices (older than 0.25.0)" : `the hub is away (${hub.reason})`;
+      log(`godmode notice for request ${request_id}: not sent — ${why}${w.own ? `, and ${provider.name} cannot send notices` : ", no bot of its own"} — kept in the unsent file`);
+      unsent(why);
+    }).catch((e) => unsent(e?.message || "error"));
+    return;
+  }
   if (typeof provider.sendNotice !== "function") { log(`godmode notice for request ${request_id}: ${provider.name} cannot send notices — kept in the unsent file`); return unsent(`${provider.name} cannot send notices`); }
   Promise.resolve(provider.sendNotice(text)).then(
     (where) => log(`godmode notice for request ${request_id}: sent${where ? ` → ${where}` : ""}`),
@@ -1270,6 +1313,22 @@ function edgeWatchPoll(id, res) {
     else if (!w.held && edgePolls.get(id) === w) edgePolls.delete(id); // over (answered, cancelled, given up)
   });
 }
+// Which way a notice of this machine goes (POST /notify below; godmodeApprove's own notice since 0.29.0).
+// body: the JSON text of {text, session_id?, agent_id?}. →
+//   {sent: true, r}   the hub's bot sent it (r: its reply)
+//   {maybe: true, r?} it may have gone out at the hub — no answer from the hub (no r), or its IM gave none
+//                     (r: its 504): never a second copy
+//   {own: true, r?}   the hub surely did not send it (away, takes no notices, or answered with an error r)
+//                     and this machine has a bot of its own
+//   {r?}              no way to send it
+async function edgeNoticeWay(body) {
+  const viaHub = hub.reachable && hub.features?.includes("notify");
+  const r = viaHub ? await edgeForward({ method: "POST" }, "/notify", body, 3000) : null;
+  if (r?.ok && r.status === 200) return { sent: true, r };
+  if (r && !r.ok) return { maybe: true };
+  if (r && r.status === 504) return { maybe: true, r };
+  return { ...(ownBot.on ? { own: true } : {}), ...(r ? { r } : {}) };
+}
 async function edgeRoute(req, res, url) {
   const p = url.pathname, M = req.method;
   if ((M === "GET" && p === "/health") || (M === "POST" && p === "/shutdown") || p === "/attest") return false;
@@ -1317,6 +1376,19 @@ async function edgeRoute(req, res, url) {
   if (M === "POST" && p === "/ask") {
     const pre = await readBody(req, ASK_MAX_BYTES);
     if (pre.tooLarge) { refuseTooLarge(req, res, `request body over ${ASK_MAX_BYTES} bytes`); return true; }
+    // Two kinds of question never leave this machine (v0.29.0), whatever the hub's state — decided before any
+    // forwarding or holding, and handled like a single machine's (handleAsk):
+    //   - the "godmode-session" question (the phone asking to turn God mode on for a session): its ✅ must come
+    //     from an account bound to THIS relay's owner, and an edge is never in tree mode → unreachable at once;
+    //   - a question with `approves` of a session whose OWN God mode flag is on: its ✅ is pressed here and the
+    //     approval kept here (this machine's guard asks this relay's /attest; one recorded at the hub would
+    //     never be seen). The machine-wide flag alone changes nothing: that question goes to the hub as before.
+    {
+      const a = jsonOf(pre.body).v;
+      const here = a && typeof a === "object" && (a.kind === GODMODE_SESSION_KIND
+        || (typeof a.approves === "string" && typeof a.session_id === "string" && sessionGodmodeOn(a.session_id)));
+      if (here) { await handleAsk(req, res, LOCAL_SCOPE, pre); return true; }
+    }
     if (hub.active) {
       // the edge picks the request id (X-Myna-Request-Id): when the forward fails it still knows which
       // question the hub may have put on the phone (the reply lost in a broken link), and cancels it
@@ -1348,11 +1420,10 @@ async function edgeRoute(req, res, url) {
     // Never held (by the time a held notice went out the action would long be done; the unsent file is the record).
     const pre = await readBody(req, ASK_MAX_BYTES);
     if (pre.tooLarge) { refuseTooLarge(req, res, `request body over ${ASK_MAX_BYTES} bytes`); return true; }
-    const viaHub = hub.reachable && hub.features?.includes("notify");
-    const r = viaHub ? await edgeForward(req, "/notify", pre.body, 3000) : null;
-    if (r?.ok && r.status === 200) { relayBack(res, r); return true; }
-    if (r && !r.ok) { log("notify: no answer from the hub (it may have sent it) — not sending a second copy"); send(res, 504, { error: "no answer from the hub — the notice may have been sent there" }); return true; }
-    if (r && r.status === 504) { log("notify: the hub's IM gave no answer (it may have sent it) — not sending a second copy"); relayBack(res, r); return true; }
+    const { r, sent, maybe } = await edgeNoticeWay(pre.body);
+    if (sent) { relayBack(res, r); return true; }
+    if (maybe && !r) { log("notify: no answer from the hub (it may have sent it) — not sending a second copy"); send(res, 504, { error: "no answer from the hub — the notice may have been sent there" }); return true; }
+    if (maybe) { log("notify: the hub's IM gave no answer (it may have sent it) — not sending a second copy"); relayBack(res, r); return true; }
     if (ownBot.on) { log(`notify: ${r ? `the hub answered HTTP ${r.status}` : hub.reachable ? "the hub takes no notices (older than 0.25.0)" : `hub away (${hub.reason})`} — sending on this machine's own bot`); await handleNotify(req, res, LOCAL_SCOPE, pre); return true; }
     if (r) { relayBack(res, r); return true; }
     send(res, 503, { error: hub.reachable ? "the hub takes no notices (older than 0.25.0) and this edge has no bot of its own" : `the hub is away (${hub.reason}) and this edge has no bot of its own` }); return true;

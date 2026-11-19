@@ -70,6 +70,18 @@ export function configChatArgs(args) {
   const m = /^\s*chat(?:\s+([\s\S]*?))?\s*$/i.exec(String(args ?? ""));
   return m ? (m[1] || "").toLowerCase() : null;
 }
+// God mode's switches (v0.29.0). A "!command" another session sent (via "session", tree transport) that would
+// change God mode — !myna:godmode …, !myna:godmode-session …, !myna:config godmode … — is never run: it goes in
+// as that session's quoted text, like any other message of it. Only the human may turn God mode on.
+export function isGodmodeCommand(name, args) {
+  const n = String(name || "").toLowerCase();
+  return n === "myna:godmode" || n === "myna:godmode-session" || (n === "myna:config" && /^\s*godmode(?:\s|$)/i.test(String(args ?? "")));
+}
+// the phone's own !myna:godmode-session on: one more question on the phone, and only its ✅ turns it on
+export const GODMODE_SESSION_KIND = "godmode-session"; // as src/relay.mjs: never pressed by God mode, never forwarded, tree mode only
+export const GODMODE_SESSION_YES = "✅ 開", GODMODE_SESSION_NO = "不開";
+const GODMODE_SESSION_USAGE = "用法：!myna:godmode-session on｜off｜status（只管這個 topic 的 session，不收其他參數）";
+const GODMODE_SESSION_TERMINAL = "請在那個 session 的終端機打 /myna:godmode-session on";
 const LIMIT_NAMES = { five_hour: "5 小時額度", seven_day: "7 天額度", spend_limit: "花費上限" };
 const kTokens = (n) => (n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : n >= 1000 ? `${Math.round(n / 1000)}k` : String(n));
 const pad2 = (n) => String(n).padStart(2, "0");
@@ -400,6 +412,10 @@ export const register = (on) => {
   async function runCommand(m) {
     const [, raw, rest = ""] = PHONE_COMMAND.exec(m.text.trim());
     const name = raw.toLowerCase(), args = rest.trim();
+    // another session's message never switches God mode: its text, quoted, like the rest of what it sends
+    if (m.via === "session" && isGodmodeCommand(name, args)) return submitText([m]);
+    // the phone's !myna:godmode-session: answered here (never through $.command.run)
+    if (name === "myna:godmode-session") return godSession(m, args);
     if (USAGE_NAMES.has(name)) {
       let u = null;
       try { u = await io.usage(); } catch {}
@@ -436,9 +452,95 @@ export const register = (on) => {
     pendingCmd = { mark, name, at: now() };
   }
 
+  // --- God mode for this session, from the phone (v0.29.0) ---------------------------------------------
+  // "!myna:godmode-session on|off|status" typed in THIS session's topic. The session is the one this mod
+  // registered (no argument names another). Typing proves nothing about who typed, so `on` only asks: one
+  // question on this machine's relay (kind "godmode-session", `approves`), which the relay sends in tree mode
+  // only and whose ✅ counts only from the Telegram account bound to this machine's owner; neither God mode
+  // nor autopilot can answer it. That ✅ → the flag file (scripts/godmode.mjs session <id> on, the script the
+  // terminal's /myna:godmode-session runs) and a notice in the "🔓 God mode" topic. Anything else → not on.
+  // `off` and `status` need no ✅: turning it off only goes back to asking.
+  let godAsk = null;      // {id, sid, from, busy}: the question waiting for its ✅
+  const godScript = async (id, sub, stdin) => {
+    const r = await io.exec(["node", `${io.pluginRoot()}/scripts/godmode.mjs`, "session", id, sub], { timeoutMs: 15000, ...(stdin !== undefined ? { stdin } : {}) });
+    return { code: r?.exitCode, out: `${String(r?.stdout || "").trim()}${r?.exitCode ? `\n${String(r?.stderr || "").trim()}` : ""}`.trim() };
+  };
+  const cleanName = (s) => String(s ?? "").replace(UNSAFE_RE, " ").replace(/[<>]/g, "").replace(/\s+/g, " ").trim().slice(0, 60);
+  // the question is over without an answer wanted any more (the session ends, chat is turned off, off was typed)
+  async function dropGodAsk() {
+    const g = godAsk;
+    if (!g) return false;
+    godAsk = null;
+    try { await call(`/cancel/${g.id}`, {}); } catch {}
+    return true;
+  }
+  async function godSession(m, args) {
+    const arg = args.toLowerCase();
+    if (!["", "on", "off", "status"].includes(arg)) return replyToPhone(`🔓 沒有改。${GODMODE_SESSION_USAGE}`);
+    const id = await io.sessionId();
+    if (!sid || id !== sid) return replyToPhone("🔓 這個 session 剛換過（/clear 或 resume），沒有改；請再打一次。");
+    try {
+      if (arg === "" || arg === "status") return replyToPhone(`🔓 ${(await godScript(id, "status")).out}${godAsk ? "\n（有一題「要不要開」還在等 ✅）" : ""}`);
+      if (arg === "off") {
+        const dropped = await dropGodAsk();
+        const r = await godScript(id, "off");
+        return replyToPhone(`🔓 ${r.out}${dropped ? "\n還在等 ✅ 的那一題也收回了。" : ""}`);
+      }
+      if (godAsk) return replyToPhone("🔓 已經有一題在等 ✅ 了：要綁到這台 owner 的 Telegram 帳號按 ✅ 才會開。");
+      if ((await godScript(id, "check")).out === "on") return replyToPhone(`🔓 這個 session（${nick}）的 God mode 已經開著，沒有改。關掉：!myna:godmode-session off`);
+    } catch (x) {
+      return replyToPhone(`⚠️ 這個 Claude Code 版本不能從手機切 God mode（${String(x?.message || x || "").slice(0, 200)}）；${GODMODE_SESSION_TERMINAL.replace(" on", " on|off")}。`);
+    }
+    const from = cleanName(m.from) || "?";
+    let r;
+    try {
+      r = await call("/ask", {
+        kind: GODMODE_SESSION_KIND, header: "🔓 God mode", gate: "God mode（只開給這個 session）",
+        question: `手機要替 session ${nick}（${id.slice(0, 8)}）開 God mode：這個 session 的權限確認和 ✅ 題全部自動同意，session 結束就關。打字的人：${from}。`,
+        options: [GODMODE_SESSION_YES, GODMODE_SESSION_NO], approves: `myna:godmode-session on ${id}`,
+        session_id: id, session_name: nick,
+      });
+    } catch { return replyToPhone(`⚠️ relay 沒有回應，沒有開；${GODMODE_SESSION_TERMINAL}。`); }
+    if (r.status !== 200 || !r.request_id) return replyToPhone(`⚠️ 沒有開：relay 不收這一題（${r.status}${r.error ? `：${String(r.error).slice(0, 200)}` : ""}；relay 要 0.29.0 以上）。${GODMODE_SESSION_TERMINAL}。`);
+    godAsk = { id: String(r.request_id), sid: id, from, busy: false };
+    godPoll().catch(() => {});
+  }
+  // one held GET /answer at a time, from the poll timer; a failed one is simply tried again at the next tick
+  async function godPoll() {
+    const g = godAsk;
+    if (!g || g.busy) return;
+    g.busy = true;
+    try {
+      const r = await io.fetch(`${cfg.relay}/answer/${g.id}`, { method: "GET" });
+      if (godAsk !== g) return; // dropped meanwhile: whatever came back opens nothing
+      let a = {};
+      try { a = JSON.parse(r.text || "{}"); } catch {}
+      if (r.status === 404) { godAsk = null; return replyToPhone(`🔓 沒有開：那一題不見了（relay 重啟過？）。要開請再打一次。`); }
+      if (r.status !== 200 || !a.kind || a.kind === "pending") return;
+      godAsk = null;
+      await godAnswered(g, a);
+    } catch {} finally { g.busy = false; }
+  }
+  async function godAnswered(g, a) {
+    if (a.kind === "unreachable") return replyToPhone(`🔓 沒有開：這台沒開 tree 模式／沒有自己的 Telegram bot／owner 沒綁帳號，手機開不了；${GODMODE_SESSION_TERMINAL}。`);
+    // only a ✅ pressed on the phone: never one something pressed for the human (by), never another answer
+    if (a.kind !== "selection" || a.value !== GODMODE_SESSION_YES || a.by) return replyToPhone(a.kind === "selection" && a.value === GODMODE_SESSION_NO ? "🔓 沒有開（選了不開）。" : a.kind === "message" ? "🔓 沒有開：收到的是文字回覆，不是 ✅。" : "🔓 沒有開（那一題沒有按 ✅）。");
+    if ((await io.sessionId()) !== g.sid) return; // the session it was asked for is over
+    let r;
+    try { r = await godScript(g.sid, "on"); } catch (x) { return replyToPhone(`⚠️ 按了 ✅ 但沒有開：${String(x?.message || x || "").slice(0, 200)}；${GODMODE_SESSION_TERMINAL}。`); }
+    if (r.code !== 0) return replyToPhone(`⚠️ 按了 ✅ 但沒有開：${r.out}`);
+    const text = `🔓 God mode 已從手機開給 session ${nick}（${g.sid.slice(0, 8)}）｜打字：${g.from}｜session 結束就關`;
+    let why = "";
+    try { const n = await call("/notify", { text, session_id: g.sid }); if (n.status !== 200) why = `HTTP ${n.status}${n.error ? `: ${n.error}` : ""}${n.status === 504 ? " (may still have been sent)" : ""}`; }
+    catch (x) { why = String(x?.message || x || "error"); }
+    // a notice that could not go out is kept like every other God mode notice
+    if (why) { try { await godScript(g.sid, "unsent", JSON.stringify({ text, reason: why })); } catch {} }
+    replyToPhone(`🔓 已開：這個 session（${nick}）的權限確認和 ✅ 題全部自動同意，session 結束就關。關掉：!myna:godmode-session off`);
+  }
+
   function start() {
     if (timer || !io) return;
-    timer = io.every(POLL_MS, () => { tick().catch(() => {}); });
+    timer = io.every(POLL_MS, () => { tick().catch(() => {}); godPoll().catch(() => {}); });
     tick().catch(() => {});
   }
   function stop() { if (timer) { timer.cancel(); timer = null; } }
@@ -466,6 +568,8 @@ export const register = (on) => {
       status: (text) => $.ui.status(text),
       submit: (text) => $.prompt.submit({ text }),
       run: (a) => $.command.run(a),
+      exec: (argv, init) => $.process.run(argv, init),
+      pluginRoot: () => $.plugin.root,
       list: () => $.command.list(),
       usage: () => $.session.usage(),
       every: (ms, fn) => $.clock.every(ms, fn),
@@ -509,6 +613,7 @@ export const register = (on) => {
     // after a /clear or an in-app /resume the process goes on under another session id: keep polling,
     // the next tick registers that one; any other reason is the process going away
     if (e.reason !== "clear" && e.reason !== "resume") stop();
+    await dropGodAsk(); // "turn God mode on for this session?" still waiting: retracted — a later ✅ opens nothing
     await recordState({ ended: true, id: e.sessionId });
     mayRead.clear();
     await close();
@@ -646,7 +751,7 @@ export const register = (on) => {
       return okNow ? `💬 聊天已開啟:這個 session 在 Telegram 叫 ${nick}。` : `💬 聊天已開啟,但還連不上 relay(${unavailable}),會自動重試。`;
     }
     if (arg === "off") {
-      enabled = false; stop(); await close(); status();
+      enabled = false; stop(); await dropGodAsk(); await close(); status();
       await remember(id, { on: false });
       await recordState();
       return "💬 聊天已關閉:這個 session 不再收 Telegram 訊息,也不回報進度。";

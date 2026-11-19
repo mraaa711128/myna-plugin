@@ -14,11 +14,15 @@ import path from "node:path";
 import crypto from "node:crypto";
 import { withFileLock } from "./remote.mjs";
 import { privateTempPath, sealTemp } from "./private-file.mjs";
+import { sessionGodmodeOn, sessionGodmodeFile, sessionGodmodeSince, godmodeSessionsDir } from "./godmode-session.mjs";
 
 export const UNSENT_MAX = 200;
 export const godmodeFile = (env = process.env) => env.MYNA_GODMODE_FILE || path.join(os.homedir(), ".myna", "godmode");
 export const unsentFile = (env = process.env) => env.MYNA_GODMODE_UNSENT_FILE || path.join(os.homedir(), ".myna", "godmode-unsent.jsonl");
-export const godmodeOn = (env = process.env) => { try { return fs.existsSync(godmodeFile(env)); } catch { return false; } };
+// sid (v0.29.0): a session id — on when the machine-wide flag exists, OR that session's own flag does
+// (/myna:godmode-session, src/godmode-session.mjs). Without sid: the machine-wide flag only, as before.
+export const godmodeOn = (env = process.env, sid) => { try { if (fs.existsSync(godmodeFile(env))) return true; } catch {} return sessionGodmodeOn(sid, env); };
+export { sessionGodmodeOn, sessionGodmodeFile, sessionGodmodeSince, godmodeSessionsDir };
 
 // God mode brings autopilot along (v0.26.2; the human, 2026-11-12: "godmode on的時候就順便autopilot也是on").
 // /myna:godmode on turns autopilot on when it is off: the autopilot flag file then holds "godmode <time>" (the
