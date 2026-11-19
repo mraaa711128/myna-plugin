@@ -30,6 +30,7 @@
 // this one call only, no updatedPermissions — after a one-way notice to the IM (relay POST /notify,
 // waited for at most GODMODE_NOTIFY_MS). The notice not going out (relay down, no bot, an IM without
 // notices) still allows; its text is kept in ~/.myna/godmode-unsent.jsonl (newest 200 lines).
+// On for one session only (v0.29.0, /myna:godmode-session): the same, for the prompts of that session.
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -56,13 +57,15 @@ const abstain = () => process.exit(0); // no output → the terminal dialog deci
 process.stdout.on("error", () => {});
 
 const flagOff = () => { try { return fs.readFileSync(FLAG, "utf8").split(/\r?\n/)[0].trim() === "off"; } catch { return false; } };
-const GOD = godmodeOn();
-if (!GOD && flagOff()) abstain();
-
+// the hook input is read first (v0.29.0): God mode may be on for this session only (/myna:godmode-session —
+// the session's own flag file, src/godmode-session.mjs), and only the input says which session this is. A
+// background subagent's prompt carries the main session's session_id, so it counts with its session.
 const input = await (async () => {
   const chunks = []; try { for await (const c of process.stdin) chunks.push(c); } catch {}
   try { return JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}"); } catch { return {}; }
 })();
+const GOD = godmodeOn(process.env, typeof input.session_id === "string" ? input.session_id : undefined);
+if (!GOD && flagOff()) abstain();
 if (!input.tool_name) abstain();
 
 const post = (p, body, ms = 3000) => fetch(`${RELAY}${p}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body ?? {}), signal: AbortSignal.timeout(ms) });

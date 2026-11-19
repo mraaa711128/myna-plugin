@@ -27,6 +27,13 @@
 //      decision log says mode "godmode"
 //   9. God mode brings autopilot along (v0.26.2): on turns autopilot on when off (recorded in the flag
 //      file), off puts it back; a /myna:autopilot on|off meanwhile is left alone (and said); status shows it
+//  10. God mode for ONE session (v0.29.0, /myna:godmode-session): godmode.mjs session <id> on|off|status (no
+//      real session id → nothing written); the hook allows that session's dialogs (its subagents' too), not
+//      another session's; the relay presses that session's ✅ questions, not another's, not a remote machine's;
+//      an edge whose hub is reachable keeps such a question and presses it itself (its notice through the hub),
+//      the machine-wide flag alone still forwards; kind "godmode-session" is never pressed, never forwarded,
+//      and outside tree mode never sent; ask_human auto-accepts for that session only (no autopilot flag
+//      file); the SessionEnd hook removes that session's flag only
 import http from "node:http";
 import crypto from "node:crypto";
 import { spawn, spawnSync } from "node:child_process";
@@ -59,7 +66,7 @@ const baseEnv = (() => {
 })();
 const dirOf = (name) => { const d = path.join(TMP, name); fs.mkdirSync(d, { recursive: true }); return d; };
 const GOD = path.join(TMP, "godmode"), UNSENT = path.join(TMP, "godmode-unsent.jsonl"), PERM = path.join(TMP, "permission");
-const files = { MYNA_GODMODE_FILE: GOD, MYNA_GODMODE_UNSENT_FILE: UNSENT, MYNA_PERMISSION_FILE: PERM, MYNA_AUTOPILOT_FILE: path.join(TMP, "autopilot") };
+const files = { MYNA_GODMODE_FILE: GOD, MYNA_GODMODE_UNSENT_FILE: UNSENT, MYNA_PERMISSION_FILE: PERM, MYNA_AUTOPILOT_FILE: path.join(TMP, "autopilot"), MYNA_GODMODE_SESSIONS_DIR: path.join(TMP, "godmode-sessions") };
 
 // --- Telegram API stubs ------------------------------------------------------------------------------------
 function tgStub() {
@@ -561,6 +568,187 @@ const script = (name, args, extra = {}) => spawnSync(process.execPath, [src("scr
   ok(/^godmode /.test(read(AP) || ""), "9: /myna:config godmode on → autopilot on too");
   r = script("config.mjs", ["godmode", "off"]);
   ok(!fs.existsSync(AP) && r.status === 0, "9: /myna:config godmode off → autopilot back off");
+}
+
+// === 10. God mode for ONE session (v0.29.0, /myna:godmode-session) ===================================================
+{
+  const SDIR = files.MYNA_GODMODE_SESSIONS_DIR, AP = files.MYNA_AUTOPILOT_FILE;
+  const SA = "aaaa1111-0000-4000-8000-00000000000a", SB = "bbbb2222-0000-4000-8000-00000000000b";
+  const flag = (sid) => path.join(SDIR, sid);
+  const flags = () => { try { return fs.readdirSync(SDIR).sort(); } catch { return []; } };
+  const sess = (...a) => script("godmode.mjs", ["session", ...a]);
+  const postTo = (port) => (p, body, headers = {}) => fetch(`http://127.0.0.1:${port}${p}`, { method: "POST", headers: { "content-type": "application/json", ...headers }, body: JSON.stringify(body), signal: AbortSignal.timeout(8000) })
+    .then(async (r) => ({ status: r.status, ...(await r.json().catch(() => ({}))) }));
+  const post = postTo(H), ePost = postTo(E1);
+  const answerOf = async (port, id, headers = {}) => { for (;;) { const j = await (await fetch(`http://127.0.0.1:${port}/answer/${id}`, { headers, signal: AbortSignal.timeout(5000) })).json(); if (j.kind !== "pending") return j; } };
+  const firstAnswer = async (port, id, headers = {}) => (await fetch(`http://127.0.0.1:${port}/answer/${id}`, { headers, signal: AbortSignal.timeout(5000) })).json();
+  const pressed = (n) => hubTg.sends().slice(n).filter((m) => /God mode 已自動按 ✅/.test(m.text || ""));
+  const Q = (sid, question) => ({ question, options: ["✅ 核准執行", "❌ 先不要"], approves: "git push origin main", session_id: sid, session_name: "myproj 11/19 10:00", gate: "myproj · push" });
+  fs.rmSync(GOD, { force: true }); fs.rmSync(AP, { force: true }); fs.rmSync(UNSENT, { force: true });
+  fs.writeFileSync(PERM, "off\n"); // a session without God mode: the hook abstains at once (the normal path, perm off)
+
+  // --- the script: session <id> on / off / status; nothing written without a real session id
+  for (const [args, what] of [[[], "no session id"], [["${CLAUDE_SESSION_ID}", "on"], "the literal placeholder"], [["on"], "the id replaced by nothing (the value slid into its place)"], [["", "on"], "an empty id"], [["$CLAUDE_SESSION_ID", "on"], "an unexpanded variable"]]) {
+    const r = sess(...args);
+    ok(r.status === 1 && flags().length === 0 && /拿不到這個 session 的 id/.test(r.stderr), `10: session ${JSON.stringify(args)} (${what}) → exit 1, nothing written`);
+  }
+  let r = sess(SA, "maybe");
+  const r2 = sess(SA, "on", "extra");
+  ok(r.status === 1 && r2.status === 1 && flags().length === 0, "10: an unknown value, or anything after on → refused, nothing written");
+  r = sess(SA, "on");
+  ok(r.status === 0 && fs.existsSync(flag(SA)) && !Number.isNaN(Date.parse(fs.readFileSync(flag(SA), "utf8").trim())) && /只開給這個 session（aaaa1111）/.test(r.stdout) && !fs.existsSync(GOD) && !fs.existsSync(AP),
+    "10: session <id> on → that session's flag file (its content the time); the machine-wide flag and the autopilot flag untouched");
+  const t0 = fs.readFileSync(flag(SA), "utf8");
+  await sleep(20);
+  r = sess(SA, "on");
+  ok(r.status === 0 && /本來就開給這個 session/.test(r.stdout) && fs.readFileSync(flag(SA), "utf8") === t0, "10: on again → kept as it is, says so");
+  ok(/God mode 開著/.test(sess(SA, "status").stdout) && /整台的 God mode 關著/.test(sess(SA).stdout) && /這個 session（bbbb2222）的 God mode 關著/.test(sess(SB, "status").stdout), "10: status → on for that session, off for another, the machine-wide one off");
+  ok(sess(SA, "check").stdout.trim() === "on" && sess(SB, "check").stdout.trim() === "off", "10: check (the chat mod's) → on / off");
+  ok(/godmode 關（預設）/.test(script("status.mjs", []).stdout) && /God mode 關著/.test(script("godmode.mjs", ["status"]).stdout), "10: /myna:status and /myna:godmode status still say the machine-wide God mode is off");
+
+  // --- the permission hook: that session (its background subagent too) is allowed; another session is not
+  {
+    let n = hubTg.sends().length;
+    const a = await runHook({ ...bash("echo session-a"), session_id: SA }).done;
+    const t = hubTg.sends().slice(n).map((x) => x.text).join("\n");
+    ok(allowed(a) && /God mode 已自動同意｜myproj/.test(t) && /echo session-a/.test(t) && /・aaaa1111/.test(t), `10: the session's permission dialog → allowed, the same notice (${JSON.stringify(t.split("\n")[0])})`);
+    n = hubTg.sends().length;
+    const sub = await runHook({ ...bash("echo session-a-sub"), session_id: SA, agent_id: "sub77" }).done;
+    ok(allowed(sub) && hubTg.sends().slice(n).some((m) => /echo session-a-sub/.test(m.text) && /背景 agent sub77/.test(m.text)), "10: its background subagent's dialog (the main session's id + agent_id) → allowed too");
+    n = hubTg.sends().length;
+    const b = await runHook({ ...bash("echo session-b"), session_id: SB }).done;
+    const noSid = await runHook({ ...bash("echo no-sid"), session_id: undefined }).done;
+    ok(b.code === 0 && b.out === "" && noSid.out === "" && !hubTg.sends().slice(n).some((m) => /echo session-b|echo no-sid/.test(m.text || "")), "10: another session on the same machine (or no session id) → the normal path (perm off here: abstains), no notice");
+  }
+
+  // --- the relay: that session's ✅ question is pressed; another session's, and a remote machine's, are not
+  {
+    let n = hubTg.sends().length;
+    const a = await post("/ask", Q(SA, "session A 可以 push 嗎？"));
+    const ra = await answerOf(H, a.request_id);
+    const at = await post("/attest", { command: "git push origin main", session_id: SA });
+    ok(ra.kind === "selection" && ra.value === "✅ 核准執行" && ra.by === "godmode" && at.approved === true && at.by === "godmode" && !!(await until(() => pressed(n)[0], 5000)),
+      `10: the session's question with approves → pressed here (by godmode), /attest approves it, a notice (${JSON.stringify(ra)})`);
+    n = hubTg.sends().length;
+    const b = await post("/ask", Q(SB, "session B 可以 push 嗎？"));
+    const kb = await until(() => hubTg.sends().slice(n).find((m) => m.reply_markup && /session B 可以 push 嗎/.test(m.text || "")), 5000);
+    const rb = await firstAnswer(H, b.request_id);
+    ok(!!kb && rb.kind === "pending" && pressed(n).length === 0, "10: another session's question → goes to the phone as before, not pressed");
+    await post(`/cancel/${b.request_id}`, {});
+    // a remote machine's question whose session id happens to be the same: its ids are m:<machine>:<id> here — never pressed
+    const auth = { authorization: `Bearer ${PC4.token}` };
+    n = hubTg.sends().length;
+    const rm = await postTo(R)("/ask", Q(SA, "遠端同名 session 可以 push 嗎？"), auth);
+    const kbR = await until(() => hubTg.sends().slice(n).find((m) => m.reply_markup && /遠端同名 session/.test(m.text || "")), 5000);
+    const rr = await firstAnswer(R, rm.request_id, auth);
+    ok(rm.status === 200 && !!kbR && rr.kind === "pending" && pressed(n).length === 0, `10: a remote machine's question with the same session id → not pressed (it goes to the phone) (${rm.status}, ${rr.kind})`);
+    await postTo(R)(`/cancel/${rm.request_id}`, {}, auth);
+  }
+
+  // --- an edge whose hub is reachable: the session's ✅ question stays on the edge and is pressed there
+  {
+    await until(async () => (await health(E1))?.upstream?.active);
+    let n = hubTg.sends().length;
+    const e = await ePost("/ask", Q(SA, "子節點的 session A 可以 push 嗎？"));
+    const re = await answerOf(E1, e.request_id);
+    const note = await until(() => pressed(n).find((m) => /子節點的 session A/.test(m.text)), 5000);
+    ok(re.by === "godmode" && re.value === "✅ 核准執行" && !hubTg.sends().slice(n).some((m) => m.reply_markup), `10: an edge (hub reachable), the session's flag on → not forwarded, pressed on the edge (${JSON.stringify(re)})`);
+    ok(!!note && /\n機器：mbp$/.test(note.text) && note.message_thread_id === 901, `10: …its notice goes out on the hub's bot, with the machine name (${JSON.stringify(note?.text?.split("\n").at(-1))})`);
+    const atHub = await post("/attest", { command: "git push origin main", session_id: SA });
+    const atEdge = await ePost("/attest", { command: "git push origin main", session_id: SA });
+    ok(atHub.approved === false && atEdge.approved === true && atEdge.by === "godmode", `10: …the approval lives on the edge: its own /attest approves it, the hub's does not (${atHub.reason})`);
+    n = hubTg.sends().length;
+    const eb = await ePost("/ask", Q(SB, "子節點的 session B 可以 push 嗎？"));
+    const kbE = await until(() => hubTg.sends().slice(n).find((m) => m.reply_markup && /子節點的 session B/.test(m.text || "")), 5000);
+    ok(!!kbE && (await firstAnswer(E1, eb.request_id)).kind === "pending" && pressed(n).length === 0, "10: …another session's question on that edge → forwarded to the hub as before");
+    await ePost(`/cancel/${eb.request_id}`, {});
+    // only the machine-wide flag: an edge's question goes to the hub as before (unchanged behaviour)
+    fs.rmSync(flag(SA));
+    fs.writeFileSync(GOD, new Date().toISOString());
+    n = hubTg.sends().length;
+    const em = await ePost("/ask", Q(SA, "只有整台旗標可以 push 嗎？"));
+    const kbM = await until(() => hubTg.sends().slice(n).find((m) => m.reply_markup && /只有整台旗標/.test(m.text || "")), 5000);
+    ok(!!kbM && (await firstAnswer(E1, em.request_id)).kind === "pending" && pressed(n).length === 0, "10: …only the machine-wide flag on → the edge's question still goes to the hub, not pressed (as before 0.29.0)");
+    await ePost(`/cancel/${em.request_id}`, {});
+    // the edge's notice with no way out (hub away, no bot of its own) → the unsent file
+    fs.writeFileSync(flag(SA), new Date().toISOString());
+    fs.rmSync(GOD);
+    const e3 = await postTo(E3)("/ask", Q(SA, "沒有路可以送通知"));
+    const r3 = await answerOf(E3, e3.request_id);
+    const u3 = await until(() => unsent().find((x) => /沒有路可以送通知/.test(x.text || "")), 5000);
+    ok(r3.by === "godmode" && u3?.tool === "ask_human" && /hub is away/.test(u3.reason || ""), `10: an edge with its hub away and no bot → still pressed there, the notice in the unsent file (${u3?.reason})`);
+    const e2 = await postTo(E2)("/ask", Q(SA, "用自己的 bot 送通知"));
+    const r2b = await answerOf(E2, e2.request_id);
+    ok(r2b.by === "godmode" && !!(await until(() => pc2Tg.sends().find((m) => /God mode 已自動按 ✅/.test(m.text || "") && /用自己的 bot 送通知/.test(m.text)), 5000)), "10: an edge with its hub away and a bot of its own → pressed there, the notice on its own bot");
+  }
+
+  // --- the "godmode-session" question (the phone asking to turn it on): never pressed, never forwarded,
+  //     and outside tree mode never sent (the tree side is test/smoke-tree.mjs)
+  {
+    fs.writeFileSync(GOD, new Date().toISOString()); // the machine-wide God mode AND the session's own are both on
+    const GQ = { kind: "godmode-session", question: "手機要替 session egret 開 God mode", options: ["✅ 開", "不開"], approves: `myna:godmode-session on ${SA}`, session_id: SA, session_name: "egret" };
+    let n = hubTg.sends().length;
+    const g = await post("/ask", GQ);
+    const rg = await answerOf(H, g.request_id);
+    const at = await post("/attest", { command: GQ.approves, session_id: SA });
+    ok(g.status === 200 && rg.kind === "unreachable" && !rg.by && at.approved === false && hubTg.sends().length === n, `10: kind "godmode-session" with both God modes on, not in tree mode → unreachable at once: not pressed, not sent, nothing approved (${JSON.stringify(rg)})`);
+    const ge = await ePost("/ask", GQ);
+    const rge = await answerOf(E1, ge.request_id);
+    ok(rge.kind === "unreachable" && hubTg.sends().length === n, "10: …on an edge whose hub is reachable → not forwarded to the hub, unreachable there too");
+    const auth = { authorization: `Bearer ${PC4.token}` };
+    const gr = await postTo(R)("/ask", GQ, auth);
+    const rgr = gr.request_id ? await answerOf(R, gr.request_id, auth) : gr;
+    ok(rgr.kind === "unreachable" && hubTg.sends().length === n, "10: …sent to a hub by another machine → not asked there (unreachable)");
+    const bad1 = await post("/ask", { ...GQ, approves: undefined, options: ["開", "不開"] }), bad2 = await post("/ask", { ...GQ, session_id: undefined });
+    ok(bad1.status === 400 && bad2.status === 400, "10: …without approves or without a session id → 400");
+    fs.rmSync(GOD);
+  }
+
+  // --- autopilot comes along for that session only (the MCP server), the machine-wide autopilot flag untouched
+  {
+    const LOGDIR = dirOf("decisions-session");
+    const { Client } = await import("@modelcontextprotocol/sdk/client/index.js");
+    const { StdioClientTransport } = await import("@modelcontextprotocol/sdk/client/stdio.js");
+    const mcp = async (sid, relayUrl) => {
+      const transport = new StdioClientTransport({ command: process.execPath, args: [src("dist", "ask-human.mjs")], stderr: "ignore",
+        env: { ...baseEnv, ...files, MYNA_RELAY_URL: relayUrl, MYNA_LOG_DIR: LOGDIR, MYNA_SESSION_ID: sid, MYNA_SESSION_NAME: "myproj mcp", MYNA_TICKET: "" } });
+      const c = new Client({ name: "godmode-session-smoke", version: "0" }, { capabilities: {} });
+      await c.connect(transport);
+      return c;
+    };
+    const askArgs = { question: "用哪個方案？", options: ["A 方案", "B 方案"], recommendedIndex: 1, gate: "myproj · plan", logDir: LOGDIR };
+    const parse = (res) => { try { return JSON.parse(res.content[0].text); } catch { return null; } };
+    const ca = await mcp(SA, "http://127.0.0.1:9");
+    const ga = parse(await ca.callTool({ name: "ask_human", arguments: askArgs }, undefined, { timeout: 20000 }));
+    const dec = (() => { try { return fs.readFileSync(path.join(LOGDIR, "MYNA-DECISIONS.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l)).at(-1); } catch { return null; } })();
+    ok(ga?.kind === "selection" && ga.value === "B 方案" && ga.auto === true && dec?.mode === "auto" && !fs.existsSync(AP), `10: ask_human in that session → the recommended option, logged as autopilot's ("auto"); no autopilot flag file appeared (${JSON.stringify(ga)})`);
+    await ca.close();
+    const cb = await mcp(SB, "http://127.0.0.1:9"); // its relay is a dead port: not auto-answered → unreachable
+    const gb = parse(await cb.callTool({ name: "ask_human", arguments: askArgs }, undefined, { timeout: 30000 }));
+    ok(gb?.kind === "unreachable" && !gb.auto, `10: ask_human in another session → not auto-answered (here: its relay is down → ${gb?.kind})`);
+    await cb.close();
+  }
+
+  // --- SessionEnd: the ending session's flag goes, another session's stays
+  {
+    const end = (stdin) => spawnSync(process.execPath, [src("scripts", "godmode-session-end.mjs")], { env: { ...baseEnv, ...files }, input: stdin, encoding: "utf8" });
+    sess(SB, "on");
+    let e = end(JSON.stringify({ hook_event_name: "SessionEnd", session_id: SA, reason: "clear" }));
+    ok(e.status === 0 && e.stdout === "" && e.stderr === "" && !fs.existsSync(flag(SA)) && fs.existsSync(flag(SB)), "10: SessionEnd (/clear) of the session → its flag is gone, another session's stays; no output");
+    const after = await runHook({ ...bash("echo after-end"), session_id: SA }).done;
+    ok(after.out === "", "10: …and its next permission dialog is asked as usual");
+    e = end("not json"); const e2 = end(JSON.stringify({ reason: "other" })); const e3 = end(JSON.stringify({ session_id: "never-on" }));
+    ok([e, e2, e3].every((x) => x.status === 0 && x.stdout === "" && x.stderr === "") && fs.existsSync(flag(SB)), "10: SessionEnd with bad input, no session id, or a session never turned on → exit 0, silent, nothing else removed");
+    const hooksJson = JSON.parse(fs.readFileSync(src("hooks", "hooks.json"), "utf8"));
+    ok(/godmode-session-end\.mjs/.test(hooksJson.hooks.SessionEnd?.[0]?.hooks?.[0]?.command || ""), "10: hooks/hooks.json runs it at SessionEnd");
+    const cmd = fs.readFileSync(src("commands", "godmode-session.md"), "utf8");
+    ok(/^disable-model-invocation: true$/m.test(cmd) && cmd.includes('scripts/godmode.mjs" session ${CLAUDE_SESSION_ID} $ARGUMENTS'), "10: commands/godmode-session.md: not for the model to invoke, passes ${CLAUDE_SESSION_ID}");
+    r = sess(SB, "off");
+    ok(r.status === 0 && !fs.existsSync(flag(SB)) && /God mode 關了/.test(r.stdout) && /本來就沒開/.test(sess(SB, "off").stdout), "10: session <id> off → the flag is gone; off again says it was not on");
+    // the chat mod's `unsent`: a notice it could not send is kept like the others
+    const u = spawnSync(process.execPath, [src("scripts", "godmode.mjs"), "session", SB, "unsent"], { env: { ...baseEnv, ...files, MYNA_ENV: path.join(TMP, "no-such-env") }, input: JSON.stringify({ text: "🔓 God mode 已從手機開給 session egret", reason: "HTTP 502" }), encoding: "utf8" });
+    ok(u.status === 0 && unsent().some((x) => x.tool === "godmode-session" && x.session_id === SB && x.reason === "HTTP 502"), "10: session <id> unsent (stdin {text, reason}) → kept in the unsent file");
+  }
 }
 
 clearTimeout(watchdog);

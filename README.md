@@ -483,7 +483,7 @@ session：example-app 11/12 14:03・3f9a1c2e
 
 - **順便打開 autopilot(v0.26.2):** `/myna:godmode on` 時 autopilot 原本關著就一起打開(帶 `recommendedIndex` 的題目自動選建議選項,照 autopilot 原本的方式記進 `MYNA-DECISIONS`,`mode: "auto"`);`/myna:godmode off` 時還原成開之前的狀態:原本開著就保持開著,原本關著就關掉。God mode 開著時你另外用 `/myna:autopilot on|off` 切過,就以你最後的操作為準,`off` 不動它、輸出寫一行說明。`/myna:godmode` 和 `/myna:status` 會顯示 autopilot 現在是不是 God mode 帶開的。0.26.2 以前就開著的 God mode,升級後不會自己帶動 autopilot,再跑一次 `/myna:godmode on` 就會補上(開啟時間不變)。
 - **誰回答哪種題目:** 帶 `approves` 的 ✅ 核准題 → God mode 自動按(autopilot 本來就碰不到這種題目);有 `recommendedIndex` 的一般題 → autopilot 選建議選項;兩者都沒有的一般題 → 照舊問你。
-- **範圍是整台機器:** 這台所有 session、背景 subagent 都算,關掉前一直有效(重開機也還在),沒有時限。多台機器各自開關(每台讀自己的 `~/.myna/godmode`)。
+- **範圍是整台機器:** 這台所有 session、背景 subagent 都算,關掉前一直有效(重開機也還在),沒有時限。多台機器各自開關(每台讀自己的 `~/.myna/godmode`)。只想開給一個 session:見下面[只開給一個 session](#只開給一個-sessionmynagodmode-sessionv0290)。
 - **包含別的工具攔下來要問人的動作:** 例如護欄 hook(PreToolUse 回 `ask`)跳出的確認框,也會被自動允許。`settings.json` 的 `permissions.deny` 規則和 hook 直接回 `deny` 的動作**照樣擋住**(Claude Code 規定 hook 的允許蓋不過 deny),也不會有確認框。
 - **只允許那一次,不寫永久規則**(不帶 `updatedPermissions`)。關掉之後一切照舊。
 - **`AskUserQuestion` 和一般選擇題不算:** `AskUserQuestion` 是問題、不是權限,照舊交給 intercept / autopilot。`ask_human` **不帶 `approves`** 的選擇題也照舊送手機,由你或 autopilot 回答,God mode 不代答(autopilot 是另一個開關,兩個互不影響)。
@@ -496,6 +496,30 @@ session：example-app 11/12 14:03・3f9a1c2e
 - **風險:** 開了之後,AI(包括背景 worker)可以不經過你做收不回來的事(push、merge、刪除、寄信……),你只會在事後收到通知;同一個帳號下的任何程式建一個檔就能打開它。**任何會發 `approves` 題目的 agent,在 God mode 下都會直接拿到核准**,護欄(例如靠 `/attest` 放行的那種)會照樣放行它要的那一行指令。只在你要的時候開,用完就關。
 
 **旗標檔的對外約定**(給其他工具讀,例如護欄):路徑是環境變數 `MYNA_GODMODE_FILE`,沒設就是 `~/.myna/godmode`;**檔案存在就是開**,內容(第一行是開啟的時間,v0.26.2 起第二行記 autopilot 原本的狀態)只給 myna 自己用,其他工具不要依賴。之後的版本不會改這兩點。別的工具直接建這個檔只會開 God mode,不會帶動 autopilot(帶動是 `/myna:godmode` 做的)。
+
+### 只開給一個 session(`/myna:godmode-session`,v0.29.0)
+
+只想讓**某一個 session** 放手做、這台其他 session 照舊問你時,用這個。整台的 `/myna:godmode` 不變,兩個開關各自獨立;整台的開著時所有 session 都算,這個開關沒有影響。
+
+```
+/myna:godmode-session on       # 在那個 session 的終端機打:只開給這個 session
+/myna:godmode-session off      # 關
+/myna:godmode-session          # 查狀態:這個 session 開了沒、整台的開了沒
+```
+
+- **開了之後(只有這個 session 和它的背景 subagent):** 權限確認立刻自動允許、帶 `approves` 的 ✅ 題由 relay 自動按、有 `recommendedIndex` 的題目自動選建議選項(記成 `mode: "auto"`;**整台的 autopilot 開關不動**)。每一筆照舊送到「🔓 God mode」topic,通知格式不變(本來就寫了 session 和 id 前 8 碼)。
+- **哪些算同一個 session:** 用的是 Claude Code 的 session id。背景 subagent(Agent tool 叫出來的)跟主 session 同一個 id,一起算;另外開的 Claude Code(另一個終端機、`claude -p`)不算;`/clear` 之後是新的 session,沒開。
+- **session 結束就自動關:** 離開、`/clear`、`/resume` 換到別的 session 都會關(SessionEnd hook),之後 `--resume` 回來要重開。當掉的 session 沒機會關,會留下旗標檔:直接刪掉 `~/.myna/godmode-sessions/` 裡那個檔就好(檔名是 session id)。
+- **多台機器:** 每台讀自己的 `~/.myna/godmode-sessions/`。**連著主節點的子節點**上,這個 session 帶 `approves` 的 ✅ 題不轉給主節點,在子節點自己按 ✅、記在子節點的核准裡(子節點的護欄問的是子節點自己的 `/attest`),通知照舊轉給主節點的 bot(送不出去就記在子節點的 unsent 檔)。只開整台 God mode 的子節點行為不變(✅ 題照舊轉給主節點)。
+- **從手機開(要再按一次 ✅):** 在**那個 session 自己的聊天 topic** 打 `!myna:godmode-session on`,myna 送一題「要替 session <暱稱> 開 God mode 嗎」,**只有綁到這台 owner 的 Telegram 帳號按 ✅ 才會開**(打字的人是誰不核對,題目會寫出來);開了之後在「🔓 God mode」topic 留一則紀錄。這一題 God mode 和 autopilot 都不會代按,也不會轉給主節點。**只在 [tree 模式](#不同機器的-session-互傳訊息tree-模式第-0-批v0260)、這台有自己的 Telegram bot、owner 綁了帳號(`!bind`)時能用**;其他情況回一句「請在那個 session 的終端機打 `/myna:godmode-session on`」,不會開。只認那個 topic 的 session,不能指定別的 session。`!myna:godmode-session off` 直接關(不用 ✅)、`!myna:godmode-session status` 看狀態。需要 Claude Code 2.1.287 以上(聊天模組)。
+- **別的 session 不能替它開:** 別的 session(包括別台機器的)用 `message_session` 傳來的 `!myna:godmode …`、`!myna:godmode-session …`、`!myna:config godmode …` 不會被執行,只當成一般訊息引用交給 session。你自己在手機打的 `!myna:godmode on|off`(整台)不變。
+- **模型不能自己叫這個指令**(`disable-model-invocation`);指令說明也寫明只在你剛要求時才開。
+- **擋不住的(照實說):** 同一個 OS 帳號下的程式(包括 agent 自己用 Bash)都能直接建那個旗標檔,跟整台的旗標檔一樣,只能事後從通知發現。
+- **收過別的 owner 訊息的 session 照樣自動同意:** God mode(整台或這個 session 的)開著就是全部同意,不另外排除。
+- **Codex CLI:** 這個指令只有 Claude Code 有,Codex session 不會被開。
+- **沒在真機驗證**(v0.29.0,只跑過自動化測試):Claude Code 會不會把 plugin 指令裡的 `${CLAUDE_SESSION_ID}` 換成 session id(不會的話指令會拒絕、什麼都不寫)、`disable-model-invocation` 對 plugin 指令有沒有效、SessionEnd 在 `/clear` 和 app 內 `/resume` 帶的是不是結束的那個 id、真的 Telegram 上手機開的那一題。
+
+這個旗標檔是 myna 自己用的,**不是對外約定**(其他工具不要讀);位置可以用 `MYNA_GODMODE_SESSIONS_DIR` 改。
 
 ---
 
@@ -885,6 +909,7 @@ AI 用的工具是 myna 的 `ask_human`、`await_human`、`detach_human`(Codex �
 | `/myna:relay [start\|stop\|restart\|status]` | 手動控制 relay daemon(平常自動起);`restart` = 強制重起成目前 plugin 版本的 relay,**同版本也會重起**(升級後、改 `.env` 後用;等待中的題目經 journal 交接) |
 | `/myna:service [on\|off\|status]` | [常駐](#常駐登入後自動啟動-relay不用開-claude-codev0270):登入後自動啟動 relay(macOS LaunchAgent、Windows「啟動」資料夾、Linux `systemd --user`);`off` 只拿掉登記、不停正在跑的 relay;不帶參數 = 看狀態。沒有 Claude Code 時是 `node <myna>/scripts/service.mjs …`(v0.27.0) |
 | `/myna:godmode [on\|off\|status]` | [God mode](#god-mode權限確認和核准題全部自動同意只通知v0250):這台的權限確認和帶 `approves` 的 ✅ 題目全部自動同意,每一筆送一則通知到「🔓 God mode」topic(✅ 題目和 topic:v0.26.2);不帶參數 = 查狀態和漏送幾則(同 `/myna:config godmode …`)(v0.25.0) |
+| `/myna:godmode-session [on\|off\|status]` | [God mode 只開給這個 session](#只開給一個-sessionmynagodmode-sessionv0290):這個 session(和它的背景 subagent)的權限確認和 ✅ 題目自動同意,這台其他 session 照舊;session 結束就關;手機在那個 session 的 topic 打 `!myna:godmode-session on` 要再按一次 ✅(v0.29.0) |
 | `/myna:autopilot [on\|off]` | 別名,改用 `/myna:config autopilot …`:切換自動採用建議 |
 | `/myna:intercept [on\|off]` | 別名,改用 `/myna:config intercept …`:切換全域攔截 `AskUserQuestion`(轉手機);**預設開** |
 | `/myna:stopcatch [on\|off]` | 別名,改用 `/myna:config stopcatch …`:切換 stop-catch(純文字問句收尾轉手機);**預設開** |
@@ -915,6 +940,7 @@ AI 用的工具是 myna 的 `ask_human`、`await_human`、`detach_human`(Codex �
 | `~/.myna/chat-state/<session>.json` | 每個 session 的聊天開關(chat mod 寫,`/myna:config` 列出;已結束的 session 在列清單時刪掉)(v0.24.0) |
 | `~/.myna/autopilot` | flag 檔;存在=autopilot 開 |
 | `~/.myna/godmode` | flag 檔;**存在=God mode 開**(第一行是開啟的時間;v0.26.2 起第二行 `autopilot-before: on\|off`);位置可用 `MYNA_GODMODE_FILE` 改。其他工具可以讀(對外約定只有「路徑」和「存在就是開」)(v0.25.0) |
+| `~/.myna/godmode-sessions/<session id>` | 只開給一個 session 的 God mode(`/myna:godmode-session`):每個 session 一個檔,**存在=那個 session 開著**(內容是開啟的時間);session 結束時自動刪掉,當掉留下的檔可以直接刪;myna 自己用,不是對外約定;位置可用 `MYNA_GODMODE_SESSIONS_DIR` 改(v0.29.0) |
 | `~/.myna/godmode-unsent.jsonl` | God mode 送不出去的通知(每行一筆:時間、session、工具、原因、通知全文;權限 0600,只留最近 200 行;好幾個 session 同時寫、等不到檔案鎖時先寫在旁邊的 `godmode-unsent.jsonl.<時間>-<pid>-<亂數>.spool`,下一次寫入時併回來;原因寫 `may still have been sent` 的是逾時或沒回應,其實可能已經送到);位置可用 `MYNA_GODMODE_UNSENT_FILE` 改(v0.25.0) |
 | `~/.myna/intercept` | flag 檔;**無檔(或首行≠`off`)=攔截開(預設)**,首行 `off`=關 |
 | `~/.myna/permission` | flag 檔;**無檔(或首行≠`off`)=權限確認轉手機開(預設)**,首行 `off`=關 |
@@ -1000,7 +1026,7 @@ node scripts/service.mjs on                    # 選配:登入後自動啟動 re
 - `claude --plugin-dir <myna-plugin 路徑>` 起互動 session 載入 plugin(或把 repo 放進某目錄的 `.claude/skills/` 當 skills-dir plugin,免 marketplace)。
 - 改了 **`src/mcp/ask-human.mjs`** 後跑 **`npm run build`** 重生 `dist/ask-human.mjs`(plugin 執行的是 bundled 版,不是 src)。
 - **CI 會擋 stale dist**(rebuild 後有 diff 即 fail)+ 對 src 與 dist 各跑 autopilot smoke。想本機自動重 build,啟用一次 pre-commit hook:`git config core.hooksPath .githooks`。
- 上):檔案和照片存進 inbox、session 拿到本機路徑和不受信任標示、惡意檔名不會變成路徑、超過 20 MB 擋下且不留檔、找不到 session / 不支援的類型 / 下載失敗都回一句固定的原因、`/myna:files`、存新檔前清掉舊檔、慢下載不擋文字、chat mod 只讓 session 不經確認讀交付過的那個檔(其他情況維持 Claude Code 原本的決定)、bot token 不在 log 和回覆裡;`node test/smoke-edge-files.mjs` 驗**別台機器上的 session**(主節點 + tunnel stub + edge):那台抓一份到自己的 inbox、抓檔失敗重試且只交付一次、順序不變、一直壞的檔 3 次後放棄、主節點斷線和重啟不掉檔、`GET /chat/file` 只拿得到自己那台那個 session 的檔、舊版 edge 收到升級提示;`node test/smoke-config.mjs` 驗 **`/myna:config`**(v0.24.0;暫存 HOME、假 relay、隨機 port):每個開關跟直接跑舊指令的 script 寫出一樣的檔案、印出一樣的輸出,不合法的值什麼都不跑;`topics`、`perm-delay` 寫進 `.env`(值先驗證、不合法時檔案不動、同一個 key 的每一行都取代、CRLF 和註解不動、環境變數蓋過時會說);清單每項一行、標來源、不寫檔案;chat mod 的 `/myna:config chat on|off` 跟 `/myna:chat` 一樣、其他項目交給 markdown 指令;`node test/smoke-godmode.mjs` 驗 **God mode**(v0.25.0;真 `PermissionRequest` hook + 真 relay + Telegram stub,暫存 HOME、隨機 port):開著時立刻允許(只允許那一次)、通知送到「🔓 God mode」topic(沒有按鈕,寫專案、工具、指令、說明、session、背景 agent、機器;同時兩則只建一個 topic、relay 重啟沿用、換聊天室另開、session 結束不刪、被刪掉重建一次、建不起來或 `TELEGRAM_TOPICS=off` 退回主畫面並記 relay.log、10 分鐘內不再試)、帶 `approves` 的題目自動按 ✅(不送手機、`/attest` 只能用一次並帶 `by: "godmode"`、決定紀錄 `mode: "godmode"`、通知送出;不帶 `approves` 的題目和 God mode 關著時照舊送手機)、on／off 帶動和還原 autopilot(期間手動切過就不動它)、`/myna:perm off` 不影響、`AskUserQuestion` 不算;relay 沒在跑 / Telegram 拒絕 / Telegram 太慢(5 秒)/ Discord 不支援通知時照樣允許並寫進 unsent 檔(只留 200 行);`/notify` 沒有文字 400、遠端沒有 token 401;子節點轉給主節點(加機器名)、主節點連不上用自己的 bot、都沒有就記 unsent;關掉後照舊問手機;`/myna:godmode`、`/myna:config godmode` 寫同一個旗標檔,`/myna:status` 只算這次開啟之後漏送的筆數。`node test/smoke-service.mjs` 驗 **`/myna:service`**(v0.27.0;真 relay + 假 bot token,暫存 HOME、隨機 port;`launchctl`/`systemctl` 一律換成 `test/helpers/fake-service-os.mjs`、`APPDATA` 指到暫存資料夾,用 `MYNA_SERVICE_PLATFORM` 在任何機器上輪流扮三種 OS,不會真的登記):`on` 寫出固定的 start.mjs 和 `service.json`、各 OS 的登記檔和指令參數(node 絕對路徑、路徑有空白和 `&`;Windows 的 `.vbs` 是 UTF-16、隱藏視窗,`status` 檢查內容)、relay 起來;連跑兩次 `on`(macOS 先 bootout 再 bootstrap、`on` 不自己再跑 start.mjs);`off` 拿掉登記、刪 `~/.myna/service/`、relay 還在跑,本來沒登記也 exit 0,OS 指令失敗時不刪檔、exit 非零;`status` 各種狀態;start.mjs 在 myna 路徑不見、`service.json` 壞掉、沒設定時在 relay.log 寫一行,`on` 當下的 `MYNA_ENV` 在登入時照樣用;`ensure-relay` 只在自己較新(或同版、記的路徑不見)時改指向、不倒退、不碰別的 `.env` 的、壞掉 / 寫不進去 / 兩個同時跑只警告且 relay 照樣起來。`test/chat-mod-read.test.ts` 用 Claude Code 的 `claude plugin test` 跑同一個 `tool.check`,`test/chat-mod-config.test.ts` 用它驗 `/myna:config` 的非 chat 項目原樣交給下層的 markdown 指令、手機的 `!myna:config chat off` 由 mod 回答(兩支都要裝 Claude Code CLI,不在 CI)。以上皆無需真 bot、全進 CI(daemon 用假 `.env`)。`test/smoke-relay*.mjs` 是需要真 bot 的互動測試(provider 依 `~/.myna/.env`,三平台都能用它做真機驗證)。
+ 上):檔案和照片存進 inbox、session 拿到本機路徑和不受信任標示、惡意檔名不會變成路徑、超過 20 MB 擋下且不留檔、找不到 session / 不支援的類型 / 下載失敗都回一句固定的原因、`/myna:files`、存新檔前清掉舊檔、慢下載不擋文字、chat mod 只讓 session 不經確認讀交付過的那個檔(其他情況維持 Claude Code 原本的決定)、bot token 不在 log 和回覆裡;`node test/smoke-edge-files.mjs` 驗**別台機器上的 session**(主節點 + tunnel stub + edge):那台抓一份到自己的 inbox、抓檔失敗重試且只交付一次、順序不變、一直壞的檔 3 次後放棄、主節點斷線和重啟不掉檔、`GET /chat/file` 只拿得到自己那台那個 session 的檔、舊版 edge 收到升級提示;`node test/smoke-config.mjs` 驗 **`/myna:config`**(v0.24.0;暫存 HOME、假 relay、隨機 port):每個開關跟直接跑舊指令的 script 寫出一樣的檔案、印出一樣的輸出,不合法的值什麼都不跑;`topics`、`perm-delay` 寫進 `.env`(值先驗證、不合法時檔案不動、同一個 key 的每一行都取代、CRLF 和註解不動、環境變數蓋過時會說);清單每項一行、標來源、不寫檔案;chat mod 的 `/myna:config chat on|off` 跟 `/myna:chat` 一樣、其他項目交給 markdown 指令;`node test/smoke-godmode.mjs` 驗 **God mode**(v0.25.0;真 `PermissionRequest` hook + 真 relay + Telegram stub,暫存 HOME、隨機 port):開著時立刻允許(只允許那一次)、通知送到「🔓 God mode」topic(沒有按鈕,寫專案、工具、指令、說明、session、背景 agent、機器;同時兩則只建一個 topic、relay 重啟沿用、換聊天室另開、session 結束不刪、被刪掉重建一次、建不起來或 `TELEGRAM_TOPICS=off` 退回主畫面並記 relay.log、10 分鐘內不再試)、帶 `approves` 的題目自動按 ✅(不送手機、`/attest` 只能用一次並帶 `by: "godmode"`、決定紀錄 `mode: "godmode"`、通知送出;不帶 `approves` 的題目和 God mode 關著時照舊送手機)、on／off 帶動和還原 autopilot(期間手動切過就不動它)、`/myna:perm off` 不影響、`AskUserQuestion` 不算;只開給一個 session(v0.29.0:那個 session 和它的 subagent 自動同意、別的 session 和遠端機器的題目不算、子節點自己按 ✅、SessionEnd 自動關、手機開的那一題不會被自動按也不轉給主節點;chat mod 和 tree 的部分在 `smoke-chatmod`、`smoke-tree`);relay 沒在跑 / Telegram 拒絕 / Telegram 太慢(5 秒)/ Discord 不支援通知時照樣允許並寫進 unsent 檔(只留 200 行);`/notify` 沒有文字 400、遠端沒有 token 401;子節點轉給主節點(加機器名)、主節點連不上用自己的 bot、都沒有就記 unsent;關掉後照舊問手機;`/myna:godmode`、`/myna:config godmode` 寫同一個旗標檔,`/myna:status` 只算這次開啟之後漏送的筆數。`node test/smoke-service.mjs` 驗 **`/myna:service`**(v0.27.0;真 relay + 假 bot token,暫存 HOME、隨機 port;`launchctl`/`systemctl` 一律換成 `test/helpers/fake-service-os.mjs`、`APPDATA` 指到暫存資料夾,用 `MYNA_SERVICE_PLATFORM` 在任何機器上輪流扮三種 OS,不會真的登記):`on` 寫出固定的 start.mjs 和 `service.json`、各 OS 的登記檔和指令參數(node 絕對路徑、路徑有空白和 `&`;Windows 的 `.vbs` 是 UTF-16、隱藏視窗,`status` 檢查內容)、relay 起來;連跑兩次 `on`(macOS 先 bootout 再 bootstrap、`on` 不自己再跑 start.mjs);`off` 拿掉登記、刪 `~/.myna/service/`、relay 還在跑,本來沒登記也 exit 0,OS 指令失敗時不刪檔、exit 非零;`status` 各種狀態;start.mjs 在 myna 路徑不見、`service.json` 壞掉、沒設定時在 relay.log 寫一行,`on` 當下的 `MYNA_ENV` 在登入時照樣用;`ensure-relay` 只在自己較新(或同版、記的路徑不見)時改指向、不倒退、不碰別的 `.env` 的、壞掉 / 寫不進去 / 兩個同時跑只警告且 relay 照樣起來。`test/chat-mod-read.test.ts` 用 Claude Code 的 `claude plugin test` 跑同一個 `tool.check`,`test/chat-mod-config.test.ts` 用它驗 `/myna:config` 的非 chat 項目原樣交給下層的 markdown 指令、手機的 `!myna:config chat off` 由 mod 回答(兩支都要裝 Claude Code CLI,不在 CI)。以上皆無需真 bot、全進 CI(daemon 用假 `.env`)。`test/smoke-relay*.mjs` 是需要真 bot 的互動測試(provider 依 `~/.myna/.env`,三平台都能用它做真機驗證)。
 
 ---
 
