@@ -97,6 +97,7 @@ function engine({ sid, env = {}, interactive = true, store = new Map(), root = R
     plugin: { name: "myna", root: pluginRoot },
     ...(noProcess ? {} : { process: { run: async (argv, init = {}) => {
       S.execs.push(argv);
+      if (S.slowOn && argv.at(-1) === "on") await sleep(S.slowOn); // a slow start of the script: room for a session end
       const r = spawnSync(argv[0] === "node" ? process.execPath : argv[0], argv.slice(1), { env: { ...process.env, ...GOD_ENV }, input: init.stdin, encoding: "utf8" });
       return { exitCode: r.status ?? 1, stdout: r.stdout || "", stderr: r.stderr || "" };
     } } }),
@@ -607,6 +608,23 @@ ok(await until(() => /🔧 Bash: npm test/.test(latest(tprog) || "")) && await u
     ok(F.cancels.includes(id2) && !fs.existsSync(flagOf(SID)), "the session ends (/clear) while the question waits → retracted; a ✅ after that turns nothing on");
   }
   X.stop();
+  // the ✅ and the session's end at the same moment: the flag is written while the session ends → taken back
+  {
+    const YS = "5e55105e-0000-4000-8000-000000000004";
+    const Y = engine({ sid: YS, env: { MYNA_RELAY_URL: FAKE }, pluginRoot: REPO });
+    await Y.start();
+    await until(() => Y.S.status === "💬 egret");
+    const n = F.asks.length, notices = F.notices.length;
+    phone("!myna:godmode-session on");
+    await until(() => F.asks.length === n + 1, 8000);
+    Y.S.slowOn = 700;
+    F.answers.set(`a${F.n}`, { kind: "selection", value: "✅ 開" });
+    await until(() => Y.S.execs.some((a) => a.at(-1) === "on"), 8000); // the mod is acting on the ✅ now
+    await Y.end("prompt_input_exit");                                   // …and the session ends before the flag is written
+    ok(Y.S.execs.some((a) => a.at(-1) === "on") && Y.S.execs.at(-1).at(-1) === "off" && !fs.existsSync(flagOf(YS)) && F.notices.length === notices,
+      "the session ends while a ✅ is being acted on → session end waits for it, the flag just written is taken back, no \"turned on\" notice");
+    Y.stop();
+  }
   // a CLI without $.process: the phone is told to use the terminal
   {
     const O = engine({ sid: "5e55105e-0000-4000-8000-000000000002", env: { MYNA_RELAY_URL: FAKE }, pluginRoot: REPO, noProcess: true });

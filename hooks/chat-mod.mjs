@@ -461,6 +461,12 @@ export const register = (on) => {
   // terminal's /myna:godmode-session runs) and a notice in the "🔓 God mode" topic. Anything else → not on.
   // `off` and `status` need no ✅: turning it off only goes back to asking.
   let godAsk = null;      // {id, sid, from, busy}: the question waiting for its ✅
+  // A ✅ and the session's end may come together. The flag must never outlive the session: session.end marks
+  // the id ended first, then waits for an answer being acted on (godWork); the one acting on it checks the
+  // mark again AFTER the flag was written and takes it back — whichever of the two (or the SessionEnd hook's
+  // own delete) ran first.
+  const godEnded = new Set(); // session ids that ended in this process (cleared for an id by its next "on")
+  let godWork = Promise.resolve();
   const godScript = async (id, sub, stdin) => {
     const r = await io.exec(["node", `${io.pluginRoot()}/scripts/godmode.mjs`, "session", id, sub], { timeoutMs: 15000, ...(stdin !== undefined ? { stdin } : {}) });
     return { code: r?.exitCode, out: `${String(r?.stdout || "").trim()}${r?.exitCode ? `\n${String(r?.stderr || "").trim()}` : ""}`.trim() };
@@ -492,6 +498,7 @@ export const register = (on) => {
       return replyToPhone(`⚠️ 這個 Claude Code 版本不能從手機切 God mode（${String(x?.message || x || "").slice(0, 200)}）；${GODMODE_SESSION_TERMINAL.replace(" on", " on|off")}。`);
     }
     const from = cleanName(m.from) || "?";
+    godEnded.delete(id); // the same id again in this process (resumed): a new request for it stands on its own
     let r;
     try {
       r = await call("/ask", {
@@ -518,16 +525,20 @@ export const register = (on) => {
       if (r.status === 404) { godAsk = null; return replyToPhone(`🔓 沒有開：那一題不見了（relay 重啟過？）。要開請再打一次。`); }
       if (r.status !== 200 || !a.kind || a.kind === "pending") return;
       godAsk = null;
-      await godAnswered(g, a);
+      godWork = godAnswered(g, a).catch(() => {});
+      await godWork;
     } catch {} finally { g.busy = false; }
   }
   async function godAnswered(g, a) {
     if (a.kind === "unreachable") return replyToPhone(`🔓 沒有開：這台沒開 tree 模式／沒有自己的 Telegram bot／owner 沒綁帳號，手機開不了；${GODMODE_SESSION_TERMINAL}。`);
     // only a ✅ pressed on the phone: never one something pressed for the human (by), never another answer
     if (a.kind !== "selection" || a.value !== GODMODE_SESSION_YES || a.by) return replyToPhone(a.kind === "selection" && a.value === GODMODE_SESSION_NO ? "🔓 沒有開（選了不開）。" : a.kind === "message" ? "🔓 沒有開：收到的是文字回覆，不是 ✅。" : "🔓 沒有開（那一題沒有按 ✅）。");
-    if ((await io.sessionId()) !== g.sid) return; // the session it was asked for is over
+    const over = async () => godEnded.has(g.sid) || (await io.sessionId()) !== g.sid;
+    if (await over()) return; // the session it was asked for is over
     let r;
     try { r = await godScript(g.sid, "on"); } catch (x) { return replyToPhone(`⚠️ 按了 ✅ 但沒有開：${String(x?.message || x || "").slice(0, 200)}；${GODMODE_SESSION_TERMINAL}。`); }
+    // the session ended while the flag was being written: taken back (session.end waits for this)
+    if (await over().catch(() => true)) { try { await godScript(g.sid, "off"); } catch {} return; }
     if (r.code !== 0) return replyToPhone(`⚠️ 按了 ✅ 但沒有開：${r.out}`);
     const text = `🔓 God mode 已從手機開給 session ${nick}（${g.sid.slice(0, 8)}）｜打字：${g.from}｜session 結束就關`;
     let why = "";
@@ -613,7 +624,12 @@ export const register = (on) => {
     // after a /clear or an in-app /resume the process goes on under another session id: keep polling,
     // the next tick registers that one; any other reason is the process going away
     if (e.reason !== "clear" && e.reason !== "resume") stop();
-    await dropGodAsk(); // "turn God mode on for this session?" still waiting: retracted — a later ✅ opens nothing
+    // "turn God mode on for this session?": the id is marked ended before anything else, a question still
+    // waiting is retracted (a later ✅ opens nothing), and a ✅ being acted on right now is waited for — it
+    // sees the mark and takes its flag back
+    if (e.sessionId) godEnded.add(e.sessionId);
+    await dropGodAsk();
+    await godWork;
     await recordState({ ended: true, id: e.sessionId });
     mayRead.clear();
     await close();
