@@ -461,12 +461,17 @@ export const register = (on) => {
   // terminal's /myna:godmode-session runs) and a notice in the "🔓 God mode" topic. Anything else → not on.
   // `off` and `status` need no ✅: turning it off only goes back to asking.
   let godAsk = null;      // {id, sid, from, busy}: the question waiting for its ✅
-  // A ✅ and the session's end may come together. The flag must never outlive the session: session.end marks
-  // the id ended first, then waits for an answer being acted on (godWork); the one acting on it checks the
-  // mark again AFTER the flag was written and takes it back — whichever of the two (or the SessionEnd hook's
-  // own delete) ran first.
+  // A ✅ may be acted on while an "off" is typed or the session ends. The last word must win and the flag must
+  // never outlive the session, whatever the order (the SessionEnd hook's own delete included):
+  //   - everything that writes or removes the flag here runs one after another (godChain);
+  //   - "off" and the session's end first move godGen on — a ✅ asked under an older godGen turns nothing on,
+  //     and one already writing takes its flag back and says nothing — then queue their own removal behind
+  //     whatever is running: the removal is always the last thing done.
   const godEnded = new Set(); // session ids that ended in this process (cleared for an id by its next "on")
-  let godWork = Promise.resolve();
+  const godAsked = new Set(); // session ids the phone asked to turn it on for (only their end removes a flag here)
+  let godGen = 0;
+  let godChain = Promise.resolve();
+  const godQueue = (fn) => { const p = godChain.then(fn, fn); godChain = p.catch(() => {}); return p; };
   const godScript = async (id, sub, stdin) => {
     const r = await io.exec(["node", `${io.pluginRoot()}/scripts/godmode.mjs`, "session", id, sub], { timeoutMs: 15000, ...(stdin !== undefined ? { stdin } : {}) });
     return { code: r?.exitCode, out: `${String(r?.stdout || "").trim()}${r?.exitCode ? `\n${String(r?.stderr || "").trim()}` : ""}`.trim() };
@@ -488,8 +493,9 @@ export const register = (on) => {
     try {
       if (arg === "" || arg === "status") return replyToPhone(`🔓 ${(await godScript(id, "status")).out}${godAsk ? "\n（有一題「要不要開」還在等 ✅）" : ""}`);
       if (arg === "off") {
+        godGen++; // a ✅ being acted on right now is void from here on
         const dropped = await dropGodAsk();
-        const r = await godScript(id, "off");
+        const r = await godQueue(() => godScript(id, "off"));
         return replyToPhone(`🔓 ${r.out}${dropped ? "\n還在等 ✅ 的那一題也收回了。" : ""}`);
       }
       if (godAsk) return replyToPhone("🔓 已經有一題在等 ✅ 了：要綁到這台 owner 的 Telegram 帳號按 ✅ 才會開。");
@@ -499,6 +505,7 @@ export const register = (on) => {
     }
     const from = cleanName(m.from) || "?";
     godEnded.delete(id); // the same id again in this process (resumed): a new request for it stands on its own
+    godAsked.add(id);
     let r;
     try {
       r = await call("/ask", {
@@ -509,7 +516,7 @@ export const register = (on) => {
       });
     } catch { return replyToPhone(`⚠️ relay 沒有回應，沒有開；${GODMODE_SESSION_TERMINAL}。`); }
     if (r.status !== 200 || !r.request_id) return replyToPhone(`⚠️ 沒有開：relay 不收這一題（${r.status}${r.error ? `：${String(r.error).slice(0, 200)}` : ""}；relay 要 0.29.0 以上）。${GODMODE_SESSION_TERMINAL}。`);
-    godAsk = { id: String(r.request_id), sid: id, from, busy: false };
+    godAsk = { id: String(r.request_id), sid: id, from, busy: false, gen: godGen };
     godPoll().catch(() => {});
   }
   // one held GET /answer at a time, from the poll timer; a failed one is simply tried again at the next tick
@@ -525,25 +532,28 @@ export const register = (on) => {
       if (r.status === 404) { godAsk = null; return replyToPhone(`🔓 沒有開：那一題不見了（relay 重啟過？）。要開請再打一次。`); }
       if (r.status !== 200 || !a.kind || a.kind === "pending") return;
       godAsk = null;
-      godWork = godAnswered(g, a).catch(() => {});
-      await godWork;
+      await godQueue(() => godAnswered(g, a));
     } catch {} finally { g.busy = false; }
   }
   async function godAnswered(g, a) {
     if (a.kind === "unreachable") return replyToPhone(`🔓 沒有開：這台沒開 tree 模式／沒有自己的 Telegram bot／owner 沒綁帳號，手機開不了；${GODMODE_SESSION_TERMINAL}。`);
     // only a ✅ pressed on the phone: never one something pressed for the human (by), never another answer
     if (a.kind !== "selection" || a.value !== GODMODE_SESSION_YES || a.by) return replyToPhone(a.kind === "selection" && a.value === GODMODE_SESSION_NO ? "🔓 沒有開（選了不開）。" : a.kind === "message" ? "🔓 沒有開：收到的是文字回覆，不是 ✅。" : "🔓 沒有開（那一題沒有按 ✅）。");
-    const over = async () => godEnded.has(g.sid) || (await io.sessionId()) !== g.sid;
-    if (await over()) return; // the session it was asked for is over
+    // void: an "off" was typed or the session ended since this was asked (godGen moved on), or the session is
+    // another one now. Checked before the flag is written, after it (→ taken back), and before anything is said.
+    const over = async () => g.gen !== godGen || godEnded.has(g.sid) || (await io.sessionId().catch(() => null)) !== g.sid;
+    if (await over()) return;
     let r;
     try { r = await godScript(g.sid, "on"); } catch (x) { return replyToPhone(`⚠️ 按了 ✅ 但沒有開：${String(x?.message || x || "").slice(0, 200)}；${GODMODE_SESSION_TERMINAL}。`); }
-    // the session ended while the flag was being written: taken back (session.end waits for this)
-    if (await over().catch(() => true)) { try { await godScript(g.sid, "off"); } catch {} return; }
+    if (await over()) { try { await godScript(g.sid, "off"); } catch {} return; }
     if (r.code !== 0) return replyToPhone(`⚠️ 按了 ✅ 但沒有開：${r.out}`);
     const text = `🔓 God mode 已從手機開給 session ${nick}（${g.sid.slice(0, 8)}）｜打字：${g.from}｜session 結束就關`;
     let why = "";
     try { const n = await call("/notify", { text, session_id: g.sid }); if (n.status !== 200) why = `HTTP ${n.status}${n.error ? `: ${n.error}` : ""}${n.status === 504 ? " (may still have been sent)" : ""}`; }
     catch (x) { why = String(x?.message || x || "error"); }
+    // an "off" or the session's end while the notice was on its way: their own removal is queued behind this
+    // and takes the flag away — nothing more is said here
+    if (await over()) return;
     // a notice that could not go out is kept like every other God mode notice
     if (why) { try { await godScript(g.sid, "unsent", JSON.stringify({ text, reason: why })); } catch {} }
     replyToPhone(`🔓 已開：這個 session（${nick}）的權限確認和 ✅ 題全部自動同意，session 結束就關。關掉：!myna:godmode-session off`);
@@ -624,12 +634,16 @@ export const register = (on) => {
     // after a /clear or an in-app /resume the process goes on under another session id: keep polling,
     // the next tick registers that one; any other reason is the process going away
     if (e.reason !== "clear" && e.reason !== "resume") stop();
-    // "turn God mode on for this session?": the id is marked ended before anything else, a question still
-    // waiting is retracted (a later ✅ opens nothing), and a ✅ being acted on right now is waited for — it
-    // sees the mark and takes its flag back
+    // "turn God mode on for this session?": the id is marked ended before anything else (a ✅ being acted on
+    // right now is void), a question still waiting is retracted (a later ✅ opens nothing), and — only when
+    // the phone asked for it in this session — the flag's removal is queued behind whatever is running, so
+    // it is the last thing done whichever of this handler, a ✅ and the SessionEnd hook came first
+    const hadGod = godAsked.delete(e.sessionId);
     if (e.sessionId) godEnded.add(e.sessionId);
+    godGen++;
     await dropGodAsk();
-    await godWork;
+    if (hadGod && e.sessionId) await godQueue(() => godScript(e.sessionId, "off")).catch(() => {});
+    else await godChain;
     await recordState({ ended: true, id: e.sessionId });
     mayRead.clear();
     await close();

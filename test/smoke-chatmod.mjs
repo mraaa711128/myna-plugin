@@ -497,7 +497,7 @@ ok(await until(() => /🔧 Bash: npm test/.test(latest(tprog) || "")) && await u
       if (p === "/ask") { F.asks.push(b); return json({ request_id: `a${++F.n}` }); }
       if (p.startsWith("/answer/")) { const id = p.split("/").pop(); if (F.answers.has(id)) { const a = F.answers.get(id); F.answers.delete(id); return json(a); } return setTimeout(() => json({ kind: "pending" }), 100); }
       if (p.startsWith("/cancel/")) { F.cancels.push(p.split("/").pop()); return json({ cancelled: true }); }
-      if (p === "/notify") { F.notices.push(b); return json(F.notifyStatus === 200 ? { ok: true } : { error: "refused" }, F.notifyStatus); }
+      if (p === "/notify") { F.notices.push(b); return setTimeout(() => json(F.notifyStatus === 200 ? { ok: true } : { error: "refused" }, F.notifyStatus), F.notifyDelay || 0); }
       json({});
     });
   });
@@ -620,10 +620,45 @@ ok(await until(() => /🔧 Bash: npm test/.test(latest(tprog) || "")) && await u
     Y.S.slowOn = 700;
     F.answers.set(`a${F.n}`, { kind: "selection", value: "✅ 開" });
     await until(() => Y.S.execs.some((a) => a.at(-1) === "on"), 8000); // the mod is acting on the ✅ now
-    await Y.end("prompt_input_exit");                                   // …and the session ends before the flag is written
+    // …the SessionEnd hook runs first (nothing to delete yet), then the session ends — all before the flag is written
+    spawnSync(process.execPath, [path.join(REPO, "scripts", "godmode-session-end.mjs")], { env: { ...process.env, ...GOD_ENV }, input: JSON.stringify({ session_id: YS, reason: "prompt_input_exit" }) });
+    await Y.end("prompt_input_exit");
     ok(Y.S.execs.some((a) => a.at(-1) === "on") && Y.S.execs.at(-1).at(-1) === "off" && !fs.existsSync(flagOf(YS)) && F.notices.length === notices,
-      "the session ends while a ✅ is being acted on → session end waits for it, the flag just written is taken back, no \"turned on\" notice");
+      "the session ends while a ✅ is being acted on (the SessionEnd hook already ran) → the flag written late is taken back, removal is the last thing done, no \"turned on\" notice");
     Y.stop();
+  }
+  // "off" typed while a ✅ is being acted on: the last word wins
+  {
+    const WS = "5e55105e-0000-4000-8000-000000000005";
+    const W = engine({ sid: WS, env: { MYNA_RELAY_URL: FAKE }, pluginRoot: REPO });
+    await W.start();
+    await until(() => W.S.status === "💬 egret");
+    let n = F.asks.length, notices = F.notices.length, said = replies().length;
+    phone("!myna:godmode-session on");
+    await until(() => F.asks.length === n + 1, 8000);
+    W.S.slowOn = 1500;
+    F.answers.set(`a${F.n}`, { kind: "selection", value: "✅ 開" });
+    await until(() => W.S.execs.some((a) => a.at(-1) === "on"), 8000);
+    phone("!myna:godmode-session off");                                   // typed while "on" is still being written
+    await until(() => W.S.execs.filter((a) => a.at(-1) === "off").length >= 2, 10000); // the voided ✅'s own, then the off typed
+    await sleep(300);
+    const texts = replies().slice(said);
+    ok(!fs.existsSync(flagOf(WS)) && F.notices.length === notices && !texts.some((t) => /已開/.test(t)) && W.S.execs.at(-1).at(-1) === "off",
+      `"off" typed while a ✅ is being acted on → off: no flag, no "turned on" notice or reply (${JSON.stringify(texts)})`);
+    // the session ends while the "turned on" notice is on its way: the flag goes, nothing says "on"
+    W.S.slowOn = 0;
+    n = F.asks.length; said = replies().length;
+    phone("!myna:godmode-session on");
+    await until(() => F.asks.length === n + 1, 8000);
+    F.notifyDelay = 800;
+    F.answers.set(`a${F.n}`, { kind: "selection", value: "✅ 開" });
+    await until(() => fs.existsSync(flagOf(WS)), 8000); // written; the notice is being sent now
+    await W.end("prompt_input_exit");
+    F.notifyDelay = 0;
+    await sleep(300);
+    ok(!fs.existsSync(flagOf(WS)) && !replies().slice(said).some((t) => /已開/.test(t)) && W.S.execs.at(-1).at(-1) === "off",
+      "the session ends while the notice is on its way → the flag is removed last, the phone is not told \"on\"");
+    W.stop();
   }
   // a CLI without $.process: the phone is told to use the terminal
   {
