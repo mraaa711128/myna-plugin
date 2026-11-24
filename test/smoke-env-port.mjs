@@ -61,8 +61,10 @@ function stub() {
   return new Promise((resolve) => srv.listen(0, "127.0.0.1", () => resolve({ srv, seen, port: srv.address().port, up: () => { down = false; } })));
 }
 const writeEnv = (lines) => fs.writeFileSync(ENV_FILE, ["TELEGRAM_BOT_TOKEN=fake", "TELEGRAM_CHAT_ID=1", "TELEGRAM_API_BASE=http://127.0.0.1:9", ...lines, ""].join("\n"));
+// the child's environment: ours plus `extra`; a key set to null is left out (e.g. MYNA_ENV, as Codex's MCP has it)
+const envWith = (extra) => { const e = { ...env, ...extra }; for (const k of Object.keys(e)) if (e[k] === null) delete e[k]; return e; };
 const script = (rel, args = [], { input, extra = {}, timeout = 15000 } = {}) => new Promise((resolve) => {
-  const c = spawn(process.execPath, [path.join(root, rel), ...args], { env: { ...env, ...extra } });
+  const c = spawn(process.execPath, [path.join(root, rel), ...args], { env: envWith(extra) });
   let out = "";
   c.stdout.on("data", (d) => (out += d)); c.stderr.on("data", (d) => (out += d));
   c.stdin.on("error", () => {});
@@ -72,7 +74,7 @@ const script = (rel, args = [], { input, extra = {}, timeout = 15000 } = {}) => 
 });
 // the MCP server logs the relay it talks to once it is connected; then it is closed (stdin end)
 const mcpRelay = (rel, extra = {}) => new Promise((resolve) => {
-  const c = spawn(process.execPath, [path.join(root, rel)], { env: { ...env, MYNA_SESSION_ID: "env-port-test", ...extra } });
+  const c = spawn(process.execPath, [path.join(root, rel)], { env: envWith({ MYNA_SESSION_ID: "env-port-test", ...extra }) });
   let err = "";
   const done = (v) => { clearTimeout(t); try { c.stdin.end(); } catch {} setTimeout(() => { try { c.kill(); } catch {} }, 1500); resolve(v); };
   const t = setTimeout(() => done(null), 10000);
@@ -96,6 +98,10 @@ for (const rel of ["src/mcp/ask-human.mjs", "dist/ask-human.mjs"]) {
   ok(url === `http://127.0.0.1:${A.port}`, `ask_human (${rel}) connects to the .env's RELAY_PORT (relay=${url})`);
 }
 ok((await mcpRelay("dist/ask-human.mjs", { MYNA_HOST: "codex" })) === `http://127.0.0.1:${A.port}`, "ask_human with MYNA_HOST=codex (Codex's MCP gets no RELAY_PORT from the shell) reads it from the .env too");
+// as Codex really starts it: no MYNA_ENV either — the .env is found at <home>/.myna/.env (HOME / USERPROFILE)
+ok((await mcpRelay("dist/ask-human.mjs", { MYNA_HOST: "codex", MYNA_ENV: null })) === `http://127.0.0.1:${A.port}`, "…and without MYNA_ENV, from <home>/.myna/.env");
+r = await script("scripts/ensure-relay.mjs", [], { extra: { MYNA_ENV: null } });
+ok(new RegExp(`already running on :${A.port} `).test(r.out), "ensure-relay without MYNA_ENV finds <home>/.myna/.env's port too");
 
 clear();
 const askQ = { cwd: TMP, session_id: "s-int", tool_name: "AskUserQuestion", tool_input: { questions: [
@@ -154,8 +160,13 @@ const UNREADABLE = path.join(TMP, "env-is-a-folder");
 fs.mkdirSync(UNREADABLE, { recursive: true });
 clear();
 r = await script("scripts/ensure-relay.mjs", [], { extra: { MYNA_ENV: UNREADABLE, TELEGRAM_BOT_TOKEN: "fake", RELAY_PORT: String(A.port) } });
-ok(r.status === 0 && /could not read/.test(r.out) && new RegExp(`already running on :${A.port} `).test(r.out),
-  `ensure-relay (SessionStart) with an unreadable .env → one warning, the environment's settings, exit 0 (${r.out.split("\n").join(" | ")})`);
+ok(r.status === 0 && /could not read/.test(r.out) && new RegExp(`relay on :${A.port} is v.* not replacing or restarting it`).test(r.out) && has(A, "GET /health") && !has(A, "POST /shutdown"),
+  `ensure-relay (SessionStart) with an unreadable .env → a warning, the environment's port probed, the relay there left alone, exit 0 (${r.out.split("\n").join(" | ")})`);
+// nothing on the port: no relay is started (it would read the same .env and exit) — and it says so
+const closedPort = await new Promise((res) => { const s = http.createServer(); s.listen(0, "127.0.0.1", () => { const p = s.address().port; s.close(() => res(p)); }); });
+r = await script("scripts/ensure-relay.mjs", [], { extra: { MYNA_ENV: UNREADABLE, TELEGRAM_BOT_TOKEN: "fake", RELAY_PORT: String(closedPort) } });
+ok(r.status === 0 && new RegExp(`no relay on :${closedPort}, and none started`).test(r.out) && !fs.existsSync(path.join(TMP, "relay.log")),
+  `…and with nothing on the port → no relay started, the reason given, exit 0 (${r.out.split("\n").at(-1)})`);
 r = await script("scripts/session-end.mjs", [], { input: JSON.stringify({ session_id: "s-unr" }), extra: { MYNA_ENV: UNREADABLE, RELAY_PORT: String(A.port) } });
 ok(r.status === 0 && r.out === "" && has(A, "POST /session/close"), "session-end with an unreadable .env → the environment's port, silent, exit 0");
 r = await script("scripts/intercept-ask.mjs", [], { input: JSON.stringify(askQ), extra: { MYNA_ENV: UNREADABLE, RELAY_PORT: String(A.port) } });

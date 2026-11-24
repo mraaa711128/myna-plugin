@@ -36,10 +36,12 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 // same env merge as the relay: ~/.myna/.env keys, overridden by process.env — RELAY_PORT too (#28: a port
 // written only in the .env used to be missed here, so every SessionStart probed :7800 and spawned a relay
 // that found its own port taken). An unreadable .env leaves the environment alone: this is a SessionStart
-// hook and must not fail
+// hook and must not fail. It then only looks at the port — a relay started now would read the same .env at
+// its start and exit, so none is started or replaced (envUnreadable)
 const defaultEnvPath = process.env.MYNA_ENV || path.join(os.homedir(), ".myna", ".env");
-let cfg;
+let cfg, envUnreadable = "";
 try { cfg = loadEnv(); } catch (e) {
+  envUnreadable = e.message;
   console.log(`myna: warning — could not read ${defaultEnvPath} (${e.message}); using the environment only`);
   cfg = { ...process.env, MYNA_ENV: defaultEnvPath };
 }
@@ -101,6 +103,14 @@ async function waitDown(ms = 4000) {
 // compareVersions (semver order; "?" and anything unparseable are the oldest) lives in src/service.mjs
 
 const running = await probe();
+// the .env could not be read: report what is on the port, start or replace nothing (a new relay reads the
+// same .env when it starts and would exit at once)
+if (envUnreadable) {
+  console.log(running
+    ? `myna: relay on :${port} is v${running.version} — not replacing or restarting it while ${envPath} cannot be read (${envUnreadable}). Fix the file, then /myna:relay restart.`
+    : `myna: no relay on :${port}, and none started: ${envPath} cannot be read (${envUnreadable}) — the relay reads it too. Fix the file, then /myna:relay start.`);
+  done();
+}
 // the relay on the port plays the other role (MYNA_ROLE changed in .env): replace it whatever its
 // version — a hub left running on an edge machine would keep polling the bot. Pre-0.20 relays are hubs.
 const roleSwitch = !!running && running.version !== "?" && (running.role || "hub") !== role;
