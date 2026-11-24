@@ -21,7 +21,7 @@ import { loadEnv, roleOf, machinesFile, NAME_RE, updateEnvFile } from "../src/re
 const DEFAULT_REMOTE_PORT = "7801";
 const cfg = loadEnv();
 const envPath = cfg.MYNA_ENV;
-const relayPort = Number(process.env.RELAY_PORT || 7800); // same as ensure-relay / stop-relay
+const relayPort = Number(cfg.RELAY_PORT || 7800); // same as the relay, ensure-relay and stop-relay (.env, then the environment)
 const argv = process.argv.slice(2);
 const cmd = String(argv[0] || "status").toLowerCase();
 // /myna:hub tree …: the tree transport (scripts/tree.mjs) — everything below is the old hub, unchanged

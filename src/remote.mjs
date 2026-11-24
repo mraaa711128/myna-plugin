@@ -72,6 +72,10 @@ export function loadEnv() {
   );
   return { ...fileEnv, ...process.env, MYNA_ENV: ENV_PATH };
 }
+// where a client reaches this machine's relay: MYNA_RELAY_URL (trailing slashes dropped — the relay matches
+// exact paths such as "/ask"), else 127.0.0.1:RELAY_PORT (default 7800). MYNA_RELAY_URL only moves the
+// clients; the relay itself listens on RELAY_PORT.
+export const relayUrl = (cfg) => String(cfg.MYNA_RELAY_URL || `http://127.0.0.1:${Number(cfg.RELAY_PORT || 7800)}`).replace(/\/+$/, "");
 export const mynaDir = (cfg) => path.dirname(cfg.MYNA_ENV || path.join(os.homedir(), ".myna", ".env"));
 export const roleOf = (cfg) => String(cfg.MYNA_ROLE || "hub").trim().toLowerCase();
 export const machinesFile = (cfg) => cfg.MYNA_MACHINES_FILE || path.join(mynaDir(cfg), "machines.json");

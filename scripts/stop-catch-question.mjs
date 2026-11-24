@@ -26,10 +26,14 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { loadEnv, relayUrl } from "../src/remote.mjs";
 
 const FLAG = process.env.MYNA_STOPCATCH_FILE || path.join(os.homedir(), ".myna", "stopcatch");
-const PORT = Number(process.env.RELAY_PORT || 7800);
-const RELAY = process.env.MYNA_RELAY_URL || `http://127.0.0.1:${PORT}`;
+// the relay's address: ~/.myna/.env, overridden by process.env — the relay's own rule (#28). An unreadable
+// .env leaves the environment alone (a hook never fails)
+let cfg;
+try { cfg = loadEnv(); } catch { cfg = { ...process.env }; }
+const RELAY = relayUrl(cfg);
 
 const chunks = [];
 try { for await (const c of process.stdin) chunks.push(c); } catch { /* no stdin */ }

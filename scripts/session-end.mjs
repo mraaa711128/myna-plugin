@@ -7,8 +7,13 @@
 // relay closes the session's topics once it is answered (src/relay.mjs handleSessionClose / closeIfDue).
 // Codex caps a SessionEnd hook at 3 seconds; this one gives up well before that, and never fails: no relay,
 // no answer, no session id → exit 0 quietly.
-const PORT = Number(process.env.RELAY_PORT || 7800);
-const RELAY = process.env.MYNA_RELAY_URL || `http://127.0.0.1:${PORT}`;
+import { loadEnv, relayUrl } from "../src/remote.mjs";
+
+// ~/.myna/.env, overridden by process.env — the relay's own rule (#28); an unreadable .env leaves the
+// environment alone (this hook never fails)
+let cfg;
+try { cfg = loadEnv(); } catch { cfg = { ...process.env }; }
+const RELAY = relayUrl(cfg);
 
 setTimeout(() => process.exit(0), 2000).unref();
 

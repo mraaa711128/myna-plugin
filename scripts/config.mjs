@@ -5,7 +5,8 @@
 //   config.mjs <item>            that item only, in full: also where it is kept and when a change applies
 //   config.mjs <item> <value>    change it:
 //     a switch (autopilot, godmode, intercept, stopcatch, brief, perm, murmur, hold) → its own script
-//       (scripts/<item>.mjs) with the value, its output as is: same flag files, same reading
+//       (scripts/<item>.mjs) with the value, its output as is: same flag files, same reading.
+//       godmode on is refused (v0.29.1, #27): only the human's /myna:godmode on turns it on; off works here
 //     topics / perm-delay → ~/.myna/.env (TELEGRAM_TOPICS / MYNA_PERMISSION_DELAY): the line replaced, or
 //       added. The value is checked first; a bad one changes nothing.
 // chat is per session and lives in the chat mod (hooks/chat-mod.mjs), which answers "/myna:config chat …"
@@ -109,9 +110,9 @@ const INFO = {
     applies: "馬上生效",
   },
   godmode: {
-    values: "on / off",
+    values: "off（開：/myna:godmode on，要你自己打）",
     purpose: "所有權限確認自動同意（含護欄 hook 攔下來要問的動作）、帶 ✅ 核准的 ask_human 題目自動按 ✅，每一筆送通知到 IM 的「🔓 God mode」topic，不再問你；同時帶開 autopilot",
-    more: "整台機器一起開，關掉前一直有效；只允許那一次，不寫永久規則；AskUserQuestion 和不帶 approves 的題目不算（交給 intercept／autopilot／手機）；開的時候 autopilot 原本關著就一起打開，關的時候還原（期間手動切過 autopilot 就不動它）；通知送不出去時照樣同意，記在 ~/.myna/godmode-unsent.jsonl（/myna:status 看得到筆數）；通知目前只有 Telegram；也可以用 /myna:godmode",
+    more: "整台機器一起開，關掉前一直有效；只允許那一次，不寫永久規則；AskUserQuestion 和不帶 approves 的題目不算（交給 intercept／autopilot／手機）；開的時候 autopilot 原本關著就一起打開，關的時候還原（期間手動切過 autopilot 就不動它）；通知送不出去時照樣同意，記在 ~/.myna/godmode-unsent.jsonl（/myna:status 看得到筆數）；通知目前只有 Telegram；這裡只能關（godmode off），開要你自己在終端機打 /myna:godmode on（手機：!myna:godmode on），AI 不能替你開",
     applies: "馬上生效",
   },
   intercept: {
@@ -247,6 +248,10 @@ if (!ENV_ITEMS[item]) {
     if (v === "max" && rest.length === 2) args = ["max", rest[1]];
     else if (["on", "off", "status"].includes(v) && rest.length === 1) args = [v];
     else usageError(`hold 只接受 on、off、status 或 max <30m|6h|1d|秒數|default>（你給的是「${rest.join(" ")}」），沒有改。`);
+  } else if (item === "godmode" && v === "on") {
+    // #27 (v0.29.1): turning God mode on is the human's own command (/myna:godmode has disable-model-invocation,
+    // this one does not — the model may use it for everything else); off still works here, and from the phone
+    usageError("godmode on 不能在 /myna:config 開：請你自己在終端機打 /myna:godmode on（手機：!myna:godmode on）。/myna:config 只能 godmode off，沒有改。");
   } else if ((v === "on" || v === "off") && rest.length === 1) args = [v];
   else usageError(`${item} 只接受 on 或 off（你給的是「${rest.join(" ")}」），沒有改。`);
   const r = spawnSync(process.execPath, [path.join(HERE, sw(item).script), ...args], CODEX ? { encoding: "utf8" } : { stdio: "inherit" });

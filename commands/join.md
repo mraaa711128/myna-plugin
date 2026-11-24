@@ -9,7 +9,7 @@ argument-hint: "<hub URL> [--name <name>]  |  tree <parent URL> [--name <name>]"
 
 Without `tree`:
 
-Make THIS machine an **edge** of a Myna hub: its relay forwards every question to the hub (another machine, whose bot becomes the one inbox), so `ask_human`, the hooks and any guard here keep working unchanged on `127.0.0.1:7800`. A bot this machine already has stays configured and becomes the fallback while the hub is away — unless it is the hub's own bot (same bot id), then it is not used at all.
+Make THIS machine an **edge** of a Myna hub: its relay forwards every question to the hub (another machine, whose bot becomes the one inbox), so `ask_human`, the hooks and any guard here keep working unchanged on `127.0.0.1:<RELAY_PORT>` (`RELAY_PORT` from the environment or `~/.myna/.env`; 7800 when it is not set). A bot this machine already has stays configured and becomes the fallback while the hub is away — unless it is the hub's own bot (same bot id), then it is not used at all.
 
 Before you start, check (and tell the user in 繁體中文 if something is missing):
 - The hub runs myna 0.20.0+ with `MYNA_REMOTE_PORT` set and a tunnel (Cloudflare Tunnel + Access) pointing its public HTTPS URL at that port.
@@ -18,6 +18,6 @@ Before you start, check (and tell the user in 繁體中文 if something is missi
 Steps:
 1. Run `node "${CLAUDE_PLUGIN_ROOT}/scripts/join.mjs" $ARGUMENTS --no-wait`. It prints a confirmation code like `4F7-K92`. Show the code to the user and tell them, in 繁體中文, that the phone now shows「🆕 <name> 要加入，核對碼 …」: tap **✅ 允許** only if the code is the same, otherwise **❌ 拒絕**. They have 10 minutes.
 2. Run `node "${CLAUDE_PLUGIN_ROOT}/scripts/join.mjs" --wait` (it waits for the tap — give the Bash call a long timeout, e.g. 600000 ms, or run it in the background). On ✅ it saves the token to `~/.myna/machine-token`, writes `MYNA_ROLE=edge` and `MYNA_UPSTREAM` into `~/.myna/.env`, and starts the edge relay.
-3. Report the result in 繁體中文. On success, `curl -s http://127.0.0.1:7800/health` should show `"role":"edge"`, `upstream.reachable: true` and `upstream.active: true`; `own_bot.on` says whether this machine's own bot is the fallback (if `false`, `own_bot.reason` says why).
+3. Report the result in 繁體中文. On success, `curl -s http://127.0.0.1:7800/health` (the port is `RELAY_PORT` when it is set in the environment or in `~/.myna/.env`) should show `"role":"edge"`, `upstream.reachable: true` and `upstream.active: true`; `own_bot.on` says whether this machine's own bot is the fallback (if `false`, `own_bot.reason` says why).
 
 Only a human tap issues the token — autopilot never answers a join request. If it was denied or expired, run the command again (the hub accepts one new join request per minute).

@@ -368,12 +368,13 @@ try {
   // ============ ensure-relay updates the pointer ==================================================
   {
     console.log("\n--- ensure-relay → service.json ---");
-    // two more myna copies, older and newer: just what ensure-relay needs (it imports src/service.mjs only)
+    // two more myna copies, older and newer: just what ensure-relay needs (it imports src/service.mjs and,
+    // since 0.29.1, src/remote.mjs for the .env — both import src/private-file.mjs only)
     const copy = (name, version) => {
       const d = path.join(TMP, "roots", name);
       fs.mkdirSync(path.join(d, "scripts"), { recursive: true }); fs.mkdirSync(path.join(d, "src"), { recursive: true });
       fs.copyFileSync(ENSURE, path.join(d, "scripts", "ensure-relay.mjs"));
-      for (const f of ["service.mjs", "private-file.mjs"]) fs.copyFileSync(path.join(ROOT, "src", f), path.join(d, "src", f));
+      for (const f of ["service.mjs", "remote.mjs", "private-file.mjs"]) fs.copyFileSync(path.join(ROOT, "src", f), path.join(d, "src", f));
       fs.writeFileSync(path.join(d, "package.json"), JSON.stringify({ name: "myna-plugin", version }));
       return path.join(d, "scripts", "ensure-relay.mjs");
     };

@@ -104,7 +104,7 @@ for (const args of [["autopilot", "yes"], ["intercept", "status"], ["brief", "on
   ok(r.rc === 0 && items.every((k) => new RegExp(`^  ${k} `, "m").test(r.out)) && same(snap(a), {}), "no argument → one line per item (all 11), nothing written");
   ok(/autopilot\s+off（預設）/.test(r.out) && /godmode\s+off（預設）/.test(r.out) && /intercept\s+on（預設）/.test(r.out) && /topics\s+auto（預設）/.test(r.out) && /perm-delay\s+30 秒（預設）/.test(r.out), "defaults: autopilot off, intercept on, topics auto, perm-delay 30 s");
   // every item: "可設：…" on its line and a purpose line under it (Stanley 2026-11-11, after trying it)
-  const VALUES = { autopilot: "on / off", godmode: "on / off", intercept: "on / off", stopcatch: "on / off", brief: "on / off", perm: "on / off", murmur: "on / off",
+  const VALUES = { autopilot: "on / off", godmode: "off（開：/myna:godmode on，要你自己打）", intercept: "on / off", stopcatch: "on / off", brief: "on / off", perm: "on / off", murmur: "on / off",
     hold: "on / off / max <時間> / status", chat: "on / off（只改目前這個 session）", topics: "auto / off", "perm-delay": "0 以上的整數（秒）" };
   const ls = r.out.trimEnd().split("\n");
   const missing = items.filter((k) => {

@@ -3,7 +3,10 @@
 // The relay answers /shutdown and exits ~50ms later, so wait until the port is actually free before
 // reporting "stopped" — otherwise a start right after (stop → ensure-relay) still sees the dying
 // process answer and reports "already running", leaving NO relay once it exits.
-const port = Number(process.env.RELAY_PORT || 7800);
+import { loadEnv } from "../src/remote.mjs";
+
+// the relay's port as the relay reads it: ~/.myna/.env, overridden by process.env (#28)
+const port = Number(loadEnv().RELAY_PORT || 7800);
 const answers = () => fetch(`http://127.0.0.1:${port}/health`, { signal: AbortSignal.timeout(500) }).then(() => true, () => false);
 try {
   await fetch(`http://127.0.0.1:${port}/shutdown`, { method: "POST", signal: AbortSignal.timeout(1500) });
