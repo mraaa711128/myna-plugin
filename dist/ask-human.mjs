@@ -3229,8 +3229,8 @@ var require_utils = __commonJS({
       }
       return ind;
     }
-    function removeDotSegments(path4) {
-      let input = path4;
+    function removeDotSegments(path5) {
+      let input = path5;
       const output = [];
       let nextSlash = -1;
       let len = 0;
@@ -3482,8 +3482,8 @@ var require_schemes = __commonJS({
         wsComponent.secure = void 0;
       }
       if (wsComponent.resourceName) {
-        const [path4, query] = wsComponent.resourceName.split("?");
-        wsComponent.path = path4 && path4 !== "/" ? path4 : void 0;
+        const [path5, query] = wsComponent.resourceName.split("?");
+        wsComponent.path = path5 && path5 !== "/" ? path5 : void 0;
         wsComponent.query = query;
         wsComponent.resourceName = void 0;
       }
@@ -6876,12 +6876,12 @@ var require_dist = __commonJS({
         throw new Error(`Unknown format "${name}"`);
       return f;
     };
-    function addFormats(ajv, list, fs3, exportName) {
+    function addFormats(ajv, list, fs4, exportName) {
       var _a3;
       var _b;
       (_a3 = (_b = ajv.opts.code).formats) !== null && _a3 !== void 0 ? _a3 : _b.formats = (0, codegen_1._)`require("ajv-formats/dist/formats").${exportName}`;
       for (const f of list)
-        ajv.addFormat(f, fs3[f]);
+        ajv.addFormat(f, fs4[f]);
     }
     module.exports = exports = formatsPlugin;
     Object.defineProperty(exports, "__esModule", { value: true });
@@ -7129,10 +7129,10 @@ function mergeDefs(...defs) {
 function cloneDef(schema) {
   return mergeDefs(schema._zod.def);
 }
-function getElementAtPath(obj, path4) {
-  if (!path4)
+function getElementAtPath(obj, path5) {
+  if (!path5)
     return obj;
-  return path4.reduce((acc, key) => acc?.[key], obj);
+  return path5.reduce((acc, key) => acc?.[key], obj);
 }
 function promiseAllObject(promisesObj) {
   const keys = Object.keys(promisesObj);
@@ -7541,11 +7541,11 @@ function explicitlyAborted(x, startIndex = 0) {
   }
   return false;
 }
-function prefixIssues(path4, issues) {
+function prefixIssues(path5, issues) {
   return issues.map((iss) => {
     var _a3;
     (_a3 = iss).path ?? (_a3.path = []);
-    iss.path.unshift(path4);
+    iss.path.unshift(path5);
     return iss;
   });
 }
@@ -7692,16 +7692,16 @@ function flattenError(error2, mapper = (issue2) => issue2.message) {
 }
 function formatError(error2, mapper = (issue2) => issue2.message) {
   const fieldErrors = { _errors: [] };
-  const processError = (error3, path4 = []) => {
+  const processError = (error3, path5 = []) => {
     for (const issue2 of error3.issues) {
       if (issue2.code === "invalid_union" && issue2.errors.length) {
-        issue2.errors.map((issues) => processError({ issues }, [...path4, ...issue2.path]));
+        issue2.errors.map((issues) => processError({ issues }, [...path5, ...issue2.path]));
       } else if (issue2.code === "invalid_key") {
-        processError({ issues: issue2.issues }, [...path4, ...issue2.path]);
+        processError({ issues: issue2.issues }, [...path5, ...issue2.path]);
       } else if (issue2.code === "invalid_element") {
-        processError({ issues: issue2.issues }, [...path4, ...issue2.path]);
+        processError({ issues: issue2.issues }, [...path5, ...issue2.path]);
       } else {
-        const fullpath = [...path4, ...issue2.path];
+        const fullpath = [...path5, ...issue2.path];
         if (fullpath.length === 0) {
           fieldErrors._errors.push(mapper(issue2));
         } else {
@@ -15450,9 +15450,9 @@ var StdioServerTransport = class {
 };
 
 // src/mcp/ask-human.mjs
-import fs2 from "node:fs";
-import os3 from "node:os";
-import path3 from "node:path";
+import fs3 from "node:fs";
+import os4 from "node:os";
+import path4 from "node:path";
 import crypto from "node:crypto";
 
 // src/providers/util.mjs
@@ -15571,17 +15571,47 @@ var sessionGodmodeOn = (sid, env = process.env) => {
   }
 };
 
+// src/remote.mjs
+import fs2 from "node:fs";
+import os3 from "node:os";
+import path3 from "node:path";
+
+// src/private-file.mjs
+var WIN = process.platform === "win32";
+
+// src/remote.mjs
+function loadEnv() {
+  const ENV_PATH = process.env.MYNA_ENV || path3.join(os3.homedir(), ".myna", ".env");
+  const fileEnv = Object.fromEntries(
+    (fs2.existsSync(ENV_PATH) ? fs2.readFileSync(ENV_PATH, "utf8") : "").split(/\r?\n/).filter((l) => l && !l.startsWith("#") && l.includes("=")).map((l) => {
+      const i = l.indexOf("=");
+      return [l.slice(0, i).trim(), l.slice(i + 1).trim()];
+    })
+  );
+  return { ...fileEnv, ...process.env, MYNA_ENV: ENV_PATH };
+}
+var HOLD_MAX_MAX_S = 7 * 86400;
+var ASK_MAX_BYTES_DEFAULT = 256 * 1024;
+
 // src/mcp/ask-human.mjs
-var RELAY = process.env.MYNA_RELAY_URL || "http://127.0.0.1:7800";
-var AUTOPILOT_FILE = process.env.MYNA_AUTOPILOT_FILE || path3.join(os3.homedir(), ".myna", "autopilot");
+var RELAY = (() => {
+  let cfg;
+  try {
+    cfg = loadEnv();
+  } catch {
+    cfg = process.env;
+  }
+  return cfg.MYNA_RELAY_URL || `http://127.0.0.1:${Number(cfg.RELAY_PORT || 7800)}`;
+})();
+var AUTOPILOT_FILE = process.env.MYNA_AUTOPILOT_FILE || path4.join(os4.homedir(), ".myna", "autopilot");
 var HEARTBEAT_MS = Number(process.env.MYNA_HEARTBEAT_MS || 15e3);
 var ANSWER_POLL_MS = Number(process.env.MYNA_ANSWER_POLL_MS || 35e3);
 var log = (...a) => console.error(`[myna ${(/* @__PURE__ */ new Date()).toISOString()}]`, ...a);
 var FALLBACK_SESSION_ID = process.env.CLAUDE_CODE_SESSION_ID || crypto.randomBytes(4).toString("hex");
-var SESSIONS_FILE = path3.join(process.env.CLAUDE_CONFIG_DIR || path3.join(os3.homedir(), ".claude"), "sessions", `${process.ppid}.json`);
+var SESSIONS_FILE = path4.join(process.env.CLAUDE_CONFIG_DIR || path4.join(os4.homedir(), ".claude"), "sessions", `${process.ppid}.json`);
 function liveSessionId() {
   try {
-    const s = JSON.parse(fs2.readFileSync(SESSIONS_FILE, "utf8"));
+    const s = JSON.parse(fs3.readFileSync(SESSIONS_FILE, "utf8"));
     if (s?.pid === process.ppid && typeof s.sessionId === "string" && s.sessionId) return s.sessionId;
   } catch {
   }
@@ -15609,7 +15639,7 @@ var clock = () => {
   const d = /* @__PURE__ */ new Date(), two = (n) => String(n).padStart(2, "0");
   return `${two(d.getMonth() + 1)}/${two(d.getDate())} ${two(d.getHours())}:${two(d.getMinutes())}`;
 };
-var SESSION_BASE = process.env.MYNA_SESSION_NAME || (CODEX ? "" : `${path3.basename(process.cwd()) || "session"} ${clock()}`);
+var SESSION_BASE = process.env.MYNA_SESSION_NAME || (CODEX ? "" : `${path4.basename(process.cwd()) || "session"} ${clock()}`);
 var codexBase = SESSION_BASE;
 var codexProvisional = "";
 function baseFor(meta2) {
@@ -15657,7 +15687,7 @@ async function fetchRelayJson(url, opts, tries = 2, delayMs = 0) {
 var ANSWER_POLL_TRIES = Number(process.env.MYNA_ANSWER_POLL_TRIES || 8);
 var autopilotFlag = () => {
   try {
-    return fs2.existsSync(AUTOPILOT_FILE);
+    return fs3.existsSync(AUTOPILOT_FILE);
   } catch {
     return false;
   }
@@ -15673,17 +15703,17 @@ function codexLogDir(meta2) {
   if (cwd) return cwd;
   const dir = fallbackLogDir();
   log(`Codex: this call has no project folder (codex/sandbox-state) \u2014 decision log goes to ${dir}`);
-  fs2.mkdirSync(dir, { recursive: true });
+  fs3.mkdirSync(dir, { recursive: true });
   return dir;
 }
 function logDecision(rec, logDir, meta2) {
   try {
     const base = logDir || process.env.MYNA_LOG_DIR || (CODEX ? codexLogDir(meta2) : process.cwd());
-    fs2.appendFileSync(path3.join(base, "MYNA-DECISIONS.jsonl"), JSON.stringify(rec) + "\n");
-    const md = path3.join(base, "MYNA-DECISIONS.md");
-    if (!fs2.existsSync(md)) fs2.writeFileSync(md, "# Myna decisions\n\n| time | mode | header | question | chosen |\n|---|---|---|---|---|\n");
+    fs3.appendFileSync(path4.join(base, "MYNA-DECISIONS.jsonl"), JSON.stringify(rec) + "\n");
+    const md = path4.join(base, "MYNA-DECISIONS.md");
+    if (!fs3.existsSync(md)) fs3.writeFileSync(md, "# Myna decisions\n\n| time | mode | header | question | chosen |\n|---|---|---|---|---|\n");
     const cell = (s) => String(s ?? "").replace(/\|/g, "\\|").replace(/\r?\n/g, " ");
-    fs2.appendFileSync(md, `| ${rec.ts} | ${rec.mode} | ${cell(rec.header)} | ${cell(rec.question)} | ${cell(JSON.stringify(rec.chosen))} |
+    fs3.appendFileSync(md, `| ${rec.ts} | ${rec.mode} | ${cell(rec.header)} | ${cell(rec.question)} | ${cell(JSON.stringify(rec.chosen))} |
 `);
   } catch (e) {
     log("logDecision failed:", e.message);
@@ -15740,10 +15770,10 @@ async function waitForAnswer(request_id, extra, progressToken) {
     clearInterval(heartbeat);
   }
 }
-var MYNA_DIR = path3.dirname(process.env.MYNA_ENV || path3.join(os3.homedir(), ".myna", ".env"));
+var MYNA_DIR = path4.dirname(process.env.MYNA_ENV || path4.join(os4.homedir(), ".myna", ".env"));
 function envFileValue(key) {
   try {
-    const m = new RegExp(`^${key}=(.*)$`, "m").exec(fs2.readFileSync(process.env.MYNA_ENV || path3.join(MYNA_DIR, ".env"), "utf8"));
+    const m = new RegExp(`^${key}=(.*)$`, "m").exec(fs3.readFileSync(process.env.MYNA_ENV || path4.join(MYNA_DIR, ".env"), "utf8"));
     return m ? m[1].trim() : "";
   } catch {
     return "";
@@ -15768,7 +15798,7 @@ async function messageSession(args) {
   const sid = sessionId();
   let token = "";
   try {
-    token = fs2.readFileSync(path3.join(MYNA_DIR, "session-tokens", String(sid).replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 128)), "utf8").trim();
+    token = fs3.readFileSync(path4.join(MYNA_DIR, "session-tokens", String(sid).replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 128)), "utf8").trim();
   } catch {
   }
   if (!token) return out({ delivered: false, reason: "not_registered", error: "this session's chat is not registered with the relay (needs Claude Code 2.1.287+ and /myna:config chat on) \u2014 nothing was sent" }, true);
@@ -15836,7 +15866,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req, extra) => {
   const args = req.params.arguments || {};
   const meta2 = req.params?._meta;
   const ts = (/* @__PURE__ */ new Date()).toISOString();
-  const machine = os3.hostname();
+  const machine = os4.hostname();
   const problems = validateAskArgs(args);
   if (problems.length) {
     log(`rejecting ask_human call: ${problems.join("; ")}`);
@@ -15936,7 +15966,7 @@ async function awaitHuman(args, req, extra) {
     const result = await waitForAnswer(id, extra, req.params?._meta?.progressToken);
     const answered_at = (/* @__PURE__ */ new Date()).toISOString();
     if (result.kind === "selection") {
-      logDecision({ ts, answered_at, machine: os3.hostname(), mode: modeOf(result), ...info.gate ? { gate: info.gate } : {}, header: info.header, question: info.question, options: info.options, chosen: result.value, ...info.approves !== void 0 ? { approves: info.approves } : {}, reattached: id }, args.logDir, meta2);
+      logDecision({ ts, answered_at, machine: os4.hostname(), mode: modeOf(result), ...info.gate ? { gate: info.gate } : {}, header: info.header, question: info.question, options: info.options, chosen: result.value, ...info.approves !== void 0 ? { approves: info.approves } : {}, reattached: id }, args.logDir, meta2);
     }
     return textResult({ ...result, request_id: id });
   } catch (e) {

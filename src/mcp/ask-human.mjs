@@ -20,8 +20,16 @@ import crypto from "node:crypto";
 import { validateAskArgs } from "../providers/util.mjs";
 import { CODEX, CODEX_CAPABILITIES, sessionFromMeta, cwdFromMeta, folderName, fallbackLogDir } from "./codex.mjs";
 import { sessionGodmodeOn } from "../godmode-session.mjs";
+import { loadEnv } from "../remote.mjs";
 
-const RELAY = process.env.MYNA_RELAY_URL || "http://127.0.0.1:7800";
+// the relay's address as the relay reads its port: ~/.myna/.env (MYNA_ENV), overridden by process.env —
+// MYNA_RELAY_URL, else 127.0.0.1:RELAY_PORT (#28: a RELAY_PORT only in the .env used to be missed here).
+// An unreadable .env leaves the environment alone.
+const RELAY = (() => {
+  let cfg;
+  try { cfg = loadEnv(); } catch { cfg = process.env; }
+  return cfg.MYNA_RELAY_URL || `http://127.0.0.1:${Number(cfg.RELAY_PORT || 7800)}`;
+})();
 const AUTOPILOT_FILE = process.env.MYNA_AUTOPILOT_FILE || path.join(os.homedir(), ".myna", "autopilot");
 const HEARTBEAT_MS = Number(process.env.MYNA_HEARTBEAT_MS || 15000);
 // each /answer poll is a short request (relay returns {kind:"pending"} after ~25s); allow a little

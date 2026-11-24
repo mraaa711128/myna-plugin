@@ -4,8 +4,11 @@
 //                     `!pair <code>` from the chat to bind (private chat or group)
 //   pair.mjs status   which chat is bound now
 // The relay takes the pairing itself (it owns the bot's getUpdates), so it must be running.
-const PORT = Number(process.env.RELAY_PORT || 7800);
-const RELAY = process.env.MYNA_RELAY_URL || `http://127.0.0.1:${PORT}`;
+import { loadEnv } from "../src/remote.mjs";
+
+// ~/.myna/.env, overridden by process.env — the relay's own rule (#28)
+const cfg = loadEnv();
+const RELAY = cfg.MYNA_RELAY_URL || `http://127.0.0.1:${Number(cfg.RELAY_PORT || 7800)}`;
 const status = (process.argv[2] || "").toLowerCase() === "status";
 
 const describe = (c) => !c ? "no chat bound yet"

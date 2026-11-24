@@ -30,10 +30,15 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { setTimeout as sleep } from "node:timers/promises";
 import { compareVersions, updatePointer } from "../src/service.mjs";
+import { loadEnv } from "../src/remote.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const envPath = process.env.MYNA_ENV || path.join(os.homedir(), ".myna", ".env");
-const port = Number(process.env.RELAY_PORT || 7800);
+// same env merge as the relay: ~/.myna/.env keys, overridden by process.env — RELAY_PORT too (#28: a port
+// written only in the .env used to be missed here, so every SessionStart probed :7800 and spawned a relay
+// that found its own port taken)
+const cfg = loadEnv();
+const envPath = cfg.MYNA_ENV;
+const port = Number(cfg.RELAY_PORT || 7800);
 const force = process.argv.includes("--force") || process.env.MYNA_RELAY_FORCE === "1";
 const ourVersion = (() => { try { return JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8")).version || "0.0.0"; } catch { return "0.0.0"; } })();
 
@@ -53,13 +58,6 @@ function servicePointer() {
 }
 function done() { servicePointer(); process.exit(0); }
 
-// same env merge as the relay: file keys, overridden by process.env
-const fileEnv = Object.fromEntries(
-  (fs.existsSync(envPath) ? fs.readFileSync(envPath, "utf8") : "")
-    .split(/\r?\n/).filter((l) => l && !l.startsWith("#") && l.includes("="))
-    .map((l) => { const i = l.indexOf("="); return [l.slice(0, i).trim(), l.slice(i + 1).trim()]; }),
-);
-const cfg = { ...fileEnv, ...process.env };
 // role (0.20): hub (default) = the relay other machines forward to; edge = it forwards this machine's
 // questions to a hub (MYNA_UPSTREAM), its own bot — when it has one — being the fallback. Same script.
 const role = String(cfg.MYNA_ROLE || "hub").trim().toLowerCase();
