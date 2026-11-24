@@ -139,6 +139,29 @@ r = await script("scripts/session-end.mjs", [], { input: JSON.stringify({ sessio
 ok(has(B, "POST /session/close") && !A.seen.length, "MYNA_RELAY_URL in the .env is where session-end goes");
 ok((await mcpRelay("dist/ask-human.mjs")) === `http://127.0.0.1:${B.port}`, "…and ask_human");
 
+// trailing slashes on MYNA_RELAY_URL are dropped (the relay matches exact paths: "//session/close" is a 404)
+writeEnv([`MYNA_RELAY_URL=http://127.0.0.1:${B.port}//`]);
+clear();
+r = await script("scripts/session-end.mjs", [], { input: JSON.stringify({ session_id: "s-slash" }) });
+ok(has(B, "POST /session/close"), `MYNA_RELAY_URL with trailing slashes → session-end posts /session/close, not //session/close (${B.seen.join(", ") || "nothing"})`);
+ok((await mcpRelay("dist/ask-human.mjs")) === `http://127.0.0.1:${B.port}`, "…and ask_human's relay has no trailing slash");
+clear();
+r = await script("scripts/pair.mjs");
+ok(has(B, "POST /pair/start"), "…and pair.mjs posts /pair/start");
+
+// --- 4. a .env that cannot be read: the environment alone, nothing fails ----------------------------------
+const UNREADABLE = path.join(TMP, "env-is-a-folder");
+fs.mkdirSync(UNREADABLE, { recursive: true });
+clear();
+r = await script("scripts/ensure-relay.mjs", [], { extra: { MYNA_ENV: UNREADABLE, TELEGRAM_BOT_TOKEN: "fake", RELAY_PORT: String(A.port) } });
+ok(r.status === 0 && /could not read/.test(r.out) && new RegExp(`already running on :${A.port} `).test(r.out),
+  `ensure-relay (SessionStart) with an unreadable .env → one warning, the environment's settings, exit 0 (${r.out.split("\n").join(" | ")})`);
+r = await script("scripts/session-end.mjs", [], { input: JSON.stringify({ session_id: "s-unr" }), extra: { MYNA_ENV: UNREADABLE, RELAY_PORT: String(A.port) } });
+ok(r.status === 0 && r.out === "" && has(A, "POST /session/close"), "session-end with an unreadable .env → the environment's port, silent, exit 0");
+r = await script("scripts/intercept-ask.mjs", [], { input: JSON.stringify(askQ), extra: { MYNA_ENV: UNREADABLE, RELAY_PORT: String(A.port) } });
+ok(r.status === 0 && /"permissionDecision":\s*"deny"/.test(r.out), "AskUserQuestion hook with an unreadable .env → still works from the environment");
+ok((await mcpRelay("dist/ask-human.mjs", { MYNA_ENV: UNREADABLE, RELAY_PORT: String(A.port) })) === `http://127.0.0.1:${A.port}`, "ask_human with an unreadable .env → the environment's port");
+
 // --- no default port anywhere --------------------------------------------------------------------------
 const blocked = fs.existsSync(FETCH_LOG) ? fs.readFileSync(FETCH_LOG, "utf8").trim() : "";
 ok(!blocked, `no process tried the live ports 7800/7801/7802${blocked ? ` (tried: ${blocked.split("\n").join(", ")})` : ""}`);

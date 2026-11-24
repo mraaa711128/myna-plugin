@@ -35,6 +35,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { godmodeOn, appendUnsent } from "../src/godmode.mjs";
+import { relayUrl } from "../src/remote.mjs";
 
 // settings: process env first, then ~/.myna/.env (same precedence as the relay)
 const fileEnv = (() => {
@@ -46,8 +47,7 @@ const fileEnv = (() => {
 })();
 const setting = (k) => process.env[k] ?? fileEnv[k];
 const FLAG = process.env.MYNA_PERMISSION_FILE || path.join(os.homedir(), ".myna", "permission");
-const PORT = Number(setting("RELAY_PORT") || 7800);
-const RELAY = setting("MYNA_RELAY_URL") || `http://127.0.0.1:${PORT}`;
+const RELAY = relayUrl({ MYNA_RELAY_URL: setting("MYNA_RELAY_URL"), RELAY_PORT: setting("RELAY_PORT") });
 const delaySetting = Number(setting("MYNA_PERMISSION_DELAY") ?? 30);
 const DELAY_MS = (Number.isFinite(delaySetting) && delaySetting >= 0 ? delaySetting : 30) * 1000;
 const WATCH_MS = Number(process.env.MYNA_PERMISSION_WATCH_MS || 1500); // transcript check interval

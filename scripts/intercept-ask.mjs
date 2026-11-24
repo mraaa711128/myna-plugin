@@ -30,7 +30,7 @@ import os from "node:os";
 import path from "node:path";
 import crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
-import { loadEnv } from "../src/remote.mjs";
+import { loadEnv, relayUrl } from "../src/remote.mjs";
 
 const FLAG = process.env.MYNA_INTERCEPT_FILE || path.join(os.homedir(), ".myna", "intercept");
 const BRIEF_FLAG = process.env.MYNA_BRIEF_FILE || path.join(os.homedir(), ".myna", "brief");
@@ -38,7 +38,7 @@ const BRIEF_FLAG = process.env.MYNA_BRIEF_FILE || path.join(os.homedir(), ".myna
 // .env leaves the environment alone (a hook never fails)
 let cfg;
 try { cfg = loadEnv(); } catch { cfg = { ...process.env }; }
-const RELAY = cfg.MYNA_RELAY_URL || `http://127.0.0.1:${Number(cfg.RELAY_PORT || 7800)}`;
+const RELAY = relayUrl(cfg);
 const RENDER = path.join(path.dirname(fileURLToPath(import.meta.url)), "render-gate.mjs");
 
 // exit 0 with NO output → hook abstains → normal permission flow → local AskUserQuestion picker.

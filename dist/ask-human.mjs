@@ -15590,6 +15590,7 @@ function loadEnv() {
   );
   return { ...fileEnv, ...process.env, MYNA_ENV: ENV_PATH };
 }
+var relayUrl = (cfg) => String(cfg.MYNA_RELAY_URL || `http://127.0.0.1:${Number(cfg.RELAY_PORT || 7800)}`).replace(/\/+$/, "");
 var HOLD_MAX_MAX_S = 7 * 86400;
 var ASK_MAX_BYTES_DEFAULT = 256 * 1024;
 
@@ -15601,7 +15602,7 @@ var RELAY = (() => {
   } catch {
     cfg = process.env;
   }
-  return cfg.MYNA_RELAY_URL || `http://127.0.0.1:${Number(cfg.RELAY_PORT || 7800)}`;
+  return relayUrl(cfg);
 })();
 var AUTOPILOT_FILE = process.env.MYNA_AUTOPILOT_FILE || path4.join(os4.homedir(), ".myna", "autopilot");
 var HEARTBEAT_MS = Number(process.env.MYNA_HEARTBEAT_MS || 15e3);

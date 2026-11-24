@@ -35,8 +35,14 @@ import { loadEnv } from "../src/remote.mjs";
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 // same env merge as the relay: ~/.myna/.env keys, overridden by process.env — RELAY_PORT too (#28: a port
 // written only in the .env used to be missed here, so every SessionStart probed :7800 and spawned a relay
-// that found its own port taken)
-const cfg = loadEnv();
+// that found its own port taken). An unreadable .env leaves the environment alone: this is a SessionStart
+// hook and must not fail
+const defaultEnvPath = process.env.MYNA_ENV || path.join(os.homedir(), ".myna", ".env");
+let cfg;
+try { cfg = loadEnv(); } catch (e) {
+  console.log(`myna: warning — could not read ${defaultEnvPath} (${e.message}); using the environment only`);
+  cfg = { ...process.env, MYNA_ENV: defaultEnvPath };
+}
 const envPath = cfg.MYNA_ENV;
 const port = Number(cfg.RELAY_PORT || 7800);
 const force = process.argv.includes("--force") || process.env.MYNA_RELAY_FORCE === "1";
