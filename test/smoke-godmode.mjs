@@ -326,8 +326,15 @@ const script = (name, args, extra = {}) => spawnSync(process.execPath, [src("scr
   ok(r.status === 1 && fs.existsSync(GOD), "6: an unknown argument → refused, nothing changed");
   r = script("config.mjs", ["godmode", "off"]);
   ok(r.status === 0 && !fs.existsSync(GOD), "6: /myna:config godmode off → the same flag file removed");
+  // #27 (v0.29.1, Stanley chose A): /myna:config refuses godmode on — only the human's /myna:godmode on turns it on
   r = script("config.mjs", ["godmode", "on"]);
-  ok(r.status === 0 && fs.existsSync(GOD) && /God mode 開了/.test(r.stdout), "6: /myna:config godmode on → the same flag file, the same output");
+  ok(r.status === 1 && !fs.existsSync(GOD) && /\/myna:godmode on/.test(r.stderr) && /沒有改/.test(r.stderr), `6: /myna:config godmode on → refused, points at /myna:godmode on, nothing written ("${r.stderr.trim()}")`);
+  r = script("config.mjs", ["godmode", "ON", "now"]);
+  ok(r.status === 1 && !fs.existsSync(GOD), "6: …in any case, with extra words too");
+  r = script("godmode.mjs", ["on"]);
+  ok(r.status === 0 && fs.existsSync(GOD) && /God mode 開了/.test(r.stdout), "6: …/myna:godmode on turns it on");
+  r = script("config.mjs", ["godmode"]);
+  ok(r.status === 0 && /^godmode\s+on/.test(r.stdout) && /可設：off（開：\/myna:godmode on/.test(r.stdout), "6: /myna:config godmode (its state) still works, and says on is /myna:godmode on");
   r = script("config.mjs", []);
   ok(/godmode\s+on（設定檔/.test(r.stdout), "6: /myna:config lists godmode on, from its file");
   // unsent: one line older than the flag (an earlier time it was on), one newer
@@ -563,11 +570,13 @@ const script = (name, args, extra = {}) => spawnSync(process.execPath, [src("scr
   rf = script("godmode.mjs", ["on"], { MYNA_GODMODE_FILE: path.join(BLOCK, "godmode") });
   ok(rf.status === 1 && /God mode 沒開/.test(rf.stdout) && !fs.existsSync(AP), "9: the God mode flag cannot be written → exit 1, autopilot not left on");
 
-  // /myna:config godmode does the same (it runs the same script)
+  // /myna:config godmode off does what /myna:godmode off does (it runs the same script); on is refused there (#27)
   let r = script("config.mjs", ["godmode", "on"]);
-  ok(/^godmode /.test(read(AP) || ""), "9: /myna:config godmode on → autopilot on too");
+  ok(r.status === 1 && !fs.existsSync(GOD) && !fs.existsSync(AP), "9: /myna:config godmode on → refused: neither God mode nor autopilot turned on");
+  gm("on");
+  ok(/^godmode /.test(read(AP) || ""), "9: /myna:godmode on → autopilot on too");
   r = script("config.mjs", ["godmode", "off"]);
-  ok(!fs.existsSync(AP) && r.status === 0, "9: /myna:config godmode off → autopilot back off");
+  ok(!fs.existsSync(AP) && !fs.existsSync(GOD) && r.status === 0, "9: /myna:config godmode off → God mode off, autopilot back off");
 }
 
 // === 10. God mode for ONE session (v0.29.0, /myna:godmode-session) ===================================================

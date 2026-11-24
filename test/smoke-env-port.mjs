@@ -167,6 +167,15 @@ const closedPort = await new Promise((res) => { const s = http.createServer(); s
 r = await script("scripts/ensure-relay.mjs", [], { extra: { MYNA_ENV: UNREADABLE, TELEGRAM_BOT_TOKEN: "fake", RELAY_PORT: String(closedPort) } });
 ok(r.status === 0 && new RegExp(`no relay on :${closedPort}, and none started`).test(r.out) && !fs.existsSync(path.join(TMP, "relay.log")),
   `…and with nothing on the port → no relay started, the reason given, exit 0 (${r.out.split("\n").at(-1)})`);
+// the usual case: the bot token is in that unreadable .env, not in the environment — the reason is still the
+// .env, not "not configured" (Codex confirm review X8)
+clear();
+r = await script("scripts/ensure-relay.mjs", [], { extra: { MYNA_ENV: UNREADABLE, RELAY_PORT: String(A.port) } });
+ok(r.status === 0 && !/not configured/.test(r.out) && new RegExp(`relay on :${A.port} is v.* cannot be read`).test(r.out) && !has(A, "POST /shutdown"),
+  `ensure-relay, unreadable .env and no token in the environment → says the .env cannot be read, not "not configured" (${r.out.split("\n").at(-1)})`);
+r = await script("scripts/ensure-relay.mjs", [], { extra: { MYNA_ENV: UNREADABLE, RELAY_PORT: String(closedPort) } });
+ok(r.status === 0 && !/not configured/.test(r.out) && new RegExp(`no relay on :${closedPort}, and none started: .* cannot be read`).test(r.out),
+  "…and with nothing on the port the same reason");
 r = await script("scripts/session-end.mjs", [], { input: JSON.stringify({ session_id: "s-unr" }), extra: { MYNA_ENV: UNREADABLE, RELAY_PORT: String(A.port) } });
 ok(r.status === 0 && r.out === "" && has(A, "POST /session/close"), "session-end with an unreadable .env → the environment's port, silent, exit 0");
 r = await script("scripts/intercept-ask.mjs", [], { input: JSON.stringify(askQ), extra: { MYNA_ENV: UNREADABLE, RELAY_PORT: String(A.port) } });

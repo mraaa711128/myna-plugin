@@ -478,7 +478,7 @@ session：example-app 11/12 14:03・3f9a1c2e
 /myna:godmode on       # 開(autopilot 關著就一起開)
 /myna:godmode off      # 關(autopilot 還原成開之前的狀態)
 /myna:godmode          # 查狀態:開了沒、什麼時候開的、這次開啟後有幾則通知沒送出去、autopilot 是不是它帶開的
-/myna:config godmode on|off   # 同一個開關
+/myna:config godmode off      # 同一個開關,但只能關;godmode on 會被拒絕(v0.29.1)
 ```
 
 - **順便打開 autopilot(v0.26.2):** `/myna:godmode on` 時 autopilot 原本關著就一起打開(帶 `recommendedIndex` 的題目自動選建議選項,照 autopilot 原本的方式記進 `MYNA-DECISIONS`,`mode: "auto"`);`/myna:godmode off` 時還原成開之前的狀態:原本開著就保持開著,原本關著就關掉。God mode 開著時你另外用 `/myna:autopilot on|off` 切過,就以你最後的操作為準,`off` 不動它、輸出寫一行說明。`/myna:godmode` 和 `/myna:status` 會顯示 autopilot 現在是不是 God mode 帶開的。0.26.2 以前就開著的 God mode,升級後不會自己帶動 autopilot,再跑一次 `/myna:godmode on` 就會補上(開啟時間不變)。
@@ -489,7 +489,7 @@ session：example-app 11/12 14:03・3f9a1c2e
 - **`AskUserQuestion` 和一般選擇題不算:** `AskUserQuestion` 是問題、不是權限,照舊交給 intercept / autopilot。`ask_human` **不帶 `approves`** 的選擇題也照舊送手機,由你或 autopilot 回答,God mode 不代答(autopilot 是另一個開關,兩個互不影響)。
 - **只按這台自己的 ✅ 題目:** 別台機器轉來主節點的題目不按(各台看自己的 God mode)。子節點連得上主節點時,它的 ✅ 題目照舊轉給主節點、送手機,不自動按;主節點連不上、改用子節點自己的 bot 時才會按。
 - **跟 `/myna:perm` 無關:** perm 關著時 God mode 開著照樣自動同意。
-- **模型不能自己叫這個指令**(`disable-model-invocation`,v0.29.1):`/myna:godmode` 要你自己在終端機打(或手機打 `!myna:godmode …`);AI 用 Skill tool 叫它會被 Claude Code 擋下、改請你自己跑,`status`、`off` 也一樣。0.29.0 以前沒有這一行,AI 看到別的 session 傳來的 `!myna:godmode …` 文字時會自己去叫(#27)。`/myna:config godmode on|off` 是同一個開關,沒有加這一行(指令說明寫明只在你剛要求時才開)。**沒在真機驗證**:手機的 `!myna:godmode …` 由聊天模組用 `$.command.run` 執行,Claude Code 的說明是「跟人打 `/指令` 一樣」,所以應該不受這一行影響。
+- **模型不能自己叫這個指令**(`disable-model-invocation`,v0.29.1):`/myna:godmode` 要你自己在終端機打(或手機打 `!myna:godmode …`);AI 用 Skill tool 叫它會被 Claude Code 擋下、改請你自己跑,`status`、`off` 也一樣。0.29.0 以前沒有這一行,AI 看到別的 session 傳來的 `!myna:godmode …` 文字時會自己去叫(#27)。`/myna:config` 沒有加這一行(AI 還要用它查設定、改其他開關),改成**不收 `godmode on`**:會回一句「請你自己在終端機打 `/myna:godmode on`」、什麼都不改;`/myna:config godmode off`、`/myna:config godmode`(看狀態)、手機的 `!myna:config godmode off` 照常。**沒在真機驗證**:手機的 `!myna:godmode …` 由聊天模組用 `$.command.run` 執行,Claude Code 的說明是「跟人打 `/指令` 一樣」,所以應該不受這一行影響。
 - **通知送不出去時照樣同意**(relay 沒在跑、沒 bot、IM 不支援):那則通知的文字記在 `~/.myna/godmode-unsent.jsonl`(權限 0600,只留最近 200 行),`/myna:status` 和 `/myna:godmode` 會顯示這次開啟之後漏了幾則。hook 最多等通知 5 秒;✅ 題目不等通知,答案馬上回去。relay 沒在跑時 ✅ 題目本來就問不出去,也沒有核准。
 - **通知目前只有 Telegram。** Discord、Slack 開 God mode 照樣自動同意,但每一則都只記在 unsent 檔(`/myna:godmode on` 會提醒)。
 - **多台機器:** 子節點的通知轉給主節點的 bot(主節點要 0.25.0 以上);主節點連不上、或它不收通知時,用這台自己的 bot;都沒有就記在 unsent 檔。通知**不排隊**(排著的通知送到時動作早就做完了)。
@@ -899,7 +899,7 @@ AI 用的工具是 myna 的 `ask_human`、`await_human`、`detach_human`(Codex �
 | 指令 | 作用 |
 |---|---|
 | `/myna:status` | 一頁看這台 Myna 的狀態(只讀):relay 版本和角色、配對的聊天室、Telegram topic 會不會開(卡在哪一項)、各開關、主要設定,最後列出建議的下一步。不含 token;有聊天室 id、名稱和 bot 名稱(v0.23.0) |
-| `/myna:config [項目] [值]` | 看和改所有開關和常用設定:不帶參數 = 每項兩行(值、來源、`可設:` 哪些值,下一行是一句用途);只帶項目 = 那一項的完整說明(用途、可設的值、存在哪裡、改了什麼時候生效);項目有 `autopilot`、`godmode`(v0.25.0)、`intercept`、`stopcatch`、`brief`、`perm`、`murmur`、`hold`(`on`/`off`,`hold` 另有 `max <時間>`、`status`)、`chat`(這個 session;清單會列出這台每個 session 的開關)、`topics`(`auto`/`off`,寫 `.env` 的 `TELEGRAM_TOPICS`,要 `/myna:relay restart`)、`perm-delay`(秒數,寫 `.env` 的 `MYNA_PERMISSION_DELAY`)。下面標「別名」的舊指令照常可用,之後會移除(v0.24.0) |
+| `/myna:config [項目] [值]` | 看和改所有開關和常用設定:不帶參數 = 每項兩行(值、來源、`可設:` 哪些值,下一行是一句用途);只帶項目 = 那一項的完整說明(用途、可設的值、存在哪裡、改了什麼時候生效);項目有 `autopilot`、`godmode`(v0.25.0;v0.29.1 起只收 `off`,開要打 `/myna:godmode on`)、`intercept`、`stopcatch`、`brief`、`perm`、`murmur`、`hold`(`on`/`off`,`hold` 另有 `max <時間>`、`status`)、`chat`(這個 session;清單會列出這台每個 session 的開關)、`topics`(`auto`/`off`,寫 `.env` 的 `TELEGRAM_TOPICS`,要 `/myna:relay restart`)、`perm-delay`(秒數,寫 `.env` 的 `MYNA_PERMISSION_DELAY`)。下面標「別名」的舊指令照常可用,之後會移除(v0.24.0) |
 | `/myna:setup <token>` | 一鍵(Telegram):存 token → 配對 chat id → 起 relay |
 | `/myna:setup discord\|slack …` | 一鍵(Discord / Slack):存憑證 → 起 relay |
 | `/myna:configure <token> [chat_id]` | 只設/換 Telegram bot token(+可選 chat id) |
@@ -909,7 +909,7 @@ AI 用的工具是 myna 的 `ask_human`、`await_human`、`detach_human`(Codex �
 | `/myna:pair [status]` | (Telegram)用一次性配對碼綁定 Myna 使用的聊天室(私聊或群組);`status` = 目前綁定哪個聊天室 |
 | `/myna:relay [start\|stop\|restart\|status]` | 手動控制 relay daemon(平常自動起);`restart` = 強制重起成目前 plugin 版本的 relay,**同版本也會重起**(升級後、改 `.env` 後用;等待中的題目經 journal 交接) |
 | `/myna:service [on\|off\|status]` | [常駐](#常駐登入後自動啟動-relay不用開-claude-codev0270):登入後自動啟動 relay(macOS LaunchAgent、Windows「啟動」資料夾、Linux `systemd --user`);`off` 只拿掉登記、不停正在跑的 relay;不帶參數 = 看狀態。沒有 Claude Code 時是 `node <myna>/scripts/service.mjs …`(v0.27.0) |
-| `/myna:godmode [on\|off\|status]` | [God mode](#god-mode權限確認和核准題全部自動同意只通知v0250):這台的權限確認和帶 `approves` 的 ✅ 題目全部自動同意,每一筆送一則通知到「🔓 God mode」topic(✅ 題目和 topic:v0.26.2);不帶參數 = 查狀態和漏送幾則(同 `/myna:config godmode …`)(v0.25.0) |
+| `/myna:godmode [on\|off\|status]` | [God mode](#god-mode權限確認和核准題全部自動同意只通知v0250):這台的權限確認和帶 `approves` 的 ✅ 題目全部自動同意,每一筆送一則通知到「🔓 God mode」topic(✅ 題目和 topic:v0.26.2);不帶參數 = 查狀態和漏送幾則(`/myna:config godmode off` 也能關;開只能用這個指令,AI 不能自己叫,v0.29.1)(v0.25.0) |
 | `/myna:godmode-session [on\|off\|status]` | [God mode 只開給這個 session](#只開給一個-sessionmynagodmode-sessionv0290):這個 session(和它的背景 subagent)的權限確認和 ✅ 題目自動同意,這台其他 session 照舊;session 結束就關;手機在那個 session 的 topic 打 `!myna:godmode-session on` 要再按一次 ✅(v0.29.0) |
 | `/myna:autopilot [on\|off]` | 別名,改用 `/myna:config autopilot …`:切換自動採用建議 |
 | `/myna:intercept [on\|off]` | 別名,改用 `/myna:config intercept …`:切換全域攔截 `AskUserQuestion`(轉手機);**預設開** |

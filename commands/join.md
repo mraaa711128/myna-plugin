@@ -9,7 +9,7 @@ argument-hint: "<hub URL> [--name <name>]  |  tree <parent URL> [--name <name>]"
 
 Without `tree`:
 
-Make THIS machine an **edge** of a Myna hub: its relay forwards every question to the hub (another machine, whose bot becomes the one inbox), so `ask_human`, the hooks and any guard here keep working unchanged on `127.0.0.1:7800`. A bot this machine already has stays configured and becomes the fallback while the hub is away — unless it is the hub's own bot (same bot id), then it is not used at all.
+Make THIS machine an **edge** of a Myna hub: its relay forwards every question to the hub (another machine, whose bot becomes the one inbox), so `ask_human`, the hooks and any guard here keep working unchanged on `127.0.0.1:<RELAY_PORT>` (`RELAY_PORT` from the environment or `~/.myna/.env`; 7800 when it is not set). A bot this machine already has stays configured and becomes the fallback while the hub is away — unless it is the hub's own bot (same bot id), then it is not used at all.
 
 Before you start, check (and tell the user in 繁體中文 if something is missing):
 - The hub runs myna 0.20.0+ with `MYNA_REMOTE_PORT` set and a tunnel (Cloudflare Tunnel + Access) pointing its public HTTPS URL at that port.

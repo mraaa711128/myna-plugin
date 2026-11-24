@@ -66,6 +66,32 @@ function servicePointer() {
 }
 function done() { servicePointer(); process.exit(0); }
 
+const base = `http://127.0.0.1:${port}`;
+// who is on the port? null = nobody; {version:"?"} = something answers but has no /health (pre-0.7.2 relay)
+async function probe() {
+  let res;
+  try { res = await fetch(`${base}/health`, { signal: AbortSignal.timeout(1000) }); }
+  catch { return null; }
+  try { const j = await res.json(); if (j && j.name === "myna-relay") return j; } catch {}
+  return { version: "?", pending: undefined };
+}
+async function waitDown(ms = 4000) {
+  const until = Date.now() + ms;
+  while (Date.now() < until) { if (!(await probe())) return true; await sleep(150); }
+  return false;
+}
+
+// the .env could not be read: report what is on the port, start or replace nothing (a new relay reads the
+// same .env when it starts and would exit at once). Before the role / provider checks below — the bot token
+// is most likely in that very file, and "not configured" would hide why
+if (envUnreadable) {
+  const there = await probe();
+  console.log(there
+    ? `myna: relay on :${port} is v${there.version} — not replacing or restarting it while ${envPath} cannot be read (${envUnreadable}). Fix the file, then /myna:relay restart.`
+    : `myna: no relay on :${port}, and none started: ${envPath} cannot be read (${envUnreadable}) — the relay reads it too. Fix the file, then /myna:relay start.`);
+  done();
+}
+
 // role (0.20): hub (default) = the relay other machines forward to; edge = it forwards this machine's
 // questions to a hub (MYNA_UPSTREAM), its own bot — when it has one — being the fallback. Same script.
 const role = String(cfg.MYNA_ROLE || "hub").trim().toLowerCase();
@@ -85,32 +111,9 @@ if (role === "edge") {
   }
 }
 
-const base = `http://127.0.0.1:${port}`;
-// who is on the port? null = nobody; {version:"?"} = something answers but has no /health (pre-0.7.2 relay)
-async function probe() {
-  let res;
-  try { res = await fetch(`${base}/health`, { signal: AbortSignal.timeout(1000) }); }
-  catch { return null; }
-  try { const j = await res.json(); if (j && j.name === "myna-relay") return j; } catch {}
-  return { version: "?", pending: undefined };
-}
-async function waitDown(ms = 4000) {
-  const until = Date.now() + ms;
-  while (Date.now() < until) { if (!(await probe())) return true; await sleep(150); }
-  return false;
-}
-
 // compareVersions (semver order; "?" and anything unparseable are the oldest) lives in src/service.mjs
 
 const running = await probe();
-// the .env could not be read: report what is on the port, start or replace nothing (a new relay reads the
-// same .env when it starts and would exit at once)
-if (envUnreadable) {
-  console.log(running
-    ? `myna: relay on :${port} is v${running.version} — not replacing or restarting it while ${envPath} cannot be read (${envUnreadable}). Fix the file, then /myna:relay restart.`
-    : `myna: no relay on :${port}, and none started: ${envPath} cannot be read (${envUnreadable}) — the relay reads it too. Fix the file, then /myna:relay start.`);
-  done();
-}
 // the relay on the port plays the other role (MYNA_ROLE changed in .env): replace it whatever its
 // version — a hub left running on an edge machine would keep polling the bot. Pre-0.20 relays are hubs.
 const roleSwitch = !!running && running.version !== "?" && (running.role || "hub") !== role;
